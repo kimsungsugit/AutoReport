@@ -1,0 +1,14 @@
+{
+  "projects": [
+    {
+      "name": "260105",
+      "path": "D:/Project/devops/260105",
+      "enabled": true
+    },
+    {
+      "name": "GreencoreMaster",
+      "path": "D:/Project/Program/GreencoreMaster",
+      "enabled": true
+    }
+  ]
+}
