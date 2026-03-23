@@ -1,0 +1,10 @@
+[INFO] MCP Backend Checks
+[INFO] BaseUrl: http://127.0.0.1:8009
+[INFO] OK: defaults
+[INFO] OK: options
+[INFO] OK: sessions
+[INFO] OK: new session -> 38e9ba02
+[INFO] OK: session data
+[WARN] WARN: run request failed
+[INFO] Summary -> ok:5 fail:0 warn:1
+[INFO] Log file: D:\Project\devops\260105\scripts\mcp\logs\backend_checks_20260205_114007.log

@@ -47,6 +47,10 @@ DEFAULT_EXCLUDED_TOP_LEVEL_DIRS = {
     "jenkins_reports_http_192.168.110.40_7000_job_HDPDM01_PDS64_RD_lastSuccessfulBuild_20260119_115031",
     "jenkins_reports_http_192.168.110.40_7000_job_KJPDS02_DV_lastSuccessfulBuild_20260119_115122",
 }
+
+REPORT_DEPRIORITIZED_TOP_LEVEL_DIRS = {
+    "stremlit_",
+}
 IGNORED_PATH_SEGMENTS = {
     ".svn",
     ".vs",
@@ -213,7 +217,10 @@ def top_directories(paths: list[str], limit: int = 5) -> list[tuple[str, int]]:
     counts: Counter[str] = Counter()
     for path in paths:
         normalized = path.replace("\\", "/")
-        counts[normalized.split("/", 1)[0]] += 1
+        root = normalized.split("/", 1)[0]
+        if root in REPORT_DEPRIORITIZED_TOP_LEVEL_DIRS:
+            continue
+        counts[root] += 1
     return counts.most_common(limit)
 
 
@@ -229,6 +236,13 @@ def month_bounds(target: date) -> tuple[date, date]:
 def previous_month(today: date) -> tuple[date, date]:
     first_day_this_month = date(today.year, today.month, 1)
     return month_bounds(first_day_this_month - timedelta(days=1))
+
+
+def previous_business_day(target: date) -> date:
+    current = target - timedelta(days=1)
+    while current.weekday() >= 5:
+        current -= timedelta(days=1)
+    return current
 
 
 def should_generate_weekly(today: date) -> bool:
@@ -249,6 +263,20 @@ def ensure_parent(path: Path) -> None:
 def write_text(path: Path, text: str) -> None:
     ensure_parent(path)
     path.write_text(text, encoding="utf-8")
+
+
+def load_auto_commit_status(repo_name: str, target_day: date) -> dict[str, Any] | None:
+    status_path = REPO_ROOT / "reports" / "automation_status" / f"{target_day.isoformat()}-auto-commit-push.json"
+    if not status_path.exists():
+        return None
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    for item in payload.get("projects") or []:
+        if str(item.get("name") or "") == repo_name:
+            return dict(item)
+    return None
 
 
 def choose_gemini_config() -> dict[str, Any] | None:
@@ -375,19 +403,71 @@ def fetch_github_metadata(remote_url: str, branch: str, window: ReportWindow, lo
     }
 
 
-def infer_work_type(changed_files: list[str], commits: list[Commit]) -> str:
+def infer_work_type(changed_files: list[str], commits: list[Commit], profile_name: str = "general_software") -> str:
     text = " ".join(commit.subject.lower() for commit in commits)
+    normalized_paths = [path.replace("\\", "/").lower() for path in changed_files]
+    uds_hits = sum(1 for path in normalized_paths if "uds" in path)
+    quality_hits = sum(1 for path in normalized_paths if any(token in path for token in ("quality", "validation", "coverage", "baseline", "compare")))
+    test_hits = sum(1 for path in normalized_paths if path.startswith("tests/") or "/test_" in path or path.endswith("_test.py"))
+    docs_hits = sum(1 for path in normalized_paths if path.endswith(".md") or path.startswith("docs/") or path.startswith("project_docs/"))
+    backend_hits = sum(1 for path in normalized_paths if path.startswith("backend/"))
+    frontend_hits = sum(1 for path in normalized_paths if path.startswith("frontend/"))
+    app_hits = sum(
+        1
+        for path in normalized_paths
+        if path.startswith("src/")
+        or path.endswith((".cs", ".xaml", ".csproj", ".sln"))
+        or "/viewmodels/" in path
+        or "/views/" in path
+    )
+    automation_hits = sum(
+        1
+        for path in normalized_paths
+        if path.startswith("scripts/")
+        or path.endswith((".ps1", ".cmd", ".bat"))
+        or path.endswith(".json")
+    )
+    deploy_hits = sum(1 for path in normalized_paths if path.startswith("installer/") or "publish.ps1" in path or "build-installer" in path)
+
+    if uds_hits >= 3 and (quality_hits >= 2 or test_hits >= 3):
+        return "uds_quality"
+    if uds_hits >= 3:
+        return "uds_enhancement"
+    if profile_name == "desktop_app" and (app_hits >= 5 or (app_hits >= 3 and deploy_hits >= 1)):
+        return "app_bootstrap" if len(changed_files) >= 30 else "feature"
+    if profile_name == "reporting_automation" and automation_hits >= 3:
+        return "automation_build"
     if any(word in text for word in ("fix", "bug", "error", "hotfix")):
         return "bugfix"
     if any(word in text for word in ("refactor", "cleanup")):
         return "refactor"
     if any(word in text for word in ("test", "qa")):
         return "test"
-    if any(path.endswith(".md") or path.startswith("docs/") or path.startswith("project_docs/") for path in changed_files):
-        return "documentation"
-    if any(path.startswith("frontend/") or path.startswith("backend/") for path in changed_files):
+    if backend_hits + frontend_hits >= 4:
         return "feature"
+    if docs_hits >= max(app_hits, automation_hits, backend_hits + frontend_hits, 3):
+        return "documentation"
+    if app_hits >= 3:
+        return "app_bootstrap"
+    if automation_hits >= 3:
+        return "automation_build"
     return "maintenance"
+
+
+def work_type_label(work_type: str) -> str:
+    mapping = {
+        "uds_quality": "UDS 생성 및 품질 개선",
+        "uds_enhancement": "UDS 생성 고도화",
+        "app_bootstrap": "앱 초기 구축",
+        "automation_build": "자동화 구축",
+        "bugfix": "버그 수정",
+        "refactor": "구조 개선",
+        "test": "테스트 보강",
+        "documentation": "문서화",
+        "feature": "기능 개발",
+        "maintenance": "유지보수",
+    }
+    return mapping.get(work_type, work_type)
 
 
 def infer_change_facets(changed_files: list[str], commits: list[Commit], diff_summary: dict[str, Any]) -> list[dict[str, str]]:
@@ -395,6 +475,24 @@ def infer_change_facets(changed_files: list[str], commits: list[Commit], diff_su
     normalized_paths = [path.replace("\\", "/").lower() for path in changed_files]
     top_files = [str(item.get("path", "")).replace("\\", "/").lower() for item in (diff_summary.get("top_files") or [])]
     all_paths = normalized_paths + top_files
+    app_paths = [
+        path
+        for path in all_paths
+        if path.startswith("src/")
+        or path.endswith((".cs", ".xaml", ".csproj", ".sln", ".slnx"))
+        or "/viewmodels/" in path
+        or "/views/" in path
+    ]
+    automation_paths = [
+        path
+        for path in all_paths
+        if path.startswith("scripts/")
+        or path.endswith(".ps1")
+        or path.endswith(".cmd")
+        or path.endswith(".bat")
+        or "startup" in path
+        or "schedule" in path
+    ]
 
     facets: list[dict[str, str]] = []
 
@@ -403,6 +501,14 @@ def infer_change_facets(changed_files: list[str], commits: list[Commit], diff_su
             return
         facets.append({"name": name, "reason": reason})
 
+    if any("uds" in path for path in all_paths):
+        add("UDS", "UDS 생성, 분석, 문서화 관련 경로 변경이 감지되었습니다.")
+    if any(any(token in path for token in ("quality", "validation", "coverage", "baseline", "compare")) for path in all_paths):
+        add("품질", "품질 평가, 검증, 커버리지 관련 변경이 포함되었습니다.")
+    if app_paths:
+        add("앱", "데스크톱 애플리케이션 구조, 화면, 디바이스 연동 관련 소스 변경이 포함되었습니다.")
+    if automation_paths:
+        add("자동화", "스크립트, 스케줄링, 시작 프로그램 연동 등 자동 실행 경로 변경이 감지되었습니다.")
     if any(word in text for word in ("feature", "add", "implement", "create", "신규", "추가")):
         add("기능", "커밋 메시지에 신규 기능 또는 추가 작업 표현이 포함되었습니다.")
     if any(word in text for word in ("fix", "bug", "error", "hotfix", "resolve", "수정", "오류")):
@@ -426,7 +532,95 @@ def infer_change_facets(changed_files: list[str], commits: list[Commit], diff_su
 
     if not facets:
         add("유지보수", "경로와 커밋 이력을 기준으로 일반 유지보수 작업으로 분류했습니다.")
-    return facets[:5]
+    return facets[:6]
+
+
+def split_change_facets(
+    facets: list[dict[str, str]],
+    work_type: str,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    if not facets:
+        return [], []
+
+    primary_keywords_by_work_type: dict[str, set[str]] = {
+        "uds_quality": {"UDS", "품질", "테스트", "API", "기능", "구조개선"},
+        "uds_enhancement": {"UDS", "기능", "API", "품질", "테스트"},
+        "app_bootstrap": {"앱", "기능", "UI", "API", "구조개선", "품질", "배포"},
+        "automation_build": {"자동화", "기능", "구조개선", "설정", "API", "테스트"},
+        "feature": {"기능", "UI", "API", "구조개선", "품질"},
+        "bugfix": {"버그수정", "품질", "테스트", "API", "UI"},
+        "refactor": {"구조개선", "품질", "API", "테스트"},
+        "test": {"테스트", "품질", "API", "기능"},
+        "documentation": {"문서", "설정"},
+        "maintenance": {"유지보수", "설정", "문서"},
+    }
+    fallback_secondary = {"문서", "설정", "배포"}
+    primary_names = primary_keywords_by_work_type.get(work_type, {"기능", "API", "UI", "품질", "구조개선"})
+
+    major: list[dict[str, str]] = []
+    support: list[dict[str, str]] = []
+
+    for item in facets:
+        name = str(item.get("name", ""))
+        if name in primary_names:
+            major.append(item)
+        else:
+            support.append(item)
+
+    if not major:
+        for item in facets:
+            name = str(item.get("name", ""))
+            if name not in fallback_secondary:
+                major.append(item)
+                break
+
+    if not major and facets:
+        major.append(facets[0])
+
+    support = [item for item in facets if item not in major]
+    return major[:3], support[:3]
+
+
+def infer_source_insights(changed_files: list[str], diff_summary: dict[str, Any]) -> list[str]:
+    normalized_paths = [path.replace("\\", "/") for path in changed_files]
+    insights: list[str] = []
+
+    def top_matches(predicate, limit: int = 4) -> list[str]:
+        return [path for path in normalized_paths if predicate(path.lower())][:limit]
+
+    uds_paths = top_matches(lambda path: "uds" in path)
+    quality_paths = top_matches(lambda path: any(token in path for token in ("quality", "validation", "coverage", "baseline", "compare")))
+    test_paths = top_matches(lambda path: path.startswith("tests/") or "/test_" in path or path.endswith("_test.py"))
+    parser_paths = top_matches(lambda path: any(token in path for token in ("parser", "analyzer", "source_parser", "function_analyzer", "impact_analysis")))
+
+    if uds_paths:
+        insights.append(
+            f"UDS 생성 흐름이 확장되었습니다. 근거 파일: {', '.join(uds_paths[:4])}"
+        )
+    if quality_paths:
+        insights.append(
+            f"품질 평가와 검증 루프가 강화되었습니다. 근거 파일: {', '.join(quality_paths[:4])}"
+        )
+    if test_paths:
+        insights.append(
+            f"테스트와 회귀 검증 범위가 넓어졌습니다. 근거 파일: {', '.join(test_paths[:4])}"
+        )
+    if parser_paths:
+        insights.append(
+            f"소스 파싱과 영향 분석 로직이 보강되었습니다. 근거 파일: {', '.join(parser_paths[:4])}"
+        )
+
+    top_files = diff_summary.get("top_files") or []
+    if top_files:
+        major = top_files[:3]
+        insights.append(
+            "변경량이 큰 핵심 파일: " + ", ".join(
+                f"{item.get('path', '')} (+{int(item.get('added', 0))}/-{int(item.get('deleted', 0))})"
+                for item in major
+            )
+        )
+
+    return insights[:5]
 
 
 def build_context_payload(
@@ -443,17 +637,26 @@ def build_context_payload(
     changed_files: list[str],
     uncommitted: list[str],
     github_meta: dict[str, Any],
+    profile_name: str,
 ) -> dict[str, Any]:
     diff_summary = summarize_diff_stats(
         get_diff_numstat(repo_root, branch, window.start, window.end)
     )
     change_facets = infer_change_facets(changed_files, commits, diff_summary)
+    work_type = infer_work_type(changed_files, commits, profile_name)
+    primary_change_facets, supporting_change_facets = split_change_facets(change_facets, work_type)
+    source_insights = infer_source_insights(changed_files, diff_summary)
+    domain_profile = get_domain_profile(profile_name)
+    auto_commit_status = load_auto_commit_status(repo_root.name, window.end)
     return {
         "today": today.isoformat(),
         "report_type": report_type,
         "window_start": window.start.isoformat(),
         "window_end": window.end.isoformat(),
         "repository": repo_root.name,
+        "domain_profile": profile_name,
+        "domain_profile_name": domain_profile["name"],
+        "domain_focus": list(domain_profile["focus"]),
         "branch": branch,
         "remote_url": remote_url,
         "upstream": upstream or "",
@@ -461,8 +664,12 @@ def build_context_payload(
         "commit_count": len(commits),
         "changed_file_count": len(changed_files),
         "uncommitted_count": len(uncommitted),
-        "work_type": infer_work_type(changed_files, commits),
+        "work_type": work_type,
         "change_facets": change_facets,
+        "primary_change_facets": primary_change_facets,
+        "supporting_change_facets": supporting_change_facets,
+        "source_insights": source_insights,
+        "auto_commit_status": auto_commit_status or {},
         "top_areas": [{"area": area, "count": count} for area, count in top_directories(changed_files, limit=8)],
         "diff_summary": diff_summary,
         "recent_commits": [
@@ -480,7 +687,7 @@ def build_fallback_sections(report_type: str, payload: dict[str, Any]) -> dict[s
     commits = payload["recent_commits"]
     areas = payload["top_areas"]
     uncommitted_count = payload["uncommitted_count"]
-    work_type = payload["work_type"]
+    work_type = work_type_label(payload["work_type"])
     if report_type == "daily":
         return {
             "title": f"데일리 리포트 - {payload['today']}",
@@ -521,29 +728,163 @@ def build_fallback_sections(report_type: str, payload: dict[str, Any]) -> dict[s
 def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     areas = payload["top_areas"]
     commits = payload["recent_commits"]
-    work_type = payload["work_type"]
+    work_type = work_type_label(payload["work_type"])
+    diff = payload.get("diff_summary") or {}
+    source_insights = list(payload.get("source_insights") or [])
+    top_files = [str(item.get("path", "")) for item in (diff.get("top_files") or [])[:4]]
+    area_items = [str(item.get("area", "")) for item in areas[:4]]
+    area_subtasks = [
+        f"{area} 영역 변경 검토 및 검증 정리"
+        for area in area_items[:3]
+        if area
+    ]
+    if top_files:
+        area_subtasks.append(f"핵심 영향 파일 리뷰 및 결과 반영 ({', '.join(top_files[:2])})")
+    area_subtasks = area_subtasks[:4] or ["핵심 변경 영역 검토 및 결과 정리"]
     if doc_type == "jira_plan":
         return {
             "title": f"[{work_type}] {payload['today']} 작업",
-            "summary": f"{work_type} 유형 작업에 대한 Jira 상위 작업 초안입니다.",
+            "summary": source_insights[0] if source_insights else f"{work_type} 유형 작업에 대한 Jira 상위 작업 초안입니다.",
             "task_name": f"{payload['repository']} {work_type} 작업",
-            "task_goal": "최근 변경 이력 기반으로 후속 작업과 검증 범위를 정리합니다.",
-            "scope": [f"{item['area']} 영역 후속 작업" for item in areas[:4]] or ["후속 작업 범위 재정의"],
-            "subtasks": [f"{entry['subject']} 관련 검증 및 마무리" for entry in commits[:4]] or ["하위작업 정의 필요"],
-            "validation": ["기능 검증", "관련 테스트 확인", "문서 반영 확인"],
-            "risks": ["자동 분류 결과이므로 실제 Jira 이슈 타입과 비교가 필요합니다."],
+            "task_goal": source_insights[1] if len(source_insights) > 1 else "최근 변경 이력과 영향 파일을 기준으로 큰 단위의 후속 작업과 검증 범위를 정리합니다.",
+            "scope": [*source_insights[:2], *[f"{item['area']} 영역 후속 작업" for item in areas[:4]]][:4] or ["주요 변경 영역 후속 작업"],
+            "subtasks": area_subtasks,
+            "validation": ["기능 검증", "관련 테스트 확인", "문서 및 Jira 결과 반영 확인"],
+            "risks": ["자동 분류 결과이므로 실제 Jira 이슈 타입과 우선순위 비교가 필요합니다."],
         }
+    done_items = [entry["subject"] for entry in commits[:5]] or ["집계된 완료 항목이 없습니다."]
+    subtask_results = [
+        f"{area} 영역 변경 검토 결과와 검증 포인트를 정리했습니다."
+        for area in area_items[:3]
+        if area
+    ]
+    if top_files:
+        subtask_results.append(f"핵심 영향 파일 검토 결과를 반영했습니다. ({', '.join(top_files[:2])})")
     return {
         "title": f"[{work_type}] {payload['today']} 작업 결과",
-        "summary": f"{work_type} 유형 작업에 대한 Jira 작업 결과 초안입니다.",
+        "summary": source_insights[0] if source_insights else f"{work_type} 유형 작업에 대한 Jira 작업 결과 초안입니다.",
         "task_name": f"{payload['repository']} {work_type} 작업",
-        "done_items": [entry["subject"] for entry in commits[:5]] or ["완료 커밋 없음"],
-        "subtask_results": [f"{item['area']} {item['count']}개 파일 반영" for item in areas[:4]] or ["하위작업 결과 정리 필요"],
+        "done_items": done_items,
+        "subtask_results": subtask_results[:4] or ["정리된 하위 작업 결과가 없습니다."],
         "validation": ["커밋 이력 확인", "변경 파일 검토", "추가 검증 필요 여부 확인"],
-        "issues": ["미커밋 변경이 남아 있으면 결과 정리가 추가로 필요합니다."] if payload["uncommitted_count"] else ["즉시 보이는 잔여 로컬 변경은 없습니다."],
+        "issues": ["미커밋 변경이 남아 있으면 결과 정리에 추가 확인이 필요합니다."] if payload["uncommitted_count"] else ["즉시 보이는 로컬 미커밋 변경은 없습니다."],
         "links": [item.get("html_url", "") for item in payload.get("github", {}).get("commits", [])[:5] if item.get("html_url")] or [],
     }
 
+def format_top_file_signal(payload: dict[str, Any], limit: int = 3) -> list[str]:
+    diff_summary = payload.get("diff_summary") or {}
+    items = diff_summary.get("top_files") or []
+    return [
+        f"{item.get('path', '')} (+{int(item.get('added', 0))}/-{int(item.get('deleted', 0))})"
+        for item in items[:limit]
+    ]
+
+
+def format_area_signal(payload: dict[str, Any], limit: int = 3) -> list[str]:
+    return [f"{item['area']} ({item['count']} files)" for item in (payload.get("top_areas") or [])[:limit]]
+
+
+def build_fallback_sections(report_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    commits = payload["recent_commits"]
+    areas = payload["top_areas"]
+    uncommitted_count = payload["uncommitted_count"]
+    work_type = work_type_label(payload["work_type"])
+    diff = payload.get("diff_summary") or {}
+    top_files = format_top_file_signal(payload, limit=3)
+    area_signals = format_area_signal(payload, limit=3)
+    commit_count = int(payload.get("commit_count", 0))
+    changed_count = int(payload.get("changed_file_count", 0))
+    total_added = int(diff.get("total_added", 0))
+    total_deleted = int(diff.get("total_deleted", 0))
+    source_insights = list(payload.get("source_insights") or [])
+
+    if report_type == "daily":
+        return {
+            "title": f"데일리 리포트 - {payload['today']}",
+            "summary": [
+                f"{payload['window_start']}~{payload['window_end']} 기준 커밋 {commit_count}건, 변경 파일 {changed_count}건, 라인 변화 +{total_added}/-{total_deleted}가 확인됐습니다.",
+                f"이번 작업은 {work_type} 유형으로 분류되며 중심 변경 영역은 {', '.join(area_signals) if area_signals else '주요 변경 영역 없음'} 입니다.",
+                *source_insights[:2],
+                f"가장 영향이 큰 파일은 {top_files[0]} 입니다." if top_files else "상위 영향 파일은 아직 집계되지 않았습니다.",
+                *(f"최근 커밋: {entry['subject']}" for entry in commits[:2]),
+            ][:6],
+            "completed": [
+                *source_insights[:2],
+                *(f"{entry['subject']} · {entry['author']} · {entry['time']}" for entry in commits[:5]),
+                *(f"핵심 영향 파일: {item}" for item in top_files[:2]),
+            ][:7] or ["집계 구간 내 완료된 변경이 없습니다."],
+            "focus": [
+                *(f"소스 근거 확인: {item}" for item in source_insights[:2]),
+                *(f"{item['area']} 영역 점검 및 후속 검증 정리 ({item['count']} files)" for item in areas[:3]),
+                *(f"우선 검토 파일: {item}" for item in top_files[:2]),
+            ][:6] or ["오늘 집중할 핵심 변경 영역을 다시 정리해야 합니다."],
+            "risks": [
+                (f"미커밋 변경 {uncommitted_count}건이 남아 있어 결과 정리와 Jira 반영 전에 추가 확인이 필요합니다." if uncommitted_count else "즉시 보이는 로컬 미커밋 변경 리스크는 없습니다."),
+                (f"상위 영향 파일 {top_files[0]} 중심 회귀 검증이 필요합니다." if top_files else "영향 파일 기준의 추가 검증 포인트는 제한적입니다."),
+                (f"변경이 {', '.join(area_signals[:2])}에 집중돼 있어 연관 기능 회귀 가능성을 점검해야 합니다." if len(area_signals) >= 2 else "주요 변경 영역에 대한 기본 점검은 계속 필요합니다."),
+            ][:4],
+            "next_actions": [
+                *(f"{item['area']} 영역 검증 결과와 후속 조치를 정리합니다." for item in areas[:3]),
+                ("미커밋 변경을 정리한 뒤 Jira 계획과 결과 문서를 갱신합니다." if uncommitted_count else "Jira 계획과 결과 문서를 최신 기준으로 유지합니다."),
+                *(f"핵심 파일 리뷰 마감: {item}" for item in top_files[:1]),
+            ][:5],
+        }
+    if report_type == "plan":
+        return {
+            "title": f"진행 계획서 - {payload['today']}",
+            "summary": [
+                f"최근 변경 이력을 기준으로 {work_type} 유형 작업 계획 초안을 작성했습니다.",
+                f"우선 점검 대상 영역은 {', '.join(area_signals) if area_signals else '주요 변경 영역 없음'} 입니다.",
+                *source_insights[:2],
+                (f"핵심 영향 파일 {top_files[0]} 기준으로 검토 순서를 잡는 것이 좋습니다." if top_files else "영향 파일 기준 추가 정리가 필요합니다."),
+            ],
+            "priority_actions": [
+                ("미커밋 변경을 먼저 정리하고 커밋 단위를 분리합니다." if uncommitted_count else "최근 변경사항의 검증 범위와 결과를 먼저 확정합니다."),
+                *(f"핵심 변경 해석 반영: {item}" for item in source_insights[:2]),
+                *(f"{item['area']} 영역 작업 범위와 Jira 하위작업을 정리합니다." for item in areas[:3]),
+                *(f"우선 리뷰 파일: {item}" for item in top_files[:2]),
+            ][:6],
+            "mid_term_actions": [f"{item['area']} 영역 문서, 테스트, 검증 기록을 보강합니다." for item in areas[:3]] or ["다음 요구사항 후보와 중기 작업을 재정리합니다."],
+            "risks": [
+                f"변경 파일 {changed_count}건 규모이므로 검증 누락 없이 영역별 점검이 필요합니다.",
+                ("미커밋 변경이 남아 있어 작업 경계가 흐려질 수 있습니다." if uncommitted_count else "현재 기준 큰 작업 경계 이슈는 보이지 않습니다."),
+            ],
+            "notes": [
+                "자동 생성 초안이므로 실제 Jira 우선순위와 담당 범위에 맞춰 조정해야 합니다.",
+                (f"상위 영향 파일: {', '.join(top_files[:2])}" if top_files else "상위 영향 파일 정보는 아직 제한적입니다."),
+            ],
+        }
+    if report_type == "weekly":
+        return {
+            "title": f"주간 리포트 - {payload['window_start']} to {payload['window_end']}",
+            "summary": [
+                f"주간 기준 커밋 {commit_count}건, 변경 파일 {changed_count}건, 라인 변화 +{total_added}/-{total_deleted}가 누적되었습니다.",
+                f"이번 주 중심 영역은 {', '.join(area_signals) if area_signals else '주요 변경 영역 없음'} 입니다.",
+                *source_insights[:2],
+            ],
+            "highlights": [*source_insights[:2], *[f"{entry['subject']} · {entry['author']}" for entry in commits[:5]]] or ["이번 주 집계된 커밋이 없습니다."],
+            "areas": [*source_insights[:3], *[f"{item['area']} {item['count']}건 변경 · 상위 파일 리뷰 필요" for item in areas[:5]]] or ["주요 변경 영역이 없습니다."],
+            "risks": [
+                (f"상위 영향 파일 {top_files[0]} 중심 회귀 검증이 필요합니다." if top_files else "상위 영향 파일 기준 추가 검증 포인트는 제한적입니다."),
+                "다음 주 초반에는 이번 주 누적 변경의 결과 정리와 검증 마감이 필요합니다.",
+            ],
+            "next_week": [f"{item['area']} 영역 일정 정리 및 검증 완료" for item in areas[:3]] or ["다음 주 우선순위와 검증 계획을 다시 정리합니다."],
+        }
+    return {
+        "title": f"월간 리포트 - {payload['window_start']} to {payload['window_end']}",
+        "summary": [
+            f"월간 기준 커밋 {commit_count}건, 변경 파일 {changed_count}건, 라인 변화 +{total_added}/-{total_deleted}가 누적되었습니다.",
+            f"월간 중심 영역은 {', '.join(area_signals) if area_signals else '주요 변경 영역 없음'} 입니다.",
+            *source_insights[:2],
+        ],
+        "highlights": [*source_insights[:2], *[f"{entry['subject']} · {entry['author']}" for entry in commits[:6]]] or ["이번 달 집계된 커밋이 없습니다."],
+        "areas": [*source_insights[:3], *[f"{item['area']} {item['count']}건 변경 · 구조 점검 필요" for item in areas[:6]]] or ["주요 변경 영역이 없습니다."],
+        "risks": [
+            "반복 변경 영역은 설계 문서와 구조 점검을 함께 보강해야 합니다.",
+            (f"상위 영향 파일 {top_files[0]} 기준으로 다음 달 우선순위를 정리해야 합니다." if top_files else "상위 영향 파일 기준 다음 달 우선순위 정리가 필요합니다."),
+        ],
+        "next_month": [f"{item['area']} 영역 구조 안정화와 검증 계획을 수립합니다." for item in areas[:3]] or ["다음 달 우선순위와 검증 계획을 다시 정리합니다."],
+    }
 
 def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     cfg = choose_gemini_config()
@@ -570,6 +911,8 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
         "- Use short, practical business language.\n"
         "- Reflect GitHub commit URLs or PRs when available.\n"
         "- Keep the work type framing consistent.\n"
+        f"- Domain profile: {payload.get('domain_profile_name', '')}\n"
+        f"- Domain focus: {', '.join(payload.get('domain_focus') or [])}\n"
         "- For jira_plan, structure the content as one parent task plus subtasks.\n"
         "- For jira_result, structure the content as one parent task result plus subtask results.\n"
         "- No markdown fence, JSON only.\n\n"
@@ -587,32 +930,170 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
     return data
 
 
+def build_fallback_ai_team_analysis(payload: dict[str, Any]) -> dict[str, list[str]]:
+    source_insights = list(payload.get("source_insights") or [])
+    areas = list(payload.get("top_areas") or [])
+    diff = payload.get("diff_summary") or {}
+    top_files = diff.get("top_files") or []
+    return {
+        "structure": [
+            *(
+                source_insights[:1]
+                or [f"{payload.get('domain_profile_name', '프로젝트')} 기준 핵심 구조 변경을 상위 변경 영역과 영향 파일 기준으로 다시 정리해야 합니다."]
+            ),
+            *(f"{item['area']} 영역이 구조 변경 중심 축입니다. ({item['count']} files)" for item in areas[:2]),
+        ][:3],
+        "quality": [
+            *(
+                source_insights[1:2]
+                or [f"{payload.get('domain_profile_name', '프로젝트')} 관점에서 품질, validation, coverage 관련 파일을 우선 검토해야 합니다."]
+            ),
+            f"{payload.get('domain_profile_name', '프로젝트')} 기준 검증 완료 조건을 정리합니다.",
+            *(f"품질 영향 파일: {item.get('path', '')}" for item in top_files[:1]),
+        ][:3],
+        "feature": [
+            *(
+                source_insights[2:3]
+                or [f"{payload.get('domain_profile_name', '프로젝트')} 기준 기능 영향은 화면/API/워크플로우 변경 파일과 연결해서 정리해야 합니다."]
+            ),
+            f"{payload.get('domain_profile_name', '프로젝트')} 사용자 흐름 또는 작업 흐름 변화가 있으면 영향도를 요약합니다.",
+            *(f"기능 영향 파일: {item.get('path', '')}" for item in top_files[1:2]),
+        ][:3],
+        "jira_strategy": [
+            f"상위 작업은 {payload.get('domain_profile_name', '프로젝트')}의 큰 변경 흐름 1개로 유지합니다.",
+            *(f"{item['area']} 영역을 하위작업 단위로 정리합니다." for item in areas[:3]),
+        ][:4],
+    }
+
+
+def ask_gemini_for_team_analysis(payload: dict[str, Any]) -> dict[str, list[str]]:
+    cfg = choose_gemini_config()
+    if not cfg:
+        raise RuntimeError("No Gemini config available")
+    adapter = get_adapter(cfg)
+    system = (
+        "You are a Gemini-based engineering reporting team. "
+        "Act as four roles: structure analyst, quality analyst, feature analyst, and Jira planner. "
+        "Use only the supplied context. Return JSON only."
+    )
+    user = (
+        "Analyze the repository context in Korean.\n"
+        'Required schema: {"structure":[str], "quality":[str], "feature":[str], "jira_strategy":[str]}\n'
+        "Rules:\n"
+        "- structure: explain how the source/code structure changed.\n"
+        "- quality: explain how quality, validation, test, or coverage improved.\n"
+        "- feature: explain user-facing or workflow-facing impact.\n"
+        "- jira_strategy: explain parent task framing and grouped subtasks.\n"
+        "- Keep each list to 2-4 concise bullets.\n"
+        "- Mention concrete modules or paths when evidence is strong.\n"
+        f"- Domain profile: {payload.get('domain_profile_name', '')}\n"
+        f"- Domain focus: {', '.join(payload.get('domain_focus') or [])}\n"
+        "- No markdown fence, JSON only.\n\n"
+        f"Context JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+    result = adapter.generate(
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.2,
+        max_tokens=3072,
+        timeout=180.0,
+    )
+    data = json.loads(clean_json_block(result.get("output", "")))
+    if not isinstance(data, dict):
+        raise ValueError("LLM team analysis output is not a JSON object")
+    return {
+        "structure": [str(item) for item in (data.get("structure") or []) if str(item).strip()][:4],
+        "quality": [str(item) for item in (data.get("quality") or []) if str(item).strip()][:4],
+        "feature": [str(item) for item in (data.get("feature") or []) if str(item).strip()][:4],
+        "jira_strategy": [str(item) for item in (data.get("jira_strategy") or []) if str(item).strip()][:4],
+    }
+
+
+def build_auto_commit_status_items(status: dict[str, Any]) -> list[str]:
+    if not status:
+        return []
+    result = [f"상태: {status.get('status', 'unknown')}"]
+    if status.get("branch"):
+        result.append(f"브랜치: {status.get('branch')}")
+    if status.get("commit"):
+        result.append(f"커밋: {status.get('commit')}")
+    if status.get("message"):
+        result.append(f"메시지: {status.get('message')}")
+    if status.get("changed_files") is not None:
+        result.append(f"변경 파일 수: {status.get('changed_files')}")
+    if status.get("error"):
+        result.append(f"오류: {status.get('error')}")
+    return result[:5]
+
+
 def render_report_markdown(report_type: str, sections: dict[str, Any], payload: dict[str, Any], mode: str) -> str:
     lines = [str(sections.get("title") or report_type.title()), "", "## 기준 정보", ""]
     lines.extend(
         [
             f"- 저장소: `{payload['repository']}`",
+            f"- 분석 프로필: `{payload.get('domain_profile_name', '')}`",
             f"- 브랜치: `{payload['branch']}`",
             f"- 원격: {payload['remote_url']}",
             f"- 집계 구간: `{payload['window_start']}` ~ `{payload['window_end']}`",
-            f"- 작업 유형: `{payload['work_type']}`",
+            f"- 작업 유형: `{work_type_label(payload['work_type'])}`",
             f"- 커밋 수: `{payload['commit_count']}`",
             f"- 변경 파일 수: `{payload['changed_file_count']}`",
             f"- 미커밋 변경 수: `{payload['uncommitted_count']}`",
             f"- 생성 방식: `{mode}`",
         ]
     )
+    if mode == "fallback" and sections.get("_gemini_sections_error"):
+        lines.append(f"- Gemini 문서 생성 실패: `{sections.get('_gemini_sections_error')}`")
+    if sections.get("_ai_team_mode") == "fallback" and sections.get("_gemini_team_error"):
+        lines.append(f"- Gemini 역할 분석 실패: `{sections.get('_gemini_team_error')}`")
     github_meta = payload.get("github") or {}
     if github_meta.get("enabled"):
         lines.append(f"- GitHub API 저장소: `{github_meta.get('repo', '')}`")
         lines.append(f"- GitHub API 커밋 수: `{github_meta.get('commit_count', 0)}`")
     lines.append("")
-    facets = payload.get("change_facets") or []
-    if facets:
-        lines.extend(["## 변경 성격", ""])
-        for item in facets:
-            lines.append(f"- `{item.get('name', '')}`: {item.get('reason', '')}")
+    auto_commit_items = build_auto_commit_status_items(payload.get("auto_commit_status") or {})
+    if auto_commit_items:
+        lines.extend(["## 자동 커밋/푸시 상태", ""])
+        lines.extend(f"- {item}" for item in auto_commit_items)
         lines.append("")
+    primary_facets = payload.get("primary_change_facets") or []
+    supporting_facets = payload.get("supporting_change_facets") or []
+    facets = payload.get("change_facets") or []
+    if primary_facets or supporting_facets or facets:
+        lines.extend(["## 변경 성격", ""])
+        if primary_facets:
+            lines.extend(["### 주요 변경 성격", ""])
+            for item in primary_facets:
+                lines.append(f"- `{item.get('name', '')}`: {item.get('reason', '')}")
+            lines.append("")
+        if supporting_facets:
+            lines.extend(["### 보조 변경 성격", ""])
+            for item in supporting_facets:
+                lines.append(f"- `{item.get('name', '')}`: {item.get('reason', '')}")
+            lines.append("")
+        elif not primary_facets:
+            for item in facets:
+                lines.append(f"- `{item.get('name', '')}`: {item.get('reason', '')}")
+            lines.append("")
+    source_insights = list(payload.get("source_insights") or [])
+    if source_insights:
+        lines.extend(["## 소스 기반 핵심 변경", ""])
+        lines.extend(f"- {item}" for item in source_insights)
+        lines.append("")
+    ai_team = sections.get("_ai_team") or {}
+    ai_team_mode = str(sections.get("_ai_team_mode") or "fallback")
+    if ai_team:
+        lines.extend(["## Gemini 역할 분석", "", f"- 분석 방식: `{ai_team_mode}`", ""])
+        role_map = [
+            ("구조 분석", list(ai_team.get("structure") or [])),
+            ("품질 분석", list(ai_team.get("quality") or [])),
+            ("기능 영향", list(ai_team.get("feature") or [])),
+            ("Jira 전략", list(ai_team.get("jira_strategy") or [])),
+        ]
+        for title, items in role_map:
+            lines.append(f"### {title}")
+            lines.append("")
+            lines.extend(f"- {item}" for item in items) if items else lines.append("- 없음")
+            lines.append("")
 
     def add_section(title: str, items: list[str]) -> None:
         lines.append(f"## {title}")
@@ -685,17 +1166,22 @@ def render_report_markdown(report_type: str, sections: dict[str, Any], payload: 
 
     areas = payload.get("top_areas") or []
     if areas:
-        lines.extend(["## 변경 흐름도", "", "```mermaid", "flowchart LR"])
+        lines.extend(["## 설계 변화 다이어그램", "", "```mermaid", "flowchart LR"])
         first = areas[0]["area"]
-        lines.append(f'    A["GitHub / Git Activity"] --> B["{first}"]')
+        lines.append('    A["Repository"] --> B["Primary Change Area"]')
+        lines.append(f'    B --> C["{first}"]')
         for index, item in enumerate(areas[1:4], start=1):
-            prev = "B" if index == 1 else f"N{index-1}"
-            current = f"N{index}"
-            lines.append(f'    {prev} --> {current}["{item["area"]}"]')
-        lines.append('    B --> Z["Report / Plan / Jira Docs"]')
-        if len(areas) > 1:
-            tail = f'N{min(len(areas)-1, 3)}'
-            lines.append(f'    {tail} --> Z["Report / Plan / Jira Docs"]')
+            lines.append(f'    C --> N{index}["{item["area"]}"]')
+        lines.append('    C --> Z["Reports / Jira / Docs"]')
+        lines.extend(["```", ""])
+
+        lines.extend(["## 변경 영향 다이어그램", "", "```mermaid", "flowchart TD"])
+        lines.append('    A["Changed Source Files"] --> B["Structure / Service Layer"]')
+        lines.append('    A --> C["Validation / Tests"]')
+        lines.append('    B --> D["User Flow / API / Document Output"]')
+        lines.append('    C --> E["Quality Confidence"]')
+        lines.append('    D --> F["Daily / Weekly / Monthly Report"]')
+        lines.append('    E --> F["Daily / Weekly / Monthly Report"]')
         lines.extend(["```", ""])
     return "\n".join(lines)
 
@@ -704,20 +1190,48 @@ def render_jira_markdown(doc_type: str, sections: dict[str, Any], payload: dict[
     lines = [f"# {sections.get('title', doc_type)}", "", "## Meta", ""]
     lines.extend(
         [
-            f"- Work Type: `{payload['work_type']}`",
+            f"- Work Type: `{work_type_label(payload['work_type'])}`",
+            f"- Domain Profile: `{payload.get('domain_profile_name', '')}`",
             f"- Repo: `{payload['repository']}`",
             f"- Branch: `{payload['branch']}`",
             f"- Window: `{payload['window_start']}` ~ `{payload['window_end']}`",
             f"- Generation: `{mode}`",
         ]
     )
+    if mode == "fallback" and sections.get("_gemini_sections_error"):
+        lines.append(f"- Gemini doc failure: `{sections.get('_gemini_sections_error')}`")
+    if sections.get("_ai_team_mode") == "fallback" and sections.get("_gemini_team_error"):
+        lines.append(f"- Gemini team failure: `{sections.get('_gemini_team_error')}`")
     lines.extend(["", "## Summary", "", str(sections.get("summary") or "-"), ""])
+    primary_facets = payload.get("primary_change_facets") or []
+    supporting_facets = payload.get("supporting_change_facets") or []
     facets = payload.get("change_facets") or []
-    if facets:
+    if primary_facets or supporting_facets or facets:
         lines.extend(["## Change Facets", ""])
-        for item in facets:
-            lines.append(f"- {item.get('name', '')}: {item.get('reason', '')}")
-        lines.append("")
+        if primary_facets:
+            lines.extend(["### Primary Change Facets", ""])
+            for item in primary_facets:
+                lines.append(f"- {item.get('name', '')}: {item.get('reason', '')}")
+            lines.append("")
+        if supporting_facets:
+            lines.extend(["### Supporting Change Facets", ""])
+            for item in supporting_facets:
+                lines.append(f"- {item.get('name', '')}: {item.get('reason', '')}")
+            lines.append("")
+        elif not primary_facets:
+            for item in facets:
+                lines.append(f"- {item.get('name', '')}: {item.get('reason', '')}")
+            lines.append("")
+    ai_team = sections.get("_ai_team") or {}
+    ai_team_mode = str(sections.get("_ai_team_mode") or "fallback")
+    if ai_team:
+        lines.extend(["## Gemini Team Analysis", "", f"- Mode: `{ai_team_mode}`", ""])
+        for title, key in [("Structure", "structure"), ("Quality", "quality"), ("Feature Impact", "feature"), ("Jira Strategy", "jira_strategy")]:
+            lines.append(f"### {title}")
+            lines.append("")
+            items = list(ai_team.get(key) or [])
+            lines.extend(f"- {item}" for item in items) if items else lines.append("- None")
+            lines.append("")
 
     def add(title: str, items: list[str]) -> None:
         lines.append(f"## {title}")
@@ -754,11 +1268,19 @@ def render_jira_markdown(doc_type: str, sections: dict[str, Any], payload: dict[
 
     areas = payload.get("top_areas") or []
     if areas:
-        lines.extend(["## Flow", "", "```mermaid", "flowchart TD"])
-        lines.append('    A["Input: Git / GitHub"] --> B["Analyze Change Evidence"]')
-        lines.append(f'    B --> C["Primary Area: {areas[0]["area"]}"]')
-        lines.append('    C --> D["Generate Jira Draft"]')
-        lines.append('    D --> E["Manual Upload To Jira"]')
+        lines.extend(["## Architecture Delta", "", "```mermaid", "flowchart LR"])
+        lines.append('    A["Repository"] --> B["Primary Change Area"]')
+        lines.append(f'    B --> C["{areas[0]["area"]}"]')
+        if len(areas) > 1:
+            lines.append(f'    C --> D["{areas[1]["area"]}"]')
+        lines.append('    C --> E["Jira Task / Subtasks"]')
+        lines.extend(["```", ""])
+
+        lines.extend(["## Change Impact", "", "```mermaid", "flowchart TD"])
+        lines.append('    A["Changed Source Files"] --> B["Design / Structure Review"]')
+        lines.append('    A --> C["Validation / Risk Review"]')
+        lines.append('    B --> D["Jira Plan"]')
+        lines.append('    C --> D["Jira Plan"]')
         lines.extend(["```", ""])
     return "\n".join(lines)
 
@@ -767,9 +1289,25 @@ def generate_document(report_type: str, payload: dict[str, Any]) -> tuple[str, s
     try:
         sections = ask_gemini_for_sections(report_type, payload)
         mode = "gemini"
-    except Exception:
+        sections_error = ""
+    except Exception as exc:
         sections = build_fallback_jira_doc(report_type, payload) if report_type.startswith("jira_") else build_fallback_sections(report_type, payload)
         mode = "fallback"
+        sections_error = f"{type(exc).__name__}: {exc}"
+
+    try:
+        ai_team = ask_gemini_for_team_analysis(payload)
+        ai_team_mode = "gemini"
+        ai_team_error = ""
+    except Exception as exc:
+        ai_team = build_fallback_ai_team_analysis(payload)
+        ai_team_mode = "fallback"
+        ai_team_error = f"{type(exc).__name__}: {exc}"
+
+    sections["_ai_team"] = ai_team
+    sections["_ai_team_mode"] = ai_team_mode
+    sections["_gemini_sections_error"] = sections_error
+    sections["_gemini_team_error"] = ai_team_error
 
     if report_type.startswith("jira_"):
         return render_jira_markdown(report_type, sections, payload, mode), mode, sections
@@ -784,7 +1322,11 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
     commits = payload.get("recent_commits") or []
     areas = payload.get("top_areas") or []
     facets = payload.get("change_facets") or []
+    primary_facets = payload.get("primary_change_facets") or []
+    supporting_facets = payload.get("supporting_change_facets") or []
     changed_docs = payload.get("changed_docs") or []
+    ai_team = sections.get("_ai_team") or {}
+    ai_team_mode = str(sections.get("_ai_team_mode") or "fallback")
     title = str(sections.get("title") or report_type.title()).lstrip("# ").strip()
 
     def list_block(title_text: str, items: list[str]) -> str:
@@ -987,6 +1529,15 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
 """
 
     section_blocks: list[str] = []
+    if ai_team:
+        section_blocks.extend(
+            [
+                list_block(f"Gemini 구조 분석 ({ai_team_mode})", list(ai_team.get("structure") or [])),
+                list_block(f"Gemini 품질 분석 ({ai_team_mode})", list(ai_team.get("quality") or [])),
+                list_block(f"Gemini 기능 영향 ({ai_team_mode})", list(ai_team.get("feature") or [])),
+                list_block(f"Gemini Jira 전략 ({ai_team_mode})", list(ai_team.get("jira_strategy") or [])),
+            ]
+        )
     if report_type == "daily":
         section_blocks.extend(
             [
@@ -1047,10 +1598,26 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
             ]
         )
 
-    facet_html = "".join(
-        f'<span class="facet"><strong>{escape(str(item.get("name", "")))}</strong><em>{escape(str(item.get("reason", "")))}</em></span>'
-        for item in facets
-    ) or '<span class="facet"><strong>유지보수</strong><em>추가 분류 근거가 부족해 기본 태그를 사용했습니다.</em></span>'
+    source_insights = list(payload.get("source_insights") or [])
+    if source_insights:
+        section_blocks.insert(0, list_block("소스 기반 핵심 변경", source_insights))
+    auto_commit_items = build_auto_commit_status_items(payload.get("auto_commit_status") or {})
+    if auto_commit_items:
+        section_blocks.insert(1 if source_insights else 0, list_block("자동 커밋/푸시 상태", auto_commit_items))
+
+    primary_facet_html = "".join(
+        f'<span class="facet facet-primary"><strong>{escape(str(item.get("name", "")))}</strong><em>{escape(str(item.get("reason", "")))}</em></span>'
+        for item in primary_facets
+    )
+    supporting_facet_html = "".join(
+        f'<span class="facet facet-support"><strong>{escape(str(item.get("name", "")))}</strong><em>{escape(str(item.get("reason", "")))}</em></span>'
+        for item in supporting_facets
+    )
+    if not primary_facet_html and not supporting_facet_html:
+        supporting_facet_html = "".join(
+            f'<span class="facet facet-support"><strong>{escape(str(item.get("name", "")))}</strong><em>{escape(str(item.get("reason", "")))}</em></span>'
+            for item in facets
+        ) or '<span class="facet facet-support"><strong>유지보수</strong><em>추가 분류 근거가 부족해 기본 태그를 사용했습니다.</em></span>'
     commit_html = "".join(
         f"<li><code>{escape(str(item.get('hash', '')))}</code> {escape(str(item.get('subject', '')))} <span>{escape(str(item.get('author', '')))}</span></li>"
         for item in commits[:10]
@@ -1090,18 +1657,25 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
     .meta strong {{ font-size:22px; }}
     .actions {{ display:flex; gap:12px; flex-wrap:wrap; margin:0 0 18px; }}
     .actions a {{ text-decoration:none; color:var(--accent); background:#f5ede1; border:1px solid var(--line); padding:10px 14px; border-radius:999px; font-weight:700; }}
-    .facet-strip {{ display:flex; gap:10px; flex-wrap:wrap; margin:0 0 18px; }}
+    .facet-groups {{ display:grid; gap:14px; margin:0 0 18px; }}
+    .facet-group h3 {{ margin:0 0 8px; font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:#6b7280; }}
+    .facet-strip {{ display:flex; gap:10px; flex-wrap:wrap; }}
     .facet {{ display:inline-flex; flex-direction:column; gap:4px; min-width:180px; padding:12px 14px; border-radius:18px; border:1px solid var(--line); background:linear-gradient(180deg,#fff8ee,#f8eddc); }}
+    .facet-primary {{ background:linear-gradient(180deg,#fff1dd,#ffe3b8); border-color:#f59e0b; }}
+    .facet-support {{ background:linear-gradient(180deg,#fffaf2,#f5efe5); border-color:#d6c6aa; }}
     .facet strong {{ font-size:13px; text-transform:uppercase; color:#7c2d12; }}
     .facet em {{ font-style:normal; color:var(--muted); font-size:12px; line-height:1.45; }}
     .grid {{ display:grid; grid-template-columns:1.2fr .8fr; gap:16px; margin-bottom:16px; }}
     .stack {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
+    .chart-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px; }}
+    .content-stack {{ display:grid; gap:16px; margin-bottom:16px; }}
     .detail-panel {{ background:linear-gradient(180deg,rgba(255,255,255,.94),rgba(255,250,241,.98)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 42px rgba(23,33,43,.08); }}
     .detail-panel h3 {{ margin:0 0 12px; font-size:20px; }}
     .detail-panel ul {{ margin:0; padding-left:20px; }}
     .detail-panel li {{ margin-bottom:8px; line-height:1.5; }}
     .detail-panel li span {{ color:var(--muted); margin-left:8px; font-size:12px; }}
     .chart-wrap {{ background:linear-gradient(180deg,#fffdfa,#f9f3e9); border:1px solid var(--line); border-radius:24px; padding:22px; }}
+    .chart-large {{ min-height: 320px; }}
     .chart-wrap h3 {{ margin:0 0 12px; font-size:20px; }}
     .image-panel {{ grid-column:1 / -1; }}
     .image-slots {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }}
@@ -1145,6 +1719,7 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
       .meta {{ grid-template-columns:1fr 1fr; }}
       .grid {{ grid-template-columns:1fr; }}
       .stack {{ grid-template-columns:1fr; }}
+      .chart-grid {{ grid-template-columns:1fr; }}
       .image-slots {{ grid-template-columns:1fr; }}
       .area-grid {{ grid-template-columns:1fr; }}
     }}
@@ -1157,7 +1732,8 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
       <p>{escape(str(sections.get("summary") if isinstance(sections.get("summary"), str) else "Git, GitHub, 변경 통계, Jira 구조, 시각화를 포함한 상세 HTML 리포트입니다."))}</p>
       <div class="meta">
         <div><span>Repository</span><strong>{escape(str(payload.get("repository", "")))}</strong></div>
-        <div><span>Work Type</span><strong>{escape(str(payload.get("work_type", "")))}</strong></div>
+        <div><span>Profile</span><strong>{escape(str(payload.get("domain_profile_name", "")))}</strong></div>
+        <div><span>Work Type</span><strong>{escape(work_type_label(str(payload.get("work_type", ""))))}</strong></div>
         <div><span>Commits</span><strong>{int(payload.get("commit_count", 0))}</strong></div>
         <div><span>Files</span><strong>{int(payload.get("changed_file_count", 0))}</strong></div>
         <div><span>Mode</span><strong>{escape(mode)}</strong></div>
@@ -1166,21 +1742,36 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
     <div class="actions">
       <a href="{escape(markdown_path.as_uri())}">Source Markdown</a>
     </div>
-    <div class="facet-strip">{facet_html}</div>
-    <div class="grid">
-      <div class="stack">
-        {"".join(section_blocks)}
-      </div>
-      <div class="stack">
-        <section class="chart-wrap">
-          <h3>Top Change Areas</h3>
-          {svg_area_bars(areas[:5])}
-        </section>
-        <section class="chart-wrap">
-          <h3>Execution Flow</h3>
-          {svg_flow(areas[:4])}
-        </section>
-      </div>
+    <div class="facet-groups">
+      <section class="facet-group">
+        <h3>Primary Change Facets</h3>
+        <div class="facet-strip">{primary_facet_html or '<span class="facet facet-primary"><strong>핵심 변경</strong><em>주요 변경 성격이 아직 분리되지 않았습니다.</em></span>'}</div>
+      </section>
+      <section class="facet-group">
+        <h3>Supporting Change Facets</h3>
+        <div class="facet-strip">{supporting_facet_html or '<span class="facet facet-support"><strong>보조 변경 없음</strong><em>이번 리포트는 핵심 변경 중심으로 정리되었습니다.</em></span>'}</div>
+      </section>
+    </div>
+    <div class="chart-grid">
+      <section class="chart-wrap chart-large">
+        <h3>Top Change Areas</h3>
+        {svg_area_bars(areas[:5])}
+      </section>
+      <section class="chart-wrap chart-large">
+        <h3>Architecture Delta</h3>
+        {svg_architecture_delta(areas[:4], diff.get("top_files") or [])}
+      </section>
+      <section class="chart-wrap chart-large">
+        <h3>Code Structure Map</h3>
+        {svg_structure_map(diff.get("top_files") or [])}
+      </section>
+      <section class="chart-wrap chart-large">
+        <h3>Change Impact Map</h3>
+        {svg_change_impact_map(areas[:4], diff.get("top_files") or [], commits[:4])}
+      </section>
+    </div>
+    <div class="content-stack">
+      {"".join(section_blocks)}
     </div>
     <div class="grid">
       <section class="detail-panel">
@@ -1214,22 +1805,22 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
 def svg_area_bars(areas: list[dict[str, Any]]) -> str:
     if not areas:
         return "<p>No area data</p>"
-    width = 720
-    bar_height = 24
-    gap = 14
+    width = 960
+    bar_height = 34
+    gap = 18
     max_count = max(int(item.get("count", 0)) for item in areas) or 1
-    height = len(areas) * (bar_height + gap) + 24
+    height = len(areas) * (bar_height + gap) + 36
     parts = [f'<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="Area chart">']
-    y = 10
+    y = 12
     colors = ["#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51", "#6d597a"]
     for idx, item in enumerate(areas[:6]):
         label = escape(str(item.get("area", "")))
         count = int(item.get("count", 0))
-        bar_width = int((count / max_count) * 430)
+        bar_width = int((count / max_count) * 620)
         color = colors[idx % len(colors)]
-        parts.append(f'<text x="0" y="{y + 16}" font-size="13" fill="#1f2937">{label}</text>')
-        parts.append(f'<rect x="180" y="{y}" rx="8" ry="8" width="{bar_width}" height="{bar_height}" fill="{color}"></rect>')
-        parts.append(f'<text x="{190 + bar_width}" y="{y + 16}" font-size="12" fill="#111827">{count}</text>')
+        parts.append(f'<text x="0" y="{y + 22}" font-size="16" fill="#1f2937">{label}</text>')
+        parts.append(f'<rect x="240" y="{y}" rx="10" ry="10" width="{bar_width}" height="{bar_height}" fill="{color}"></rect>')
+        parts.append(f'<text x="{250 + bar_width}" y="{y + 22}" font-size="14" fill="#111827">{count}</text>')
         y += bar_height + gap
     parts.append("</svg>")
     return "".join(parts)
@@ -1239,30 +1830,171 @@ def svg_flow(areas: list[dict[str, Any]]) -> str:
     primary = escape(str(areas[0]["area"])) if areas else "Core Area"
     secondary = escape(str(areas[1]["area"])) if len(areas) > 1 else "Support Area"
     return f"""
-<svg viewBox="0 0 860 180" class="flow" role="img" aria-label="Change flow">
+<svg viewBox="0 0 1100 240" class="flow" role="img" aria-label="Change flow">
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
       <path d="M0,0 L0,6 L9,3 z" fill="#264653"></path>
     </marker>
   </defs>
-  <rect x="20" y="60" width="170" height="52" rx="14" fill="#264653"></rect>
-  <text x="105" y="91" text-anchor="middle" fill="#fff" font-size="14">Git / GitHub Activity</text>
-  <rect x="250" y="24" width="170" height="52" rx="14" fill="#2a9d8f"></rect>
-  <text x="335" y="55" text-anchor="middle" fill="#fff" font-size="14">{primary}</text>
-  <rect x="250" y="104" width="170" height="52" rx="14" fill="#e9c46a"></rect>
-  <text x="335" y="135" text-anchor="middle" fill="#1f2937" font-size="14">{secondary}</text>
-  <rect x="500" y="60" width="150" height="52" rx="14" fill="#f4a261"></rect>
-  <text x="575" y="91" text-anchor="middle" fill="#1f2937" font-size="14">Analysis / AI</text>
-  <rect x="700" y="60" width="140" height="52" rx="14" fill="#e76f51"></rect>
-  <text x="770" y="91" text-anchor="middle" fill="#fff" font-size="14">Reports</text>
-  <line x1="190" y1="86" x2="250" y2="50" stroke="#264653" stroke-width="3" marker-end="url(#arrow)"></line>
-  <line x1="190" y1="86" x2="250" y2="130" stroke="#264653" stroke-width="3" marker-end="url(#arrow)"></line>
-  <line x1="420" y1="50" x2="500" y2="86" stroke="#264653" stroke-width="3" marker-end="url(#arrow)"></line>
-  <line x1="420" y1="130" x2="500" y2="86" stroke="#264653" stroke-width="3" marker-end="url(#arrow)"></line>
-  <line x1="650" y1="86" x2="700" y2="86" stroke="#264653" stroke-width="3" marker-end="url(#arrow)"></line>
+  <rect x="20" y="90" width="210" height="60" rx="16" fill="#264653"></rect>
+  <text x="125" y="126" text-anchor="middle" fill="#fff" font-size="18">Git / GitHub Activity</text>
+  <rect x="320" y="24" width="220" height="60" rx="16" fill="#2a9d8f"></rect>
+  <text x="430" y="60" text-anchor="middle" fill="#fff" font-size="18">{primary}</text>
+  <rect x="320" y="146" width="220" height="60" rx="16" fill="#e9c46a"></rect>
+  <text x="430" y="182" text-anchor="middle" fill="#1f2937" font-size="18">{secondary}</text>
+  <rect x="650" y="90" width="190" height="60" rx="16" fill="#f4a261"></rect>
+  <text x="745" y="126" text-anchor="middle" fill="#1f2937" font-size="18">Analysis / AI</text>
+  <rect x="910" y="90" width="170" height="60" rx="16" fill="#e76f51"></rect>
+  <text x="995" y="126" text-anchor="middle" fill="#fff" font-size="18">Reports</text>
+  <line x1="230" y1="120" x2="320" y2="54" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
+  <line x1="230" y1="120" x2="320" y2="176" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
+  <line x1="540" y1="54" x2="650" y2="120" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
+  <line x1="540" y1="176" x2="650" y2="120" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
+  <line x1="840" y1="120" x2="910" y2="120" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
 </svg>
 """
 
+
+
+def svg_structure_map(top_files: list[dict[str, Any]]) -> str:
+    if not top_files:
+        return "<p>No structure data</p>"
+    roots = []
+    for item in top_files[:6]:
+        path = str(item.get("path", "")).replace("\\", "/")
+        roots.append(path.split("/"))
+    width = 1040
+    height = 90 + len(roots) * 36
+    parts = [f'<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="Structure map">']
+    parts.append('<rect x="20" y="20" width="180" height="48" rx="14" fill="#12343b"></rect>')
+    parts.append('<text x="110" y="50" text-anchor="middle" fill="#fff" font-size="18">Repository</text>')
+    y = 56
+    for idx, parts_list in enumerate(roots, start=1):
+        area = escape(parts_list[0] if parts_list else "root")
+        leaf = escape("/".join(parts_list[1:]) if len(parts_list) > 1 else area)
+        box_y = y + (idx - 1) * 36
+        parts.append(f'<line x1="200" y1="44" x2="320" y2="{box_y}" stroke="#264653" stroke-width="2.5"></line>')
+        parts.append(f'<rect x="320" y="{box_y-18}" width="190" height="30" rx="10" fill="#2a9d8f"></rect>')
+        parts.append(f'<text x="415" y="{box_y+2}" text-anchor="middle" fill="#fff" font-size="14">{area}</text>')
+        parts.append(f'<line x1="510" y1="{box_y-3}" x2="600" y2="{box_y-3}" stroke="#264653" stroke-width="2.5"></line>')
+        parts.append(f'<rect x="600" y="{box_y-18}" width="380" height="30" rx="10" fill="#f4a261"></rect>')
+        parts.append(f'<text x="790" y="{box_y+2}" text-anchor="middle" fill="#1f2937" font-size="13">{leaf}</text>')
+    parts.append('</svg>')
+    return ''.join(parts)
+
+
+def svg_action_roadmap(areas: list[dict[str, Any]], commits: list[dict[str, Any]]) -> str:
+    steps = []
+    for idx, item in enumerate(areas[:4], start=1):
+        steps.append((f'{item.get("area", "area")} 점검', f'{int(item.get("count", 0))} files'))
+    if not steps:
+        for idx, item in enumerate(commits[:4], start=1):
+            steps.append((f'Commit {idx}', str(item.get('subject', ''))))
+    width = 1040
+    height = 190
+    parts = [f'<svg viewBox="0 0 {width} {height}" class="flow" role="img" aria-label="Action roadmap">']
+    x = 30
+    colors = ["#264653", "#2a9d8f", "#e9c46a", "#f4a261"]
+    for idx, (title, subtitle) in enumerate(steps):
+        color = colors[idx % len(colors)]
+        parts.append(f'<rect x="{x}" y="56" width="210" height="74" rx="18" fill="{color}"></rect>')
+        parts.append(f'<text x="{x+105}" y="87" text-anchor="middle" fill="#fff" font-size="18">{escape(title)}</text>')
+        parts.append(f'<text x="{x+105}" y="110" text-anchor="middle" fill="#fff" font-size="12">{escape(subtitle)}</text>')
+        if idx < len(steps) - 1:
+            parts.append(f'<line x1="{x+210}" y1="93" x2="{x+250}" y2="93" stroke="#264653" stroke-width="4"></line>')
+            parts.append(f'<polygon points="{x+250},93 {x+238},86 {x+238},100" fill="#264653"></polygon>')
+        x += 250
+    parts.append('</svg>')
+    return ''.join(parts)
+
+
+def svg_architecture_delta(areas: list[dict[str, Any]], top_files: list[dict[str, Any]]) -> str:
+    primary = escape(str(areas[0]["area"])) if areas else "Primary Area"
+    secondary = escape(str(areas[1]["area"])) if len(areas) > 1 else "Secondary Area"
+    tertiary = escape(str(areas[2]["area"])) if len(areas) > 2 else "Output Area"
+    lead_file = escape(str((top_files[0] or {}).get("path", "core/module.py"))) if top_files else "core/module.py"
+    support_file = escape(str((top_files[1] or {}).get("path", "support/module.py"))) if len(top_files) > 1 else "support/module.py"
+    return f"""
+<svg viewBox="0 0 1100 320" class="flow" role="img" aria-label="Architecture delta">
+  <defs>
+    <marker id="arch-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#264653"></path>
+    </marker>
+  </defs>
+  <rect x="30" y="120" width="180" height="72" rx="18" fill="#12343b"></rect>
+  <text x="120" y="150" text-anchor="middle" fill="#fff" font-size="18">Repository</text>
+  <text x="120" y="174" text-anchor="middle" fill="#d8f3dc" font-size="13">Change Set</text>
+  <rect x="290" y="28" width="250" height="80" rx="18" fill="#2a9d8f"></rect>
+  <text x="415" y="60" text-anchor="middle" fill="#fff" font-size="20">{primary}</text>
+  <text x="415" y="84" text-anchor="middle" fill="#e6fffb" font-size="12">{lead_file}</text>
+  <rect x="290" y="120" width="250" height="80" rx="18" fill="#e9c46a"></rect>
+  <text x="415" y="152" text-anchor="middle" fill="#1f2937" font-size="20">{secondary}</text>
+  <text x="415" y="176" text-anchor="middle" fill="#4b5563" font-size="12">{support_file}</text>
+  <rect x="290" y="212" width="250" height="80" rx="18" fill="#f4a261"></rect>
+  <text x="415" y="244" text-anchor="middle" fill="#1f2937" font-size="20">{tertiary}</text>
+  <text x="415" y="268" text-anchor="middle" fill="#7c2d12" font-size="12">Derived output / docs / UI</text>
+  <rect x="640" y="74" width="190" height="78" rx="18" fill="#6d597a"></rect>
+  <text x="735" y="106" text-anchor="middle" fill="#fff" font-size="18">Structure</text>
+  <text x="735" y="130" text-anchor="middle" fill="#f3e8ff" font-size="13">Module boundary</text>
+  <rect x="640" y="178" width="190" height="78" rx="18" fill="#e76f51"></rect>
+  <text x="735" y="210" text-anchor="middle" fill="#fff" font-size="18">Validation</text>
+  <text x="735" y="234" text-anchor="middle" fill="#fee2e2" font-size="13">Risk / quality check</text>
+  <rect x="900" y="120" width="160" height="72" rx="18" fill="#264653"></rect>
+  <text x="980" y="150" text-anchor="middle" fill="#fff" font-size="18">Report Pack</text>
+  <text x="980" y="174" text-anchor="middle" fill="#dbeafe" font-size="12">Daily / Weekly / Jira</text>
+  <line x1="210" y1="156" x2="290" y2="68" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="210" y1="156" x2="290" y2="160" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="210" y1="156" x2="290" y2="252" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="540" y1="68" x2="640" y2="113" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="540" y1="160" x2="640" y2="113" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="540" y1="252" x2="640" y2="217" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="830" y1="113" x2="900" y2="156" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="830" y1="217" x2="900" y2="156" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+</svg>
+"""
+
+
+def svg_change_impact_map(areas: list[dict[str, Any]], top_files: list[dict[str, Any]], commits: list[dict[str, Any]]) -> str:
+    if not areas and not top_files and not commits:
+        return "<p>No impact data</p>"
+    nodes = []
+    for idx, item in enumerate(areas[:3], start=1):
+        nodes.append((f"Area {idx}", str(item.get("area", "area")), f'{int(item.get("count", 0))} files'))
+    for idx, item in enumerate(top_files[:2], start=len(nodes) + 1):
+        nodes.append((f"File {idx}", str(item.get("path", "")), f'+{int(item.get("added", 0))} / -{int(item.get("deleted", 0))}'))
+    width = 1100
+    height = 320
+    parts = [f'<svg viewBox="0 0 {width} {height}" class="flow" role="img" aria-label="Change impact map">']
+    parts.append('<defs><marker id="impact-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#7c2d12"></path></marker></defs>')
+    parts.append('<rect x="30" y="126" width="190" height="70" rx="18" fill="#7c2d12"></rect>')
+    parts.append('<text x="125" y="156" text-anchor="middle" fill="#fff" font-size="18">Changed Sources</text>')
+    parts.append('<text x="125" y="178" text-anchor="middle" fill="#ffedd5" font-size="12">Evidence from git diff</text>')
+    x_positions = [320, 320, 320, 630, 630]
+    y_positions = [24, 116, 208, 70, 186]
+    colors = ["#2a9d8f", "#e9c46a", "#f4a261", "#264653", "#6d597a"]
+    for idx, node in enumerate(nodes[:5]):
+        title, label, meta = node
+        x = x_positions[idx]
+        y = y_positions[idx]
+        fill = colors[idx % len(colors)]
+        text_fill = "#fff" if idx in (0, 3, 4) else "#1f2937"
+        meta_fill = "#e5e7eb" if idx in (0, 3, 4) else "#4b5563"
+        parts.append(f'<rect x="{x}" y="{y}" width="230" height="74" rx="18" fill="{fill}"></rect>')
+        parts.append(f'<text x="{x+115}" y="{y+28}" text-anchor="middle" fill="{text_fill}" font-size="16">{escape(title)}</text>')
+        parts.append(f'<text x="{x+115}" y="{y+48}" text-anchor="middle" fill="{text_fill}" font-size="13">{escape(label[:34])}</text>')
+        parts.append(f'<text x="{x+115}" y="{y+64}" text-anchor="middle" fill="{meta_fill}" font-size="11">{escape(meta)}</text>')
+    parts.append('<rect x="920" y="126" width="150" height="70" rx="18" fill="#12343b"></rect>')
+    parts.append('<text x="995" y="156" text-anchor="middle" fill="#fff" font-size="18">Impacted Output</text>')
+    parts.append('<text x="995" y="178" text-anchor="middle" fill="#dbeafe" font-size="12">UI / API / Docs / Jira</text>')
+    for target_y in (61, 153, 245):
+        parts.append(f'<line x1="220" y1="161" x2="320" y2="{target_y}" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append('<line x1="550" y1="61" x2="630" y2="107" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append('<line x1="550" y1="153" x2="630" y2="107" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append('<line x1="550" y1="245" x2="630" y2="223" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append('<line x1="860" y1="107" x2="920" y2="161" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append('<line x1="860" y1="223" x2="920" y2="161" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append('</svg>')
+    return ''.join(parts)
 
 def html_task_board(plan_sections: dict[str, Any], result_sections: dict[str, Any]) -> str:
     task_name = escape(str(plan_sections.get("task_name") or result_sections.get("task_name") or "-"))
@@ -1346,11 +2078,39 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
         commits = payload.get("recent_commits") or []
         changed_docs = payload.get("changed_docs") or []
         facets = payload.get("change_facets") or []
+        primary_facets = payload.get("primary_change_facets") or []
+        supporting_facets = payload.get("supporting_change_facets") or []
         diff = payload.get("diff_summary") or {}
-        facet_html = "".join(
-            f'<span class="facet-badge"><strong>{escape(str(item.get("name", "")))}</strong><em>{escape(str(item.get("reason", "")))}</em></span>'
-            for item in facets
-        ) or '<span class="facet-badge"><strong>유지보수</strong><em>추가 분류 근거가 부족해 기본 태그를 사용했습니다.</em></span>'
+        ai_team = sections.get("_ai_team") or {}
+        ai_mode = str(sections.get("_ai_team_mode") or "fallback")
+        primary_facet_html = "".join(
+            f'<span class="facet-badge facet-badge-primary"><strong>{escape(str(item.get("name", "")))}</strong><em>{escape(str(item.get("reason", "")))}</em></span>'
+            for item in primary_facets
+        )
+        supporting_facet_html = "".join(
+            f'<span class="facet-badge facet-badge-support"><strong>{escape(str(item.get("name", "")))}</strong><em>{escape(str(item.get("reason", "")))}</em></span>'
+            for item in supporting_facets
+        )
+        if not primary_facet_html and not supporting_facet_html:
+            supporting_facet_html = "".join(
+                f'<span class="facet-badge facet-badge-support"><strong>{escape(str(item.get("name", "")))}</strong><em>{escape(str(item.get("reason", "")))}</em></span>'
+                for item in facets
+            ) or '<span class="facet-badge facet-badge-support"><strong>유지보수</strong><em>추가 분류 근거가 부족해 기본 태그를 사용했습니다.</em></span>'
+        ai_panel = ""
+        if ai_team:
+            ai_panel = f"""
+  <div class="grid">
+    <div class="panel">
+      <h3>Gemini Structure / Quality</h3>
+      <p class="mini-meta">Mode: {escape(ai_mode)}</p>
+      <ul>{"".join(f"<li>{escape(str(x))}</li>" for x in (list(ai_team.get('structure') or [])[:2] + list(ai_team.get('quality') or [])[:2])) or "<li>No AI analysis</li>"}</ul>
+    </div>
+    <div class="panel">
+      <h3>Gemini Feature / Jira</h3>
+      <ul>{"".join(f"<li>{escape(str(x))}</li>" for x in (list(ai_team.get('feature') or [])[:2] + list(ai_team.get('jira_strategy') or [])[:2])) or "<li>No AI analysis</li>"}</ul>
+    </div>
+  </div>
+"""
         tone = {
             "daily": "tone-daily",
             "plan": "tone-plan",
@@ -1375,7 +2135,7 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
   <div class="card-head">
     <div>
       <h2>{escape(card['title'])}</h2>
-      <p class="meta">{escape(card['report_type']).upper()} · {escape(card['mode']).upper()} · {escape(payload.get('work_type', '')).upper()}</p>
+      <p class="meta">{escape(card['report_type']).upper()} · {escape(card['mode']).upper()} · {escape(work_type_label(str(payload.get('work_type', ''))))}</p>
     </div>
     <a class="file-link" href="{escape(card.get('html_path', card['path']).as_uri())}">Open Detail Report</a>
   </div>
@@ -1385,7 +2145,11 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
     <div><span>Added Lines</span><strong>{diff.get('total_added', 0)}</strong></div>
     <div><span>Deleted Lines</span><strong>{diff.get('total_deleted', 0)}</strong></div>
   </div>
-  <div class="facet-strip">{facet_html}</div>
+  <div class="facet-group-inline">
+    <div class="facet-strip">{primary_facet_html or '<span class="facet-badge facet-badge-primary"><strong>핵심 변경</strong><em>주요 변경 성격이 아직 분리되지 않았습니다.</em></span>'}</div>
+    <div class="facet-strip">{supporting_facet_html or '<span class="facet-badge facet-badge-support"><strong>보조 변경 없음</strong><em>이번 리포트는 핵심 변경 중심으로 정리되었습니다.</em></span>'}</div>
+  </div>
+  {ai_panel}
   {board_html}
   <div class="grid">
     <div class="panel">
@@ -1393,8 +2157,8 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
       {svg_area_bars(areas[:5])}
     </div>
     <div class="panel">
-      <h3>Execution Flow</h3>
-      {svg_flow(areas[:4])}
+      <h3>Architecture Delta</h3>
+      {svg_architecture_delta(areas[:4], (payload.get("diff_summary") or {}).get("top_files") or [])}
     </div>
   </div>
   <div class="grid">
@@ -1462,8 +2226,11 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
     .stats span {{ display: block; color: var(--muted); font-size: 11px; margin-bottom: 8px; letter-spacing: 0.08em; text-transform: uppercase; }}
     .stats strong {{ font-size: 30px; line-height: 1; }}
     .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }}
-    .facet-strip {{ display:flex; gap:10px; flex-wrap:wrap; margin: 0 0 18px; }}
+    .facet-group-inline {{ display:grid; gap:8px; margin: 0 0 18px; }}
+    .facet-strip {{ display:flex; gap:10px; flex-wrap:wrap; margin: 0; }}
     .facet-badge {{ display:inline-flex; flex-direction:column; gap:4px; padding:12px 14px; border-radius:18px; background:linear-gradient(180deg,#fff8ee,#f8eddc); border:1px solid var(--line); min-width:180px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
+    .facet-badge-primary {{ background:linear-gradient(180deg,#fff1dd,#ffe3b8); border-color:#f59e0b; }}
+    .facet-badge-support {{ background:linear-gradient(180deg,#fffaf2,#f5efe5); border-color:#d6c6aa; }}
     .facet-badge strong {{ font-size:13px; letter-spacing:.04em; text-transform:uppercase; color:#7c2d12; }}
     .facet-badge em {{ font-style:normal; color:var(--muted); font-size:12px; line-height:1.45; }}
     .task-board {{ display:grid; grid-template-columns: 1.1fr 1fr 1fr; gap:14px; margin: 0 0 18px; }}
@@ -1486,6 +2253,7 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
     .state.planned {{ background:#fef3c7; color:#92400e; }}
     .panel {{ border: 1px solid var(--line); border-radius: 22px; padding: 18px; background: linear-gradient(180deg, #fffdfa, #f9f3e9); overflow: auto; box-shadow: inset 0 1px 0 rgba(255,255,255,0.75); }}
     .panel h3 {{ margin-top: 0; margin-bottom: 12px; font-size: 18px; letter-spacing: 0.01em; }}
+    .mini-meta {{ margin: -4px 0 10px; color: var(--muted); font-size: 12px; }}
     .panel ul {{ margin: 0; padding-left: 20px; }}
     .panel li {{ margin-bottom: 8px; line-height: 1.45; }}
     .chart, .flow {{ width: 100%; height: auto; }}
@@ -1535,6 +2303,7 @@ def make_payload(
     commits: list[Commit],
     changed_files: list[str],
     uncommitted: list[str],
+    profile_name: str,
 ) -> dict[str, Any]:
     github_meta = fetch_github_metadata(remote_url, branch, window, commits)
     return build_context_payload(
@@ -1550,12 +2319,14 @@ def make_payload(
         changed_files=changed_files,
         uncommitted=uncommitted,
         github_meta=github_meta,
+        profile_name=profile_name,
     )
 
 
 def build_week_window(today: date) -> ReportWindow:
     monday = today - timedelta(days=today.weekday())
-    return ReportWindow(start=monday, end=today, label=f"{monday.isoformat()}_to_{today.isoformat()}")
+    end = previous_business_day(today)
+    return ReportWindow(start=monday, end=end, label=f"{monday.isoformat()}_to_{end.isoformat()}")
 
 
 def build_previous_month_window(today: date) -> ReportWindow:
@@ -1563,11 +2334,65 @@ def build_previous_month_window(today: date) -> ReportWindow:
     return ReportWindow(start=start, end=end, label=start.strftime("%Y-%m"))
 
 
+def default_domain_profile(repo_name: str) -> str:
+    name = repo_name.lower()
+    if name == "260105":
+        return "uds_quality"
+    if "greencore" in name:
+        return "desktop_app"
+    if "autoreport" in name:
+        return "reporting_automation"
+    return "general_software"
+
+
+def get_domain_profile(profile_name: str) -> dict[str, Any]:
+    profiles = {
+        "uds_quality": {
+            "name": "UDS 품질 분석",
+            "focus": [
+                "UDS 생성 흐름",
+                "품질 게이트와 validation",
+                "테스트/회귀 검증",
+                "소스 파싱 및 영향 분석",
+            ],
+        },
+        "desktop_app": {
+            "name": "데스크톱 애플리케이션 분석",
+            "focus": [
+                "기능 동작 변화",
+                "UI/UX 흐름",
+                "앱 구조와 배포 영향",
+                "사용자 시나리오 검증",
+            ],
+        },
+        "reporting_automation": {
+            "name": "리포팅 자동화 분석",
+            "focus": [
+                "자동화 스케줄링",
+                "리포트 생성 파이프라인",
+                "HTML/Markdown 렌더링",
+                "운영 안정성과 재시도",
+            ],
+        },
+        "general_software": {
+            "name": "일반 소프트웨어 분석",
+            "focus": [
+                "기능 변화",
+                "구조 변경",
+                "품질/테스트 영향",
+                "작업 계획과 Jira 정리",
+            ],
+        },
+    }
+    return profiles.get(profile_name, profiles["general_software"])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate startup daily/weekly/monthly reports.")
     parser.add_argument("--repo", default=".")
     parser.add_argument("--date", default=None, help="Reference date YYYY-MM-DD")
     parser.add_argument("--output-root", default=None, help="Optional output root directory")
+    parser.add_argument("--profile", default=None, help="Optional domain profile for AI analysis")
     return parser.parse_args()
 
 
@@ -1576,14 +2401,15 @@ def main() -> int:
     repo_root = detect_repo_root(Path(args.repo).resolve())
     output_root = Path(args.output_root).resolve() if args.output_root else repo_root
     today = date.fromisoformat(args.date) if args.date else date.today()
+    profile_name = str(args.profile or default_domain_profile(repo_root.name))
     branch = detect_branch(repo_root)
     remote_url = detect_remote_url(repo_root)
     upstream = detect_upstream(repo_root)
     sync_state = ahead_behind(repo_root, upstream)
     generated: list[Path] = []
 
-    yesterday = today - timedelta(days=1)
-    daily_window = ReportWindow(yesterday, today, today.isoformat())
+    last_business_day = previous_business_day(today)
+    daily_window = ReportWindow(last_business_day, last_business_day, last_business_day.isoformat())
     daily_commits = get_commits(repo_root, branch, daily_window.start, daily_window.end)
     daily_files = [path for path in get_changed_files(repo_root, branch, daily_window.start, daily_window.end) if is_relevant_path(path)]
     uncommitted = get_uncommitted(repo_root)
@@ -1600,6 +2426,7 @@ def main() -> int:
         commits=daily_commits,
         changed_files=daily_files,
         uncommitted=uncommitted,
+        profile_name=profile_name,
     )
 
     output_specs = [
@@ -1636,6 +2463,7 @@ def main() -> int:
             commits=weekly_commits,
             changed_files=weekly_files,
             uncommitted=uncommitted,
+            profile_name=profile_name,
         )
         weekly_path = output_root / "reports" / "weekly_brief" / f"{today.isoformat()}-weekly-report.md"
         weekly_text, weekly_mode, weekly_sections = generate_document("weekly", weekly_payload)
@@ -1664,6 +2492,7 @@ def main() -> int:
                 commits=monthly_commits,
                 changed_files=monthly_files,
                 uncommitted=uncommitted,
+                profile_name=profile_name,
             )
             monthly_text, monthly_mode, monthly_sections = generate_document("monthly", monthly_payload)
             write_text(monthly_path, monthly_text)

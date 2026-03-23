@@ -3,11 +3,19 @@
     {
       "name": "260105",
       "path": "D:/Project/devops/260105",
+      "profile": "uds_quality",
       "enabled": true
     },
     {
       "name": "GreencoreMaster",
       "path": "D:/Project/Program/GreencoreMaster",
+      "profile": "desktop_app",
+      "enabled": true
+    },
+    {
+      "name": "AutoReport",
+      "path": "D:/Project/Program/AutoReport",
+      "profile": "reporting_automation",
       "enabled": true
     }
   ]
