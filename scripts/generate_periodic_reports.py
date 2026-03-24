@@ -22,6 +22,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import config
+from scripts.design_system import (
+    DESIGN_CSS, CHECKLIST_JS,
+    SVG_PALETTE, SVG_BG_DARK, SVG_STROKE, SVG_TEXT_DARK, SVG_TEXT_DARKER,
+    SVG_TEXT_LIGHT, SVG_TEXT_MUTED, SVG_TEXT_ACCENT, SVG_IMPACT_STROKE,
+    SVG_SUBTITLE_TINTS, svg_text_color_for,
+)
 
 
 def load_get_adapter():
@@ -1748,107 +1754,16 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{escape(title)}</title>
   <style>
-    :root {{
-      --bg:#f5efe4; --paper:#fffdf9; --ink:#17212b; --muted:#5f6b76; --line:#ddd2c1;
-      --accent:#0f4c5c; --accent2:#d17a22; --hero-a:#12343b; --hero-b:#2c6e63;
-    }}
-    * {{ box-sizing:border-box; }}
-    body {{ margin:0; font-family:"Segoe UI","Noto Sans KR",sans-serif; color:var(--ink); background:
-      radial-gradient(circle at top right, rgba(209,122,34,.14), transparent 24%),
-      linear-gradient(180deg,#f8f3e9 0%, var(--bg) 100%); }}
-    .wrap {{ max-width:1320px; margin:0 auto; padding:32px 28px 48px; }}
-    .hero {{ background:linear-gradient(135deg,var(--hero-a),var(--hero-b)); color:#fff; border-radius:28px; padding:32px; box-shadow:0 24px 60px rgba(18,52,59,.24); margin-bottom:22px; }}
-    .hero h1 {{ margin:0 0 10px; font-size:38px; line-height:1.08; }}
-    .hero p {{ margin:0; max-width:820px; opacity:.92; }}
-    .meta {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin:20px 0 0; }}
-    .meta div {{ background:rgba(255,255,255,.1); border:1px solid rgba(255,255,255,.14); border-radius:18px; padding:14px; }}
-    .meta span {{ display:block; font-size:11px; text-transform:uppercase; letter-spacing:.08em; opacity:.8; margin-bottom:8px; }}
-    .meta strong {{ font-size:22px; }}
-    .actions {{ display:flex; gap:12px; flex-wrap:wrap; margin:0 0 18px; }}
-    .actions a {{ text-decoration:none; color:var(--accent); background:#f5ede1; border:1px solid var(--line); padding:10px 14px; border-radius:999px; font-weight:700; }}
-    .facet-groups {{ display:grid; gap:14px; margin:0 0 18px; }}
-    .facet-group h3 {{ margin:0 0 8px; font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:#6b7280; }}
-    .facet-strip {{ display:flex; gap:10px; flex-wrap:wrap; }}
-    .facet {{ display:inline-flex; flex-direction:column; gap:4px; min-width:180px; padding:12px 14px; border-radius:18px; border:1px solid var(--line); background:linear-gradient(180deg,#fff8ee,#f8eddc); }}
-    .facet-primary {{ background:linear-gradient(180deg,#fff1dd,#ffe3b8); border-color:#f59e0b; }}
-    .facet-support {{ background:linear-gradient(180deg,#fffaf2,#f5efe5); border-color:#d6c6aa; }}
-    .facet strong {{ font-size:13px; text-transform:uppercase; color:#7c2d12; }}
-    .facet em {{ font-style:normal; color:var(--muted); font-size:12px; line-height:1.45; }}
-    .grid {{ display:grid; grid-template-columns:1.2fr .8fr; gap:16px; margin-bottom:16px; }}
-    .stack {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; }}
-    .chart-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:16px; }}
-    .content-stack {{ display:grid; gap:16px; margin-bottom:16px; }}
-    .detail-panel {{ background:linear-gradient(180deg,rgba(255,255,255,.94),rgba(255,250,241,.98)); border:1px solid var(--line); border-radius:24px; padding:22px; box-shadow:0 18px 42px rgba(23,33,43,.08); }}
-    .detail-panel h3 {{ margin:0 0 12px; font-size:20px; }}
-    .detail-panel ul {{ margin:0; padding-left:20px; }}
-    .detail-panel li {{ margin-bottom:8px; line-height:1.5; }}
+{DESIGN_CSS}
+    /* --- Detail-report overrides --- */
+    .grid {{ grid-template-columns:1.2fr .8fr; }}
     .detail-panel li.checklist-item {{ list-style:none; margin-left:-20px; }}
-    .check-label {{ display:flex; gap:10px; align-items:flex-start; cursor:pointer; }}
-    .check-input {{ position:absolute; opacity:0; pointer-events:none; }}
-    .check-box {{ width:18px; height:18px; border:2px solid #d17a22; border-radius:6px; flex:0 0 auto; margin-top:2px; background:linear-gradient(180deg,#fff9ef,#f8eddc); }}
-    .check-input:checked + .check-box {{ background:linear-gradient(180deg,#e8faf6,#dff5ef); border-color:#2a9d8f; position:relative; }}
-    .check-input:checked + .check-box::after {{ content:""; position:absolute; left:4px; top:0px; width:5px; height:10px; border:solid #166534; border-width:0 2px 2px 0; transform:rotate(45deg); }}
-    .check-text {{ flex:1; }}
-    .check-input:checked ~ .check-text {{ color:#6b7280; text-decoration:line-through; }}
     .detail-panel li span {{ color:var(--muted); margin-left:8px; font-size:12px; }}
-    .chart-wrap {{ background:linear-gradient(180deg,#fffdfa,#f9f3e9); border:1px solid var(--line); border-radius:24px; padding:22px; }}
-    .chart-large {{ min-height: 320px; }}
-    .chart-wrap h3 {{ margin:0 0 12px; font-size:20px; }}
-    .image-panel {{ grid-column:1 / -1; }}
-    .image-slots {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }}
-    .image-slot {{ min-height:240px; border:2px dashed #d8ccb7; border-radius:20px; padding:18px; background:linear-gradient(180deg,#fffdfa,#f8f1e4); display:flex; flex-direction:column; gap:12px; }}
-    .image-slot span {{ display:block; font-size:16px; font-weight:700; margin-bottom:4px; }}
-    .image-slot small {{ color:var(--muted); line-height:1.5; }}
-    .evidence-meta strong {{ display:block; margin-bottom:6px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#7c2d12; }}
-    .evidence-meta ul {{ margin:0; padding-left:18px; }}
-    .evidence-meta li {{ margin-bottom:6px; line-height:1.45; }}
-    .evidence-meta a {{ color:var(--accent); font-weight:700; text-decoration:none; }}
-    .evidence-placeholder {{ margin-top:auto; border:1px dashed #c8b9a5; border-radius:14px; padding:12px; font-size:12px; color:var(--muted); background:rgba(255,255,255,.65); }}
-    .timeline {{ display:grid; gap:14px; }}
-    .timeline-step {{ display:grid; grid-template-columns:auto 1fr; gap:14px; align-items:start; }}
-    .timeline-marker {{ width:34px; height:34px; border-radius:50%; background:#12343b; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:700; }}
-    .timeline-copy strong {{ display:block; margin-bottom:4px; }}
-    .timeline-copy span {{ color:var(--muted); font-size:12px; }}
-    .area-section {{ margin-top:16px; }}
-    .area-stack {{ display:grid; gap:14px; }}
-    .area-card {{ border:1px solid var(--line); border-radius:20px; padding:18px; background:linear-gradient(180deg,#fffdfa,#f8f1e4); }}
-    .area-head {{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:12px; }}
-    .area-head h3 {{ margin:0; font-size:20px; }}
-    .area-head span {{ color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }}
-    .area-badges {{ display:flex; gap:8px; flex-wrap:wrap; margin:0 0 12px; }}
-    .mini-badge {{ display:inline-flex; align-items:center; padding:7px 10px; border-radius:999px; font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; border:1px solid var(--line); background:#fff; }}
-    .priority-high, .impact-high, .risk-high {{ background:#fee2e2; color:#991b1b; border-color:#fecaca; }}
-    .priority-medium, .impact-medium, .risk-medium {{ background:#fef3c7; color:#92400e; border-color:#fde68a; }}
-    .priority-low, .impact-low, .risk-low {{ background:#dcfce7; color:#166534; border-color:#bbf7d0; }}
-    .owner {{ background:#e0f2fe; color:#075985; border-color:#bae6fd; }}
-    .status {{ background:#ede9fe; color:#5b21b6; border-color:#ddd6fe; }}
-    .area-grid {{ display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; }}
-    .area-grid h4 {{ margin:0 0 8px; font-size:14px; color:#7c2d12; text-transform:uppercase; letter-spacing:.06em; }}
-    .area-grid ul {{ margin:0; padding-left:18px; }}
-    .area-grid li {{ margin-bottom:6px; line-height:1.45; }}
-    .table-wrap {{ overflow:auto; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th, td {{ padding:12px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }}
-    th {{ font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }}
-    code {{ background:#efe6d8; padding:2px 7px; border-radius:8px; }}
-    @media print {{
-      body {{ background:#fff; }}
-      .wrap {{ max-width:none; padding:0; }}
-      .hero, .detail-panel, .chart-wrap {{ box-shadow:none; break-inside:avoid; }}
-      .actions a {{ border-color:#bbb; }}
-    }}
-    @media (max-width:960px) {{
-      .meta {{ grid-template-columns:1fr 1fr; }}
-      .grid {{ grid-template-columns:1fr; }}
-      .stack {{ grid-template-columns:1fr; }}
-      .chart-grid {{ grid-template-columns:1fr; }}
-      .image-slots {{ grid-template-columns:1fr; }}
-      .area-grid {{ grid-template-columns:1fr; }}
-    }}
   </style>
 </head>
 <body>
-  <div class="wrap">
+  <a href="#main-content" class="skip-link">Skip to content</a>
+  <div class="wrap" id="main-content">
     <section class="hero">
       <h1>{escape(title)}</h1>
       <p>{escape(str(sections.get("summary") if isinstance(sections.get("summary"), str) else "Git, GitHub, 변경 통계, Jira 구조, 시각화를 포함한 상세 HTML 리포트입니다."))}</p>
@@ -1948,17 +1863,16 @@ def svg_area_bars(areas: list[dict[str, Any]]) -> str:
     gap = 18
     max_count = max(int(item.get("count", 0)) for item in areas) or 1
     height = len(areas) * (bar_height + gap) + 36
-    parts = [f'<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="Area chart">']
+    parts = [f'<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="Area chart"><title>Area distribution chart</title>']
     y = 12
-    colors = ["#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51", "#6d597a"]
     for idx, item in enumerate(areas[:6]):
         label = escape(str(item.get("area", "")))
         count = int(item.get("count", 0))
         bar_width = int((count / max_count) * 620)
-        color = colors[idx % len(colors)]
-        parts.append(f'<text x="0" y="{y + 22}" font-size="16" fill="#1f2937">{label}</text>')
+        color = SVG_PALETTE[idx % len(SVG_PALETTE)]
+        parts.append(f'<text x="0" y="{y + 22}" font-size="16" fill="{SVG_TEXT_DARK}">{label}</text>')
         parts.append(f'<rect x="240" y="{y}" rx="10" ry="10" width="{bar_width}" height="{bar_height}" fill="{color}"></rect>')
-        parts.append(f'<text x="{250 + bar_width}" y="{y + 22}" font-size="14" fill="#111827">{count}</text>')
+        parts.append(f'<text x="{250 + bar_width}" y="{y + 22}" font-size="14" fill="{SVG_TEXT_DARKER}">{count}</text>')
         y += bar_height + gap
     parts.append("</svg>")
     return "".join(parts)
@@ -1967,28 +1881,30 @@ def svg_area_bars(areas: list[dict[str, Any]]) -> str:
 def svg_flow(areas: list[dict[str, Any]]) -> str:
     primary = escape(str(areas[0]["area"])) if areas else "Core Area"
     secondary = escape(str(areas[1]["area"])) if len(areas) > 1 else "Support Area"
+    p = SVG_PALETTE
     return f"""
 <svg viewBox="0 0 1100 240" class="flow" role="img" aria-label="Change flow">
+  <title>Change flow diagram</title>
   <defs>
     <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
-      <path d="M0,0 L0,6 L9,3 z" fill="#264653"></path>
+      <path d="M0,0 L0,6 L9,3 z" fill="{SVG_STROKE}"></path>
     </marker>
   </defs>
-  <rect x="20" y="90" width="210" height="60" rx="16" fill="#264653"></rect>
-  <text x="125" y="126" text-anchor="middle" fill="#fff" font-size="18">Git / GitHub Activity</text>
-  <rect x="320" y="24" width="220" height="60" rx="16" fill="#2a9d8f"></rect>
-  <text x="430" y="60" text-anchor="middle" fill="#fff" font-size="18">{primary}</text>
-  <rect x="320" y="146" width="220" height="60" rx="16" fill="#e9c46a"></rect>
-  <text x="430" y="182" text-anchor="middle" fill="#1f2937" font-size="18">{secondary}</text>
-  <rect x="650" y="90" width="190" height="60" rx="16" fill="#f4a261"></rect>
-  <text x="745" y="126" text-anchor="middle" fill="#1f2937" font-size="18">Analysis / AI</text>
-  <rect x="910" y="90" width="170" height="60" rx="16" fill="#e76f51"></rect>
-  <text x="995" y="126" text-anchor="middle" fill="#fff" font-size="18">Reports</text>
-  <line x1="230" y1="120" x2="320" y2="54" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
-  <line x1="230" y1="120" x2="320" y2="176" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
-  <line x1="540" y1="54" x2="650" y2="120" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
-  <line x1="540" y1="176" x2="650" y2="120" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
-  <line x1="840" y1="120" x2="910" y2="120" stroke="#264653" stroke-width="4" marker-end="url(#arrow)"></line>
+  <rect x="20" y="90" width="210" height="60" rx="16" fill="{p[0]}"></rect>
+  <text x="125" y="126" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Git / GitHub Activity</text>
+  <rect x="320" y="24" width="220" height="60" rx="16" fill="{p[1]}"></rect>
+  <text x="430" y="60" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">{primary}</text>
+  <rect x="320" y="146" width="220" height="60" rx="16" fill="{p[2]}"></rect>
+  <text x="430" y="182" text-anchor="middle" fill="{SVG_TEXT_DARK}" font-size="18">{secondary}</text>
+  <rect x="650" y="90" width="190" height="60" rx="16" fill="{p[3]}"></rect>
+  <text x="745" y="126" text-anchor="middle" fill="{SVG_TEXT_DARK}" font-size="18">Analysis / AI</text>
+  <rect x="910" y="90" width="170" height="60" rx="16" fill="{p[4]}"></rect>
+  <text x="995" y="126" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Reports</text>
+  <line x1="230" y1="120" x2="320" y2="54" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arrow)"></line>
+  <line x1="230" y1="120" x2="320" y2="176" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arrow)"></line>
+  <line x1="540" y1="54" x2="650" y2="120" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arrow)"></line>
+  <line x1="540" y1="176" x2="650" y2="120" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arrow)"></line>
+  <line x1="840" y1="120" x2="910" y2="120" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arrow)"></line>
 </svg>
 """
 
@@ -2003,20 +1919,20 @@ def svg_structure_map(top_files: list[dict[str, Any]]) -> str:
         roots.append(path.split("/"))
     width = 1040
     height = 90 + len(roots) * 36
-    parts = [f'<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="Structure map">']
-    parts.append('<rect x="20" y="20" width="180" height="48" rx="14" fill="#12343b"></rect>')
-    parts.append('<text x="110" y="50" text-anchor="middle" fill="#fff" font-size="18">Repository</text>')
+    parts = [f'<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="Structure map"><title>Repository structure map</title>']
+    parts.append(f'<rect x="20" y="20" width="180" height="48" rx="14" fill="{SVG_BG_DARK}"></rect>')
+    parts.append(f'<text x="110" y="50" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Repository</text>')
     y = 56
     for idx, parts_list in enumerate(roots, start=1):
         area = escape(parts_list[0] if parts_list else "root")
         leaf = escape("/".join(parts_list[1:]) if len(parts_list) > 1 else area)
         box_y = y + (idx - 1) * 36
-        parts.append(f'<line x1="200" y1="44" x2="320" y2="{box_y}" stroke="#264653" stroke-width="2.5"></line>')
-        parts.append(f'<rect x="320" y="{box_y-18}" width="190" height="30" rx="10" fill="#2a9d8f"></rect>')
-        parts.append(f'<text x="415" y="{box_y+2}" text-anchor="middle" fill="#fff" font-size="14">{area}</text>')
-        parts.append(f'<line x1="510" y1="{box_y-3}" x2="600" y2="{box_y-3}" stroke="#264653" stroke-width="2.5"></line>')
-        parts.append(f'<rect x="600" y="{box_y-18}" width="380" height="30" rx="10" fill="#f4a261"></rect>')
-        parts.append(f'<text x="790" y="{box_y+2}" text-anchor="middle" fill="#1f2937" font-size="13">{leaf}</text>')
+        parts.append(f'<line x1="200" y1="44" x2="320" y2="{box_y}" stroke="{SVG_STROKE}" stroke-width="2.5"></line>')
+        parts.append(f'<rect x="320" y="{box_y-18}" width="190" height="30" rx="10" fill="{SVG_PALETTE[1]}"></rect>')
+        parts.append(f'<text x="415" y="{box_y+2}" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="14">{area}</text>')
+        parts.append(f'<line x1="510" y1="{box_y-3}" x2="600" y2="{box_y-3}" stroke="{SVG_STROKE}" stroke-width="2.5"></line>')
+        parts.append(f'<rect x="600" y="{box_y-18}" width="380" height="30" rx="10" fill="{SVG_PALETTE[3]}"></rect>')
+        parts.append(f'<text x="790" y="{box_y+2}" text-anchor="middle" fill="{SVG_TEXT_DARK}" font-size="13">{leaf}</text>')
     parts.append('</svg>')
     return ''.join(parts)
 
@@ -2030,17 +1946,17 @@ def svg_action_roadmap(areas: list[dict[str, Any]], commits: list[dict[str, Any]
             steps.append((f'Commit {idx}', str(item.get('subject', ''))))
     width = 1040
     height = 190
-    parts = [f'<svg viewBox="0 0 {width} {height}" class="flow" role="img" aria-label="Action roadmap">']
+    parts = [f'<svg viewBox="0 0 {width} {height}" class="flow" role="img" aria-label="Action roadmap"><title>Action roadmap</title>']
     x = 30
-    colors = ["#264653", "#2a9d8f", "#e9c46a", "#f4a261"]
     for idx, (title, subtitle) in enumerate(steps):
-        color = colors[idx % len(colors)]
+        color = SVG_PALETTE[idx % len(SVG_PALETTE)]
+        text_c = svg_text_color_for(color)
         parts.append(f'<rect x="{x}" y="56" width="210" height="74" rx="18" fill="{color}"></rect>')
-        parts.append(f'<text x="{x+105}" y="87" text-anchor="middle" fill="#fff" font-size="18">{escape(title)}</text>')
-        parts.append(f'<text x="{x+105}" y="110" text-anchor="middle" fill="#fff" font-size="12">{escape(subtitle)}</text>')
+        parts.append(f'<text x="{x+105}" y="87" text-anchor="middle" fill="{text_c}" font-size="18">{escape(title)}</text>')
+        parts.append(f'<text x="{x+105}" y="110" text-anchor="middle" fill="{text_c}" font-size="12">{escape(subtitle)}</text>')
         if idx < len(steps) - 1:
-            parts.append(f'<line x1="{x+210}" y1="93" x2="{x+250}" y2="93" stroke="#264653" stroke-width="4"></line>')
-            parts.append(f'<polygon points="{x+250},93 {x+238},86 {x+238},100" fill="#264653"></polygon>')
+            parts.append(f'<line x1="{x+210}" y1="93" x2="{x+250}" y2="93" stroke="{SVG_STROKE}" stroke-width="4"></line>')
+            parts.append(f'<polygon points="{x+250},93 {x+238},86 {x+238},100" fill="{SVG_STROKE}"></polygon>')
         x += 250
     parts.append('</svg>')
     return ''.join(parts)
@@ -2052,42 +1968,44 @@ def svg_architecture_delta(areas: list[dict[str, Any]], top_files: list[dict[str
     tertiary = escape(str(areas[2]["area"])) if len(areas) > 2 else "Output Area"
     lead_file = escape(str((top_files[0] or {}).get("path", "core/module.py"))) if top_files else "core/module.py"
     support_file = escape(str((top_files[1] or {}).get("path", "support/module.py"))) if len(top_files) > 1 else "support/module.py"
+    p, t = SVG_PALETTE, SVG_SUBTITLE_TINTS
     return f"""
 <svg viewBox="0 0 1100 320" class="flow" role="img" aria-label="Architecture delta">
+  <title>Architecture delta</title>
   <defs>
     <marker id="arch-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
-      <path d="M0,0 L0,6 L9,3 z" fill="#264653"></path>
+      <path d="M0,0 L0,6 L9,3 z" fill="{SVG_STROKE}"></path>
     </marker>
   </defs>
-  <rect x="30" y="120" width="180" height="72" rx="18" fill="#12343b"></rect>
-  <text x="120" y="150" text-anchor="middle" fill="#fff" font-size="18">Repository</text>
-  <text x="120" y="174" text-anchor="middle" fill="#d8f3dc" font-size="13">Change Set</text>
-  <rect x="290" y="28" width="250" height="80" rx="18" fill="#2a9d8f"></rect>
-  <text x="415" y="60" text-anchor="middle" fill="#fff" font-size="20">{primary}</text>
-  <text x="415" y="84" text-anchor="middle" fill="#e6fffb" font-size="12">{lead_file}</text>
-  <rect x="290" y="120" width="250" height="80" rx="18" fill="#e9c46a"></rect>
-  <text x="415" y="152" text-anchor="middle" fill="#1f2937" font-size="20">{secondary}</text>
-  <text x="415" y="176" text-anchor="middle" fill="#4b5563" font-size="12">{support_file}</text>
-  <rect x="290" y="212" width="250" height="80" rx="18" fill="#f4a261"></rect>
-  <text x="415" y="244" text-anchor="middle" fill="#1f2937" font-size="20">{tertiary}</text>
-  <text x="415" y="268" text-anchor="middle" fill="#7c2d12" font-size="12">Derived output / docs / UI</text>
-  <rect x="640" y="74" width="190" height="78" rx="18" fill="#6d597a"></rect>
-  <text x="735" y="106" text-anchor="middle" fill="#fff" font-size="18">Structure</text>
-  <text x="735" y="130" text-anchor="middle" fill="#f3e8ff" font-size="13">Module boundary</text>
-  <rect x="640" y="178" width="190" height="78" rx="18" fill="#e76f51"></rect>
-  <text x="735" y="210" text-anchor="middle" fill="#fff" font-size="18">Validation</text>
-  <text x="735" y="234" text-anchor="middle" fill="#fee2e2" font-size="13">Risk / quality check</text>
-  <rect x="900" y="120" width="160" height="72" rx="18" fill="#264653"></rect>
-  <text x="980" y="150" text-anchor="middle" fill="#fff" font-size="18">Report Pack</text>
+  <rect x="30" y="120" width="180" height="72" rx="18" fill="{SVG_BG_DARK}"></rect>
+  <text x="120" y="150" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Repository</text>
+  <text x="120" y="174" text-anchor="middle" fill="{t[1]}" font-size="13">Change Set</text>
+  <rect x="290" y="28" width="250" height="80" rx="18" fill="{p[1]}"></rect>
+  <text x="415" y="60" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="20">{primary}</text>
+  <text x="415" y="84" text-anchor="middle" fill="{t[1]}" font-size="12">{lead_file}</text>
+  <rect x="290" y="120" width="250" height="80" rx="18" fill="{p[2]}"></rect>
+  <text x="415" y="152" text-anchor="middle" fill="{SVG_TEXT_DARK}" font-size="20">{secondary}</text>
+  <text x="415" y="176" text-anchor="middle" fill="{SVG_TEXT_MUTED}" font-size="12">{support_file}</text>
+  <rect x="290" y="212" width="250" height="80" rx="18" fill="{p[3]}"></rect>
+  <text x="415" y="244" text-anchor="middle" fill="{SVG_TEXT_DARK}" font-size="20">{tertiary}</text>
+  <text x="415" y="268" text-anchor="middle" fill="{SVG_TEXT_ACCENT}" font-size="12">Derived output / docs / UI</text>
+  <rect x="640" y="74" width="190" height="78" rx="18" fill="{p[5]}"></rect>
+  <text x="735" y="106" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Structure</text>
+  <text x="735" y="130" text-anchor="middle" fill="{t[5]}" font-size="13">Module boundary</text>
+  <rect x="640" y="178" width="190" height="78" rx="18" fill="{p[4]}"></rect>
+  <text x="735" y="210" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Validation</text>
+  <text x="735" y="234" text-anchor="middle" fill="{t[4]}" font-size="13">Risk / quality check</text>
+  <rect x="900" y="120" width="160" height="72" rx="18" fill="{p[0]}"></rect>
+  <text x="980" y="150" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Report Pack</text>
   <text x="980" y="174" text-anchor="middle" fill="#dbeafe" font-size="12">Daily / Weekly / Jira</text>
-  <line x1="210" y1="156" x2="290" y2="68" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
-  <line x1="210" y1="156" x2="290" y2="160" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
-  <line x1="210" y1="156" x2="290" y2="252" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
-  <line x1="540" y1="68" x2="640" y2="113" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
-  <line x1="540" y1="160" x2="640" y2="113" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
-  <line x1="540" y1="252" x2="640" y2="217" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
-  <line x1="830" y1="113" x2="900" y2="156" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
-  <line x1="830" y1="217" x2="900" y2="156" stroke="#264653" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="210" y1="156" x2="290" y2="68" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="210" y1="156" x2="290" y2="160" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="210" y1="156" x2="290" y2="252" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="540" y1="68" x2="640" y2="113" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="540" y1="160" x2="640" y2="113" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="540" y1="252" x2="640" y2="217" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="830" y1="113" x2="900" y2="156" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
+  <line x1="830" y1="217" x2="900" y2="156" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
 </svg>
 """
 
@@ -2102,35 +2020,36 @@ def svg_change_impact_map(areas: list[dict[str, Any]], top_files: list[dict[str,
         nodes.append((f"File {idx}", str(item.get("path", "")), f'+{int(item.get("added", 0))} / -{int(item.get("deleted", 0))}'))
     width = 1100
     height = 320
-    parts = [f'<svg viewBox="0 0 {width} {height}" class="flow" role="img" aria-label="Change impact map">']
-    parts.append('<defs><marker id="impact-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#7c2d12"></path></marker></defs>')
-    parts.append('<rect x="30" y="126" width="190" height="70" rx="18" fill="#7c2d12"></rect>')
-    parts.append('<text x="125" y="156" text-anchor="middle" fill="#fff" font-size="18">Changed Sources</text>')
-    parts.append('<text x="125" y="178" text-anchor="middle" fill="#ffedd5" font-size="12">Evidence from git diff</text>')
+    _is = SVG_IMPACT_STROKE
+    imp_colors = [SVG_PALETTE[1], SVG_PALETTE[2], SVG_PALETTE[3], SVG_PALETTE[0], SVG_PALETTE[5]]
+    parts = [f'<svg viewBox="0 0 {width} {height}" class="flow" role="img" aria-label="Change impact map"><title>Change impact map</title>']
+    parts.append(f'<defs><marker id="impact-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="{_is}"></path></marker></defs>')
+    parts.append(f'<rect x="30" y="126" width="190" height="70" rx="18" fill="{_is}"></rect>')
+    parts.append(f'<text x="125" y="156" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Changed Sources</text>')
+    parts.append(f'<text x="125" y="178" text-anchor="middle" fill="#ffedd5" font-size="12">Evidence from git diff</text>')
     x_positions = [320, 320, 320, 630, 630]
     y_positions = [24, 116, 208, 70, 186]
-    colors = ["#2a9d8f", "#e9c46a", "#f4a261", "#264653", "#6d597a"]
     for idx, node in enumerate(nodes[:5]):
         title, label, meta = node
         x = x_positions[idx]
         y = y_positions[idx]
-        fill = colors[idx % len(colors)]
-        text_fill = "#fff" if idx in (0, 3, 4) else "#1f2937"
-        meta_fill = "#e5e7eb" if idx in (0, 3, 4) else "#4b5563"
+        fill = imp_colors[idx % len(imp_colors)]
+        text_fill = svg_text_color_for(fill)
+        meta_fill = "#e5e7eb" if text_fill == SVG_TEXT_LIGHT else SVG_TEXT_MUTED
         parts.append(f'<rect x="{x}" y="{y}" width="230" height="74" rx="18" fill="{fill}"></rect>')
         parts.append(f'<text x="{x+115}" y="{y+28}" text-anchor="middle" fill="{text_fill}" font-size="16">{escape(title)}</text>')
         parts.append(f'<text x="{x+115}" y="{y+48}" text-anchor="middle" fill="{text_fill}" font-size="13">{escape(label[:34])}</text>')
         parts.append(f'<text x="{x+115}" y="{y+64}" text-anchor="middle" fill="{meta_fill}" font-size="11">{escape(meta)}</text>')
-    parts.append('<rect x="920" y="126" width="150" height="70" rx="18" fill="#12343b"></rect>')
-    parts.append('<text x="995" y="156" text-anchor="middle" fill="#fff" font-size="18">Impacted Output</text>')
-    parts.append('<text x="995" y="178" text-anchor="middle" fill="#dbeafe" font-size="12">UI / API / Docs / Jira</text>')
+    parts.append(f'<rect x="920" y="126" width="150" height="70" rx="18" fill="{SVG_BG_DARK}"></rect>')
+    parts.append(f'<text x="995" y="156" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Impacted Output</text>')
+    parts.append(f'<text x="995" y="178" text-anchor="middle" fill="#dbeafe" font-size="12">UI / API / Docs / Jira</text>')
     for target_y in (61, 153, 245):
-        parts.append(f'<line x1="220" y1="161" x2="320" y2="{target_y}" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
-    parts.append('<line x1="550" y1="61" x2="630" y2="107" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
-    parts.append('<line x1="550" y1="153" x2="630" y2="107" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
-    parts.append('<line x1="550" y1="245" x2="630" y2="223" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
-    parts.append('<line x1="860" y1="107" x2="920" y2="161" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
-    parts.append('<line x1="860" y1="223" x2="920" y2="161" stroke="#7c2d12" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+        parts.append(f'<line x1="220" y1="161" x2="320" y2="{target_y}" stroke="{_is}" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append(f'<line x1="550" y1="61" x2="630" y2="107" stroke="{_is}" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append(f'<line x1="550" y1="153" x2="630" y2="107" stroke="{_is}" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append(f'<line x1="550" y1="245" x2="630" y2="223" stroke="{_is}" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append(f'<line x1="860" y1="107" x2="920" y2="161" stroke="{_is}" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
+    parts.append(f'<line x1="860" y1="223" x2="920" y2="161" stroke="{_is}" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
     parts.append('</svg>')
     return ''.join(parts)
 
@@ -2307,100 +2226,18 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
 """
         )
     return f"""<!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Startup Reports {today.isoformat()}</title>
   <style>
-    :root {{
-      --bg: #f4efe4;
-      --paper: #fffdf9;
-      --ink: #17212b;
-      --muted: #5f6b76;
-      --accent: #0f4c5c;
-      --accent-2: #d17a22;
-      --line: #ddd2c1;
-      --hero-a: #12343b;
-      --hero-b: #2c6e63;
-      --glow: rgba(209, 122, 34, 0.18);
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{ margin: 0; font-family: "Segoe UI", "Noto Sans KR", sans-serif; background:
-      radial-gradient(circle at top right, rgba(209,122,34,0.14), transparent 24%),
-      radial-gradient(circle at top left, rgba(44,110,99,0.22), transparent 28%),
-      linear-gradient(180deg, #f8f3e9 0%, var(--bg) 100%); color: var(--ink); }}
-    .wrap {{ max-width: 1380px; margin: 0 auto; padding: 32px 28px 48px; }}
-    .hero {{ position: relative; overflow: hidden; margin-bottom: 26px; padding: 34px; background: linear-gradient(135deg, var(--hero-a), var(--hero-b)); color: #fff; border-radius: 30px; box-shadow: 0 24px 60px rgba(18,52,59,0.24); }}
-    .hero::after {{ content: ""; position: absolute; inset: auto -60px -80px auto; width: 260px; height: 260px; border-radius: 50%; background: radial-gradient(circle, rgba(255,255,255,0.18), transparent 60%); }}
-    .eyebrow {{ display: inline-block; font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; padding: 8px 12px; border: 1px solid rgba(255,255,255,0.22); border-radius: 999px; margin-bottom: 14px; }}
-    .hero h1 {{ margin: 0 0 10px; font-size: 40px; line-height: 1.05; }}
-    .hero p {{ margin: 0; opacity: 0.92; max-width: 760px; font-size: 15px; }}
-    .hero-grid {{ display: grid; grid-template-columns: 2fr 1fr; gap: 18px; align-items: end; }}
-    .hero-kpis {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
-    .hero-kpi {{ background: rgba(255,255,255,0.1); border: 1px solid rgba(255,255,255,0.12); border-radius: 18px; padding: 16px; backdrop-filter: blur(8px); }}
-    .hero-kpi span {{ display: block; opacity: 0.8; font-size: 12px; margin-bottom: 8px; }}
-    .hero-kpi strong {{ font-size: 28px; }}
-    .card {{ position: relative; background: linear-gradient(180deg, rgba(255,255,255,0.94), rgba(255,250,241,0.98)); border: 1px solid var(--line); border-radius: 28px; padding: 24px; margin-bottom: 22px; box-shadow: 0 18px 42px rgba(23,33,43,0.08); }}
-    .card::before {{ content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 6px; border-radius: 28px 0 0 28px; background: var(--card-accent, var(--accent)); }}
-    .tone-daily {{ --card-accent: #0f4c5c; }}
-    .tone-plan {{ --card-accent: #d17a22; }}
-    .tone-jira {{ --card-accent: #6c5ce7; }}
-    .tone-jira2 {{ --card-accent: #b56576; }}
-    .tone-weekly {{ --card-accent: #2a9d8f; }}
-    .tone-monthly {{ --card-accent: #8f5f3f; }}
-      .card-head {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 18px; }}
-    .card h2 {{ margin: 0 0 8px; font-size: 28px; line-height: 1.1; }}
-    .meta {{ margin: 0; color: var(--muted); font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; }}
-    .file-link {{ color: var(--accent); text-decoration: none; font-weight: 700; padding: 10px 14px; border-radius: 999px; background: #f5ede1; border: 1px solid var(--line); white-space: nowrap; }}
-    .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; margin-bottom: 18px; }}
-    .stats div {{ background: linear-gradient(180deg, #fff9ef, #f7f0e5); border-radius: 18px; padding: 16px; border: 1px solid var(--line); box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }}
-    .stats span {{ display: block; color: var(--muted); font-size: 11px; margin-bottom: 8px; letter-spacing: 0.08em; text-transform: uppercase; }}
-    .stats strong {{ font-size: 30px; line-height: 1; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }}
-    .facet-group-inline {{ display:grid; gap:8px; margin: 0 0 18px; }}
-    .facet-strip {{ display:flex; gap:10px; flex-wrap:wrap; margin: 0; }}
-    .facet-badge {{ display:inline-flex; flex-direction:column; gap:4px; padding:12px 14px; border-radius:18px; background:linear-gradient(180deg,#fff8ee,#f8eddc); border:1px solid var(--line); min-width:180px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.7); }}
-    .facet-badge-primary {{ background:linear-gradient(180deg,#fff1dd,#ffe3b8); border-color:#f59e0b; }}
-    .facet-badge-support {{ background:linear-gradient(180deg,#fffaf2,#f5efe5); border-color:#d6c6aa; }}
-    .facet-badge strong {{ font-size:13px; letter-spacing:.04em; text-transform:uppercase; color:#7c2d12; }}
-    .facet-badge em {{ font-style:normal; color:var(--muted); font-size:12px; line-height:1.45; }}
-    .task-board {{ display:grid; grid-template-columns: 1.1fr 1fr 1fr; gap:14px; margin: 0 0 18px; }}
-    .task-box {{ position:relative; border-radius:22px; padding:18px; border:1px solid var(--line); background:linear-gradient(180deg,#fffdfa,#f7f1e5); box-shadow: inset 0 1px 0 rgba(255,255,255,0.72); }}
-    .task-box.parent {{ background:linear-gradient(180deg,#f3fbfb,#edf7f5); }}
-    .task-box.child {{ background:linear-gradient(180deg,#fff9ef,#fbf2de); }}
-    .task-box.result {{ background:linear-gradient(180deg,#fff4f1,#faece8); }}
-    .task-box h4 {{ margin:0 0 10px; font-size:20px; line-height:1.2; }}
-    .task-box p {{ margin:0; color:var(--muted); line-height:1.45; }}
-    .task-box ul {{ margin:0; padding-left:20px; }}
-    .task-box li {{ margin-bottom:8px; line-height:1.45; }}
-    .task-label {{ display:inline-block; margin-bottom:10px; font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); background:rgba(255,255,255,.6); border:1px solid var(--line); border-radius:999px; padding:6px 10px; }}
-    .subtask-row {{ display:grid; grid-template-columns:auto 1fr auto; gap:12px; align-items:start; }}
-    .subtask-copy strong {{ display:block; margin-bottom:4px; font-size:14px; }}
-    .subtask-copy span {{ display:block; color:var(--muted); font-size:12px; }}
-    .check {{ width:26px; height:26px; border-radius:50%; display:inline-flex; align-items:center; justify-content:center; border:1px solid var(--line); background:#fff; color:#9ca3af; font-weight:700; }}
-    .check.done {{ background:#1f7a5c; border-color:#1f7a5c; color:#fff; }}
-    .state {{ display:inline-flex; align-items:center; border-radius:999px; padding:6px 10px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.08em; }}
-    .state.done {{ background:#d8f3dc; color:#1b4332; }}
-    .state.planned {{ background:#fef3c7; color:#92400e; }}
-    .panel {{ border: 1px solid var(--line); border-radius: 22px; padding: 18px; background: linear-gradient(180deg, #fffdfa, #f9f3e9); overflow: auto; box-shadow: inset 0 1px 0 rgba(255,255,255,0.75); }}
-    .panel h3 {{ margin-top: 0; margin-bottom: 12px; font-size: 18px; letter-spacing: 0.01em; }}
-    .mini-meta {{ margin: -4px 0 10px; color: var(--muted); font-size: 12px; }}
-    .panel ul {{ margin: 0; padding-left: 20px; }}
-    .panel li {{ margin-bottom: 8px; line-height: 1.45; }}
-    .chart, .flow {{ width: 100%; height: auto; }}
-    code {{ background: #efe6d8; padding: 2px 7px; border-radius: 8px; }}
-    @media (max-width: 900px) {{
-      .hero-grid {{ grid-template-columns: 1fr; }}
-      .task-board {{ grid-template-columns: 1fr; }}
-      .grid {{ grid-template-columns: 1fr; }}
-      .stats {{ grid-template-columns: 1fr 1fr; }}
-      .card-head {{ flex-direction: column; align-items: flex-start; }}
-    }}
+{DESIGN_CSS}
   </style>
 </head>
   <body>
-  <div class="wrap">
+  <a href="#main-content" class="skip-link">Skip to content</a>
+  <div class="wrap" id="main-content">
     <header class="hero">
       <div class="hero-grid">
         <div>

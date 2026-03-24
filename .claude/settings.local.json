@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pip:*)",
+      "Bash(/c/Users/kss11/AppData/Local/Programs/Python/Python312/python.exe:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(cmd.exe:*)",
+      "Bash(where:*)",
+      "Bash(git:*)",
+      "Bash(grep -o class=\"\"[^\"\"]*\"\" reports/dashboard/2026-03-24-startup-dashboard.html)",
+      "Read(//d/Project/Program/AutoReport/=== NEW \\(3/**)",
+      "Bash(sed -n '/<style>/,/<\\\\/style>/p' reports/dashboard/2026-03-24-startup-dashboard.html)",
+      "Bash(\"C:/Users/kss11/AppData/Local/Programs/Python/Python312/python.exe\" --version)",
+      "Bash(\"C:/Users/kss11/AppData/Local/Programs/Python/Python312/python.exe\" \"D:/Project/Program/AutoReport/scripts/mcp/autoreport_mcp_server.py\" --help)",
+      "Bash(\"C:/Users/kss11/AppData/Local/Programs/Python/Python312/python.exe\" -c \"import mcp; print\\('mcp package available'\\)\" 2>&1)",
+      "Bash(grep:*)",
+      "Bash(echo \"EXIT: $?\")"
+    ]
+  },
+  "mcpServers": {
+    "autoreport": {
+      "command": "C:\\Users\\kss11\\AppData\\Local\\Programs\\Python\\Python312\\python.exe",
+      "args": [
+        "D:\\Project\\Program\\AutoReport\\scripts\\mcp\\autoreport_mcp_server.py"
+      ],
+      "cwd": "D:\\Project\\Program\\AutoReport"
+    }
+  }
+}

@@ -12,6 +12,9 @@ from typing import Any
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
 
+sys.path.insert(0, str(WORKSPACE_ROOT))
+from scripts.design_system import DESIGN_CSS
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Auto commit and push configured repositories.")
@@ -136,17 +139,10 @@ def render_html(payload: dict[str, Any]) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Auto Commit Push Status {payload.get("date","")}</title>
   <style>
-    body {{ font-family:"Segoe UI","Noto Sans KR",sans-serif; margin:0; background:#f6f1e8; color:#17212b; }}
-    .wrap {{ max-width:1100px; margin:0 auto; padding:28px; }}
-    .hero {{ background:linear-gradient(135deg,#12343b,#2c6e63); color:#fff; padding:24px; border-radius:24px; margin-bottom:18px; }}
-    table {{ width:100%; border-collapse:collapse; background:#fffdf9; border:1px solid #ddd2c1; border-radius:18px; overflow:hidden; }}
-    th, td {{ padding:12px 10px; border-bottom:1px solid #eee3d2; text-align:left; vertical-align:top; }}
-    th {{ background:#f8f1e4; font-size:12px; text-transform:uppercase; letter-spacing:.06em; }}
-    .ok {{ color:#166534; font-weight:700; }}
-    .warn {{ color:#92400e; font-weight:700; }}
-    .fail {{ color:#991b1b; font-weight:700; }}
-    .actions {{ margin:16px 0 18px; display:flex; gap:10px; flex-wrap:wrap; }}
-    .button {{ display:inline-flex; text-decoration:none; color:#0f4c5c; font-weight:700; background:#edf6f9; border:1px solid #c8d9dd; padding:11px 15px; border-radius:999px; }}
+{DESIGN_CSS}
+    .ok {{ color:var(--ok-ink); font-weight:700; }}
+    .warn {{ color:var(--warn-ink); font-weight:700; }}
+    .fail {{ color:var(--danger-ink); font-weight:700; }}
   </style>
 </head>
 <body>
@@ -156,8 +152,9 @@ def render_html(payload: dict[str, Any]) -> str:
       <p>{payload.get("date","")} 기준 자동화 실행 결과</p>
     </section>
     <div class="actions">
-      {f'<a class="button" href="{retry_link}">Retry Auto Commit/Push</a>' if retry_link else ''}
+      {f'<a class="btn" href="{retry_link}">Retry Auto Commit/Push</a>' if retry_link else ''}
     </div>
+    <div class="table-wrap">
     <table>
       <thead>
         <tr>
@@ -173,6 +170,7 @@ def render_html(payload: dict[str, Any]) -> str:
         {''.join(rows)}
       </tbody>
     </table>
+    </div>
   </div>
 </body>
 </html>"""

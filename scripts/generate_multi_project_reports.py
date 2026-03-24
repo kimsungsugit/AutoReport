@@ -14,6 +14,9 @@ from hashlib import sha1
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
 
+sys.path.insert(0, str(WORKSPACE_ROOT))
+from scripts.design_system import DESIGN_CSS, CHECKLIST_JS
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate startup reports for multiple projects.")
@@ -195,7 +198,7 @@ def build_task_board(item: dict) -> str:
 <li class="subtask-item">
   <label class="check-label">
   <input class="check-input" type="checkbox" data-checklist-id="{sha1((item['name'] + '::' + text).encode('utf-8')).hexdigest()[:16]}">
-  <span class="checkbox"></span>
+  <span class="check-box"></span>
   <div>
     <strong>{escape(text)}</strong>
     <span>Remaining Work: {escape(text[:72])}</span>
@@ -204,7 +207,7 @@ def build_task_board(item: dict) -> str:
 </li>
 """
         for text in remaining
-    ) or '<li class="subtask-item"><span class="checkbox done"></span><div><strong>No remaining tasks</strong><span>Remaining work already cleared</span></div></li>'
+    ) or '<li class="subtask-item"><span class="check-box done"></span><div><strong>No remaining tasks</strong><span>Remaining work already cleared</span></div></li>'
     validation_html = "".join(f"<li>{escape(x)}</li>" for x in validation) or "<li>Validation not defined</li>"
     sprint_html = "".join(f"<li>{escape(x)}</li>" for x in sprint_status) or "<li>Status not defined</li>"
     completed_html = "".join(f"<li>{escape(x)}</li>" for x in completed) or "<li>No completed items</li>"
@@ -276,7 +279,7 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
     board_sections = []
     for item in items:
         status = item["status"]
-        badge_class = "ok" if status == "generated" else "skip"
+        badge_class = "badge-ok" if status == "generated" else "badge-warn"
         daily_link = item.get("daily_link", "")
         dashboard_link = item.get("dashboard_link", "")
         jira_plan_link = item.get("jira_plan_link", "")
@@ -343,89 +346,22 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
 """
             )
     return f"""<!doctype html>
-<html lang="en">
+<html lang="ko">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Multi Project Startup Dashboard {run_date}</title>
   <style>
-    body {{ margin:0; font-family:"Segoe UI","Noto Sans KR",sans-serif; background:linear-gradient(180deg,#f7f1e8,#efe6d8); color:#1f2937; }}
-    .wrap {{ max-width:1100px; margin:0 auto; padding:32px; }}
-    .hero {{ background:linear-gradient(135deg,#12343b,#2c6e63); color:#fff; border-radius:28px; padding:28px; margin-bottom:22px; }}
-    .hero h1 {{ margin:0 0 8px; font-size:36px; }}
-    .hero p {{ margin:0; opacity:.9; }}
-    .hero-links {{ display:flex; gap:12px; flex-wrap:wrap; margin-top:18px; }}
-    .hero-links a {{ text-decoration:none; color:#12343b; background:#f8f1e4; border:1px solid rgba(255,255,255,.35); padding:11px 16px; border-radius:999px; font-weight:800; }}
-    .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; }}
-    .card {{ background:#fffdf9; border:1px solid #ddd2c1; border-radius:24px; padding:22px; box-shadow:0 14px 30px rgba(23,33,43,.08); }}
-    .head {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }}
-    .head h2 {{ margin:0 0 6px; }}
-    .head p {{ margin:0; color:#6b7280; font-size:13px; }}
-    .badge {{ padding:8px 12px; border-radius:999px; font-size:12px; font-weight:700; }}
-    .badge.ok {{ background:#d8f3dc; color:#1b4332; }}
-    .badge.skip {{ background:#fef3c7; color:#92400e; }}
-    .work-type-line {{ margin:14px 0 8px; font-size:13px; color:#6b7280; }}
-    .message {{ margin:16px 0; line-height:1.5; }}
-    .mini-facets {{ display:flex; gap:8px; flex-wrap:wrap; margin:0 0 14px; }}
-    .mini-chip {{ display:inline-flex; align-items:center; padding:8px 10px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid #ddd2c1; }}
-    .mini-chip.primary {{ background:#fff1dd; border-color:#f59e0b; color:#9a3412; }}
-    .mini-chip.support {{ background:#f6efe4; border-color:#d6c6aa; color:#6b7280; }}
-    .summary-line {{ margin:0 0 12px; line-height:1.6; color:#374151; font-weight:600; }}
-    .source-box {{ margin:0 0 14px; padding:12px 14px; border-radius:18px; background:#f8f4ec; border:1px solid #e1d6c6; }}
-    .source-title {{ margin:0 0 8px; font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:#6b7280; }}
-    .source-box ul {{ margin:0; padding-left:18px; }}
-    .source-box li {{ margin-bottom:6px; color:#4b5563; line-height:1.5; }}
-    .links {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .links a {{ text-decoration:none; color:#0f4c5c; background:#edf6f9; border:1px solid #c8d9dd; padding:10px 14px; border-radius:999px; font-weight:600; }}
-    .section-title {{ margin:34px 0 14px; font-size:28px; }}
-    .section-copy {{ margin:0 0 18px; color:#4b5563; line-height:1.6; }}
-    .project-board {{ background:linear-gradient(180deg,#fffdf9,#f8f1e4); border:1px solid #ddd2c1; border-radius:28px; padding:24px; box-shadow:0 14px 30px rgba(23,33,43,.08); margin-bottom:18px; }}
-    .project-head {{ display:flex; justify-content:space-between; gap:16px; align-items:flex-start; margin-bottom:16px; }}
-    .project-head h2 {{ margin:0 0 6px; }}
-    .project-head p {{ margin:0; color:#6b7280; font-size:13px; }}
-    .project-links {{ display:flex; gap:10px; flex-wrap:wrap; }}
-    .project-links a {{ text-decoration:none; color:#0f4c5c; background:#f5ede1; border:1px solid #d8ccb7; padding:10px 14px; border-radius:999px; font-weight:700; }}
-    .task-board {{ display:grid; grid-template-columns:1.1fr 1.1fr .9fr; gap:14px; }}
-    .task-col {{ min-width:0; border:1px solid #ddd2c1; border-radius:22px; padding:18px; background:linear-gradient(180deg,#fffdfa,#f7f1e5); }}
-    .task-col.parent {{ background:linear-gradient(180deg,#eef8f8,#e9f3f1); }}
-    .task-col.subtasks {{ background:linear-gradient(180deg,#fff9ef,#fbf1de); }}
-    .task-col.result {{ background:linear-gradient(180deg,#fff4f1,#faece8); }}
-    .work-type {{ display:inline-flex; margin-bottom:10px; padding:8px 12px; border-radius:999px; background:#fff1dd; border:1px solid #f59e0b; font-size:12px; font-weight:800; color:#9a3412; }}
-    .task-col h3 {{ margin:0 0 10px; font-size:20px; line-height:1.2; }}
-    .task-col p {{ margin:0 0 12px; color:#4b5563; line-height:1.55; }}
-    .task-col ul {{ margin:0; padding-left:20px; }}
-    .task-col li {{ margin-bottom:8px; line-height:1.5; overflow-wrap:anywhere; word-break:break-word; }}
-    .facet-zone {{ display:grid; gap:8px; margin:0 0 14px; }}
-    .facet-title {{ font-size:11px; font-weight:800; letter-spacing:.08em; text-transform:uppercase; color:#6b7280; }}
-    .facet-row {{ display:flex; gap:8px; flex-wrap:wrap; }}
-    .facet-chip {{ display:inline-flex; align-items:center; padding:8px 10px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid #ddd2c1; max-width:100%; overflow-wrap:anywhere; word-break:break-word; }}
-    .facet-chip.primary {{ background:#fff1dd; border-color:#f59e0b; color:#9a3412; }}
-    .facet-chip.support {{ background:#f6efe4; border-color:#d6c6aa; color:#6b7280; }}
-    .snapshot-block {{ margin:0 0 14px; padding:12px 14px; border-radius:18px; background:rgba(255,255,255,.65); border:1px solid #ddd2c1; }}
-    .snapshot-block ul {{ margin:0; padding-left:18px; }}
-    .snapshot-block li {{ margin-bottom:6px; line-height:1.5; color:#4b5563; }}
-    .task-tag {{ display:inline-block; margin-bottom:10px; padding:6px 10px; border-radius:999px; border:1px solid #ddd2c1; background:rgba(255,255,255,.7); font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:#6b7280; }}
-    .subtask-list {{ list-style:none; padding-left:0; }}
-    .subtask-item {{ list-style:none; margin-bottom:12px; }}
-    .check-label {{ display:grid; grid-template-columns:auto 1fr; gap:12px; align-items:start; cursor:pointer; }}
-    .check-input {{ position:absolute; opacity:0; pointer-events:none; }}
-    .subtask-item strong {{ display:block; margin-bottom:4px; font-size:14px; overflow-wrap:anywhere; word-break:break-word; }}
-    .subtask-item span {{ display:block; color:#6b7280; font-size:12px; overflow-wrap:anywhere; word-break:break-word; }}
-    .checkbox {{ width:18px; height:18px; margin-top:2px; border-radius:6px; border:2px solid #d17a22; background:linear-gradient(180deg,#fff9ef,#fbf1de); }}
-    .checkbox.done {{ border-color:#2a9d8f; background:linear-gradient(180deg,#e8faf6,#dff5ef); }}
-    .check-input:checked + .checkbox {{ border-color:#2a9d8f; background:linear-gradient(180deg,#e8faf6,#dff5ef); position:relative; }}
-    .check-input:checked + .checkbox::after {{ content:""; position:absolute; left:4px; top:0px; width:5px; height:10px; border:solid #166534; border-width:0 2px 2px 0; transform:rotate(45deg); }}
-    .check-input:checked ~ div strong,
-    .check-input:checked ~ div span {{ color:#6b7280; text-decoration:line-through; }}
-    .task-links {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }}
-    .task-links a {{ text-decoration:none; color:#7c2d12; background:#fff7ed; border:1px solid #f5d0a9; padding:9px 12px; border-radius:999px; font-weight:700; }}
-    .portfolio-grid {{ display:grid; grid-template-columns:1fr; gap:18px; }}
-    @media (max-width:980px) {{ .task-board {{ grid-template-columns:1fr; }} }}
-    @media (max-width:800px) {{ .grid {{ grid-template-columns:1fr; }} }}
+{DESIGN_CSS}
+    /* --- Portfolio overrides --- */
+    .badge-ok {{ background:var(--ok-bg); color:var(--ok-ink); }}
+    .badge-warn {{ background:var(--warn-bg); color:var(--warn-ink); }}
+    .task-board {{ grid-template-columns:1.1fr 1.1fr .9fr; }}
   </style>
 </head>
 <body>
-  <div class="wrap">
+  <a href="#main-content" class="skip-link">Skip to content</a>
+  <div class="wrap" id="main-content">
     <section class="hero">
       <h1>Multi Project Startup Dashboard</h1>
       <p>{escape(run_date)} portfolio summary for configured repositories.</p>
@@ -441,22 +377,7 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
       {"".join(cards)}
     </div>
   </div>
-  <script>
-    (function () {{
-      const storagePrefix = "portfolio-checklist:";
-      document.querySelectorAll(".check-input[data-checklist-id]").forEach((input) => {{
-        const key = storagePrefix + input.dataset.checklistId;
-        try {{
-          input.checked = window.localStorage.getItem(key) === "1";
-        }} catch (error) {{}}
-        input.addEventListener("change", () => {{
-          try {{
-            window.localStorage.setItem(key, input.checked ? "1" : "0");
-          }} catch (error) {{}}
-        }});
-      }});
-    }})();
-  </script>
+{CHECKLIST_JS}
 </body>
 </html>"""
 

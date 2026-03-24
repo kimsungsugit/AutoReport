@@ -10,9 +10,15 @@ from pathlib import Path
 from typing import Any
 
 
+import sys
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
 REPORTS_ROOT = WORKSPACE_ROOT / "reports"
+
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+from scripts.design_system import DESIGN_CSS
 PROJECTS_ROOT = REPORTS_ROOT / "projects"
 AUTOMATION_ROOT = REPORTS_ROOT / "automation_status"
 
@@ -315,38 +321,12 @@ def render_history_dashboard(run_date: str, project_history: dict[str, list[dict
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>History Dashboard {run_date}</title>
   <style>
-    body {{ margin:0; font-family:"Segoe UI","Noto Sans KR",sans-serif; background:linear-gradient(180deg,#f6f1e8,#ebe2d4); color:#17212b; }}
-    .wrap {{ max-width:1280px; margin:0 auto; padding:30px; }}
-    .hero {{ background:linear-gradient(135deg,#12343b,#2c6e63); color:#fff; border-radius:30px; padding:30px; margin-bottom:22px; }}
-    .hero h1 {{ margin:0 0 8px; font-size:38px; }}
-    .hero p {{ margin:0; opacity:.9; line-height:1.6; }}
-    .overview {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:18px; margin-bottom:22px; }}
-    .overview-card {{ background:#fffdf9; border:1px solid #ddd2c1; border-radius:24px; padding:22px; box-shadow:0 14px 30px rgba(23,33,43,.08); }}
-    .overview-head {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; margin-bottom:10px; }}
-    .overview-head h2 {{ margin:0 0 4px; }}
-    .overview-head p {{ margin:0; color:#6b7280; font-size:13px; }}
-    .mini-status {{ padding:8px 12px; border-radius:999px; background:#f8ead7; border:1px solid #e6c8a2; font-size:12px; font-weight:700; color:#9a3412; }}
-    .stats {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin:12px 0; }}
-    .stats div {{ background:#f8f1e4; border:1px solid #e6d8c4; border-radius:16px; padding:12px; }}
-    .stats span {{ display:block; font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:.08em; }}
-    .stats strong {{ display:block; margin-top:5px; font-size:20px; }}
-    .overview-card ul {{ margin:0 0 14px; padding-left:18px; }}
-    .overview-card li {{ margin-bottom:6px; line-height:1.5; }}
-    .links {{ display:flex; gap:10px; flex-wrap:wrap; }}
-    .links a {{ text-decoration:none; color:#0f4c5c; background:#edf6f9; border:1px solid #c8d9dd; padding:10px 13px; border-radius:999px; font-weight:700; }}
-    .panel {{ background:#fffdf9; border:1px solid #ddd2c1; border-radius:26px; padding:24px; box-shadow:0 14px 30px rgba(23,33,43,.08); margin-bottom:22px; }}
-    .panel h2 {{ margin:0 0 14px; }}
-    .chart {{ width:100%; height:auto; }}
-    .table-panel {{ background:#fffdf9; border:1px solid #ddd2c1; border-radius:26px; padding:24px; box-shadow:0 14px 30px rgba(23,33,43,.08); margin-bottom:18px; overflow:auto; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th, td {{ padding:12px 10px; border-bottom:1px solid #eee3d2; text-align:left; vertical-align:top; }}
-    th {{ font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:#6b7280; }}
-    td a {{ color:#0f4c5c; font-weight:700; text-decoration:none; }}
-    @media (max-width:1024px) {{ .overview {{ grid-template-columns:1fr; }} }}
+{DESIGN_CSS}
   </style>
 </head>
 <body>
-  <div class="wrap">
+  <a href="#main-content" class="skip-link">Skip to content</a>
+  <div class="wrap" id="main-content">
     <section class="hero">
       <h1>History Dashboard</h1>
       <p>{escape(run_date)} 기준으로 생성된 종합 이력 대시보드입니다. 현재 리포트는 유지하고, 과거 데일리/주간/월간/Jira/자동 Commit 상태를 한 화면에서 탐색합니다.</p>
