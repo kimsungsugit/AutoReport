@@ -3,6 +3,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $PythonCandidates = @(
@@ -12,6 +17,7 @@ $PythonCandidates = @(
 )
 
 $PythonExe = $null
+$FallbackPythonExe = $null
 foreach ($candidate in $PythonCandidates) {
     $resolved = $null
     if ($candidate -eq "python") {
@@ -27,6 +33,10 @@ foreach ($candidate in $PythonCandidates) {
         continue
     }
 
+    if (-not $FallbackPythonExe) {
+        $FallbackPythonExe = $resolved
+    }
+
     try {
         $check = & $resolved -c "import importlib.util; print('OK' if importlib.util.find_spec('google.genai') else 'MISSING')"
         if (($check | Out-String).Trim() -eq "OK") {
@@ -39,7 +49,12 @@ foreach ($candidate in $PythonCandidates) {
 }
 
 if (-not $PythonExe) {
-    throw "Python executable not found."
+    if ($FallbackPythonExe) {
+        $PythonExe = $FallbackPythonExe
+        Write-RunLog ("google.genai not found; using fallback Python: " + $PythonExe)
+    } else {
+        throw "Python executable not found."
+    }
 }
 
 $today = Get-Date -Format "yyyy-MM-dd"

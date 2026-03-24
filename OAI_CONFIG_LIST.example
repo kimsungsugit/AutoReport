@@ -1,0 +1,18 @@
+[
+  {
+    "model": "gemini-2.5-flash",
+    "api_key": "ENV:GOOGLE_API_KEY",
+    "base_url": null,
+    "api_type": "google",
+    "num_predict": 8192,
+    "retries": 3
+  },
+  {
+    "model": "gemini-3-pro-preview",
+    "api_key": "ENV:GOOGLE_API_KEY",
+    "base_url": null,
+    "api_type": "google",
+    "num_predict": 8192,
+    "retries": 5
+  }
+]

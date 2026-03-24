@@ -3,3 +3,5 @@ __pycache__/
 .pytest_cache/
 .codex_tmp/
 *.pyc
+OAI_CONFIG_LIST
+OAI_CONFIG_LIST.local

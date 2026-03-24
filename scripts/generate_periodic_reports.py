@@ -9,6 +9,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from hashlib import sha1
 from pathlib import Path
 from typing import Any
 from urllib import parse as urllib_parse
@@ -263,6 +264,20 @@ def ensure_parent(path: Path) -> None:
 def write_text(path: Path, text: str) -> None:
     ensure_parent(path)
     path.write_text(text, encoding="utf-8")
+
+
+def cleanup_legacy_jira_outputs(output_root: Path, today: date) -> None:
+    jira_dir = output_root / "reports" / "jira"
+    legacy_names = [
+        f"{today.isoformat()}-jira-plan.md",
+        f"{today.isoformat()}-jira-plan.html",
+        f"{today.isoformat()}-jira-result.md",
+        f"{today.isoformat()}-jira-result.html",
+    ]
+    for name in legacy_names:
+        path = jira_dir / name
+        if path.exists():
+            path.unlink()
 
 
 def load_auto_commit_status(repo_name: str, target_day: date) -> dict[str, Any] | None:
@@ -654,6 +669,7 @@ def build_context_payload(
         "window_start": window.start.isoformat(),
         "window_end": window.end.isoformat(),
         "repository": repo_root.name,
+        "repo_root": str(repo_root),
         "domain_profile": profile_name,
         "domain_profile_name": domain_profile["name"],
         "domain_focus": list(domain_profile["focus"]),
@@ -741,34 +757,31 @@ def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str,
     if top_files:
         area_subtasks.append(f"핵심 영향 파일 리뷰 및 결과 반영 ({', '.join(top_files[:2])})")
     area_subtasks = area_subtasks[:4] or ["핵심 변경 영역 검토 및 결과 정리"]
-    if doc_type == "jira_plan":
-        return {
-            "title": f"[{work_type}] {payload['today']} 작업",
-            "summary": source_insights[0] if source_insights else f"{work_type} 유형 작업에 대한 Jira 상위 작업 초안입니다.",
-            "task_name": f"{payload['repository']} {work_type} 작업",
-            "task_goal": source_insights[1] if len(source_insights) > 1 else "최근 변경 이력과 영향 파일을 기준으로 큰 단위의 후속 작업과 검증 범위를 정리합니다.",
-            "scope": [*source_insights[:2], *[f"{item['area']} 영역 후속 작업" for item in areas[:4]]][:4] or ["주요 변경 영역 후속 작업"],
-            "subtasks": area_subtasks,
-            "validation": ["기능 검증", "관련 테스트 확인", "문서 및 Jira 결과 반영 확인"],
-            "risks": ["자동 분류 결과이므로 실제 Jira 이슈 타입과 우선순위 비교가 필요합니다."],
-        }
     done_items = [entry["subject"] for entry in commits[:5]] or ["집계된 완료 항목이 없습니다."]
-    subtask_results = [
-        f"{area} 영역 변경 검토 결과와 검증 포인트를 정리했습니다."
+    progress_items = [
+        f"{area} 영역 변경 검토와 검증 범위 정리를 진행 중입니다."
         for area in area_items[:3]
         if area
     ]
     if top_files:
-        subtask_results.append(f"핵심 영향 파일 검토 결과를 반영했습니다. ({', '.join(top_files[:2])})")
+        progress_items.append(f"핵심 영향 파일 리뷰를 진행 중입니다. ({', '.join(top_files[:2])})")
     return {
-        "title": f"[{work_type}] {payload['today']} 작업 결과",
-        "summary": source_insights[0] if source_insights else f"{work_type} 유형 작업에 대한 Jira 작업 결과 초안입니다.",
+        "title": f"[{work_type}] {payload['today']} 작업 현황",
+        "summary": source_insights[0] if source_insights else f"{work_type} 유형 작업에 대한 Jira 통합 현황 초안입니다.",
         "task_name": f"{payload['repository']} {work_type} 작업",
-        "done_items": done_items,
-        "subtask_results": subtask_results[:4] or ["정리된 하위 작업 결과가 없습니다."],
+        "task_goal": source_insights[1] if len(source_insights) > 1 else "최근 변경 이력과 영향 파일을 기준으로 계획, 완료, 잔여 작업을 한 문서에서 연결합니다.",
+        "scope": [*source_insights[:2], *[f"{item['area']} 영역 후속 작업" for item in areas[:4]]][:4] or ["주요 변경 영역 후속 작업"],
+        "completed": done_items,
+        "in_progress": progress_items[:4] or ["현재 진행 중인 하위 작업을 추가 정리해야 합니다."],
+        "remaining": area_subtasks,
         "validation": ["커밋 이력 확인", "변경 파일 검토", "추가 검증 필요 여부 확인"],
-        "issues": ["미커밋 변경이 남아 있으면 결과 정리에 추가 확인이 필요합니다."] if payload["uncommitted_count"] else ["즉시 보이는 로컬 미커밋 변경은 없습니다."],
+        "risks": ["미커밋 변경이 남아 있으면 결과 정리에 추가 확인이 필요합니다."] if payload["uncommitted_count"] else ["즉시 보이는 로컬 미커밋 변경은 없습니다."],
         "links": [item.get("html_url", "") for item in payload.get("github", {}).get("commits", [])[:5] if item.get("html_url")] or [],
+        "status_summary": {
+            "completed_count": len(done_items),
+            "in_progress_count": len(progress_items[:4] or []),
+            "remaining_count": len(area_subtasks),
+        },
     }
 
 def format_top_file_signal(payload: dict[str, Any], limit: int = 3) -> list[str]:
@@ -896,8 +909,7 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
         "plan": '{"title": str, "summary": [str], "priority_actions": [str], "mid_term_actions": [str], "risks": [str], "notes": [str]}',
         "weekly": '{"title": str, "summary": [str], "highlights": [str], "areas": [str], "risks": [str], "next_week": [str]}',
         "monthly": '{"title": str, "summary": [str], "highlights": [str], "areas": [str], "risks": [str], "next_month": [str]}',
-        "jira_plan": '{"title": str, "summary": str, "task_name": str, "task_goal": str, "scope": [str], "subtasks": [str], "validation": [str], "risks": [str]}',
-        "jira_result": '{"title": str, "summary": str, "task_name": str, "done_items": [str], "subtask_results": [str], "validation": [str], "issues": [str], "links": [str]}',
+        "jira": '{"title": str, "summary": str, "task_name": str, "task_goal": str, "scope": [str], "completed": [str], "in_progress": [str], "remaining": [str], "validation": [str], "risks": [str], "links": [str], "status_summary": {"completed_count": int, "in_progress_count": int, "remaining_count": int}}',
     }
     system = (
         "You are an engineering reporting assistant. "
@@ -913,8 +925,7 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
         "- Keep the work type framing consistent.\n"
         f"- Domain profile: {payload.get('domain_profile_name', '')}\n"
         f"- Domain focus: {', '.join(payload.get('domain_focus') or [])}\n"
-        "- For jira_plan, structure the content as one parent task plus subtasks.\n"
-        "- For jira_result, structure the content as one parent task result plus subtask results.\n"
+        "- For jira, structure the content as one parent task with completed, in-progress, and remaining work in the same document.\n"
         "- No markdown fence, JSON only.\n\n"
         f"Context JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
@@ -1242,17 +1253,22 @@ def render_jira_markdown(doc_type: str, sections: dict[str, Any], payload: dict[
             lines.append("- None")
         lines.append("")
 
-    if doc_type == "jira_plan":
-        add("Task", [f"Name: {sections.get('task_name', '-')}", f"Goal: {sections.get('task_goal', '-')}", *list(sections.get('scope') or [])])
-        add("Subtasks", list(sections.get("subtasks") or []))
-        add("Validation", list(sections.get("validation") or []))
-        add("Risks", list(sections.get("risks") or []))
-    else:
-        add("Task", [f"Name: {sections.get('task_name', '-')}", *list(sections.get("done_items") or [])])
-        add("Subtask Results", list(sections.get("subtask_results") or []))
-        add("Validation", list(sections.get("validation") or []))
-        add("Issues", list(sections.get("issues") or []))
-        add("Links", list(sections.get("links") or []))
+    status_summary = sections.get("status_summary") or {}
+    add("상위 작업", [f"이름: {sections.get('task_name', '-')}", f"목표: {sections.get('task_goal', '-')}", *list(sections.get('scope') or [])])
+    add(
+        "스프린트 현황",
+        [
+            f"완료: {status_summary.get('completed_count', len(list(sections.get('completed') or [])))}",
+            f"진행 중: {status_summary.get('in_progress_count', len(list(sections.get('in_progress') or [])))}",
+            f"잔여: {status_summary.get('remaining_count', len(list(sections.get('remaining') or [])))}",
+        ],
+    )
+    add("완료된 작업", list(sections.get("completed") or []))
+    add("진행 중인 작업", list(sections.get("in_progress") or []))
+    add("남은 작업", list(sections.get("remaining") or []))
+    add("완료 조건", list(sections.get("validation") or []))
+    add("리스크 및 확인 필요 사항", list(sections.get("risks") or []))
+    add("참고 링크", list(sections.get("links") or []))
 
     diff_summary = payload.get("diff_summary") or {}
     if diff_summary:
@@ -1273,14 +1289,14 @@ def render_jira_markdown(doc_type: str, sections: dict[str, Any], payload: dict[
         lines.append(f'    B --> C["{areas[0]["area"]}"]')
         if len(areas) > 1:
             lines.append(f'    C --> D["{areas[1]["area"]}"]')
-        lines.append('    C --> E["Jira Task / Subtasks"]')
+        lines.append('    C --> E["Jira Status / Remaining Work"]')
         lines.extend(["```", ""])
 
         lines.extend(["## Change Impact", "", "```mermaid", "flowchart TD"])
         lines.append('    A["Changed Source Files"] --> B["Design / Structure Review"]')
         lines.append('    A --> C["Validation / Risk Review"]')
-        lines.append('    B --> D["Jira Plan"]')
-        lines.append('    C --> D["Jira Plan"]')
+        lines.append('    B --> D["Jira Status"]')
+        lines.append('    C --> D["Jira Status"]')
         lines.extend(["```", ""])
     return "\n".join(lines)
 
@@ -1309,7 +1325,7 @@ def generate_document(report_type: str, payload: dict[str, Any]) -> tuple[str, s
     sections["_gemini_sections_error"] = sections_error
     sections["_gemini_team_error"] = ai_team_error
 
-    if report_type.startswith("jira_"):
+    if report_type.startswith("jira"):
         return render_jira_markdown(report_type, sections, payload, mode), mode, sections
     title = str(sections.get("title") or "")
     if title and not title.startswith("# "):
@@ -1328,15 +1344,39 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
     ai_team = sections.get("_ai_team") or {}
     ai_team_mode = str(sections.get("_ai_team_mode") or "fallback")
     title = str(sections.get("title") or report_type.title()).lstrip("# ").strip()
+    repo_root = Path(str(payload.get("repo_root") or ".")).resolve()
 
     def list_block(title_text: str, items: list[str]) -> str:
-        body = "".join(f"<li>{escape(str(item))}</li>" for item in items) or "<li>No items</li>"
+        checkbox_mode = title_text in {"남은 작업", "Remaining"}
+        item_class = ' class="checklist-item"' if checkbox_mode else ""
+        body_items = []
+        for item in items:
+            item_text = str(item)
+            if checkbox_mode:
+                item_id = sha1(f"{markdown_path}:{title_text}:{item_text}".encode("utf-8")).hexdigest()[:16]
+                body_items.append(
+                    f'<li{item_class}><label class="check-label"><input class="check-input" type="checkbox" data-checklist-id="{item_id}"><span class="check-box" aria-hidden="true"></span><span class="check-text">{escape(item_text)}</span></label></li>'
+                )
+            else:
+                body_items.append(f"<li>{escape(item_text)}</li>")
+        body = "".join(body_items) or "<li>No items</li>"
         return f"""
 <section class="detail-panel">
   <h3>{escape(title_text)}</h3>
   <ul>{body}</ul>
 </section>
 """
+
+    def file_link(path_str: str) -> str:
+        raw = str(path_str or "").strip()
+        if not raw:
+            return ""
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = (repo_root / candidate).resolve()
+        if not candidate.exists():
+            return ""
+        return f'<a href="{escape(candidate.as_uri())}"><code>{escape(str(candidate))}</code></a>'
 
     def area_checkpoints(area_name: str) -> list[str]:
         area = area_name.lower()
@@ -1463,25 +1503,93 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
 """
 
     def build_image_slots() -> str:
+        top_files = [str(item.get("path", "")) for item in (diff.get("top_files") or [])[:3]]
+        changed_docs_local = [str(path) for path in (payload.get("changed_docs") or [])[:3]]
+        related_outputs = [
+            ("상세 Markdown", markdown_path),
+            ("상세 HTML", markdown_path.with_suffix(".html")),
+            ("스타트업 대시보드", markdown_path.parents[1] / "dashboard" / markdown_path.name.replace("-jira-status.md", "-startup-dashboard.html")),
+        ]
+
+        def render_link_group(items: list[tuple[str, Path | str]]) -> str:
+            rows = []
+            for label, value in items:
+                target = value if isinstance(value, Path) else Path(str(value))
+                link_html = file_link(str(target))
+                if link_html:
+                    rows.append(f"<li>{escape(label)}: {link_html}</li>")
+            return "".join(rows) or "<li>자동 링크 가능한 파일 없음</li>"
+
+        evidence_specs = [
+            {
+                "title": "증빙 1. 변경 전후 화면",
+                "purpose": "UI, 대시보드, 리포트 레이아웃 변경이 있으면 Before / After 비교 캡처를 붙입니다.",
+                "targets": ["시작 대시보드", "리포트 HTML", "주요 화면 변경점"],
+                "sources": changed_docs_local[:1] or top_files[:1] or ["관련 화면 또는 HTML 출력물"],
+                "links": related_outputs[:2],
+            },
+            {
+                "title": "증빙 2. 실행 결과 확인",
+                "purpose": "스크립트 실행 성공, 자동화 성공, 핵심 산출물 생성 여부를 캡처합니다.",
+                "targets": ["실행 로그", "생성된 Markdown/HTML", "자동 커밋 상태"],
+                "sources": top_files[:2] or ["reports/dashboard", "reports/jira", "reports/automation_status"],
+                "links": related_outputs,
+            },
+            {
+                "title": "증빙 3. 구조 또는 흐름 증빙",
+                "purpose": "아키텍처 변화나 작업 흐름이 핵심이면 흐름도, Mermaid, 파일 트리 캡처를 붙입니다.",
+                "targets": ["Architecture Delta", "Change Impact Map", "Area Inspection"],
+                "sources": top_files[1:3] or ["핵심 영향 파일", "주요 변경 영역"],
+                "links": [(f"근거 파일 {idx + 1}", item) for idx, item in enumerate(top_files[:2])],
+            },
+        ]
+        slots = []
+        for spec in evidence_specs:
+            target_html = "".join(f"<li>{escape(item)}</li>" for item in spec["targets"])
+            source_html = "".join(f"<li><code>{escape(item)}</code></li>" for item in spec["sources"])
+            link_html = render_link_group(list(spec.get("links") or []))
+            slots.append(
+                f"""
+    <div class="image-slot">
+      <span>{escape(spec['title'])}</span>
+      <small>{escape(spec['purpose'])}</small>
+      <div class="evidence-meta">
+        <strong>추천 캡처 대상</strong>
+        <ul>{target_html}</ul>
+      </div>
+      <div class="evidence-meta">
+        <strong>근거 파일/영역</strong>
+        <ul>{source_html}</ul>
+      </div>
+      <div class="evidence-meta">
+        <strong>바로 열기 링크</strong>
+        <ul>{link_html}</ul>
+      </div>
+      <div class="evidence-placeholder">여기에 스크린샷, 차트, 비교 이미지를 배치</div>
+    </div>
+"""
+            )
         return """
 <section class="detail-panel image-panel">
-  <h3>Visual Evidence Slots</h3>
+  <h3>시각 증빙 패널</h3>
+  <p class="mini-meta">결과 보고서에 바로 붙일 수 있는 증빙 위치입니다. 아래 추천 대상을 기준으로 화면, 로그, 구조 변경 캡처를 채웁니다.</p>
   <div class="image-slots">
-    <div class="image-slot"><span>Screen / Before</span><small>Paste screenshot or exported chart here for reporting.</small></div>
-    <div class="image-slot"><span>Screen / After</span><small>Use for UI diff, diagram image, or stakeholder-ready capture.</small></div>
-    <div class="image-slot"><span>Architecture / Flow</span><small>Use for sequence, component, or data-flow visual.</small></div>
+""" + "".join(slots) + """
   </div>
 </section>
 """
 
     def build_jira_plan_extras() -> str:
-        subtasks = list(sections.get("subtasks") or [])
+        remaining = list(sections.get("remaining") or [])
+        in_progress = list(sections.get("in_progress") or [])
+        completed = list(sections.get("completed") or [])
         validations = list(sections.get("validation") or [])
         rows = []
         timeline = []
         owners = ["Backend", "Frontend", "QA", "Docs", "DevOps", "Owner"]
-        for idx, item in enumerate(subtasks[:6]):
-            priority = "High" if idx == 0 else ("Medium" if idx < 3 else "Low")
+        work_items = [(item, "진행 중") for item in in_progress[:3]] + [(item, "잔여") for item in remaining[:3]] + [(item, "완료") for item in completed[:2]]
+        for idx, (item, phase) in enumerate(work_items[:6]):
+            priority = "High" if phase == "잔여" and idx == 0 else ("Medium" if phase in {"잔여", "진행 중"} else "Low")
             owner = owners[idx % len(owners)]
             dod = validations[idx % len(validations)] if validations else "Validation needed"
             timeline.append(
@@ -1490,7 +1598,7 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
   <div class="timeline-marker">{idx + 1}</div>
   <div class="timeline-copy">
     <strong>{escape(str(item))}</strong>
-    <span>{priority} priority · {escape(str(dod))}</span>
+    <span>{escape(phase)} · {priority} priority · {escape(str(dod))}</span>
   </div>
 </div>
 """
@@ -1500,6 +1608,7 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
 <tr>
   <td>{idx + 1}</td>
   <td>{escape(str(item))}</td>
+  <td>{escape(phase)}</td>
   <td>{priority}</td>
   <td>{owner}</td>
   <td>{escape(str(dod))}</td>
@@ -1510,15 +1619,15 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
             return ""
         return f"""
 <section class="detail-panel">
-  <h3>Jira Execution Timeline</h3>
+  <h3>실행 흐름 타임라인</h3>
   <div class="timeline">{"".join(timeline)}</div>
 </section>
 <section class="detail-panel">
-  <h3>Assignment Table</h3>
+  <h3>작업 할당 및 상태 표</h3>
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>#</th><th>Subtask</th><th>Priority</th><th>Owner</th><th>Definition of Done</th></tr>
+        <tr><th>#</th><th>Work Item</th><th>Status</th><th>Priority</th><th>Owner</th><th>Definition of Done</th></tr>
       </thead>
       <tbody>
         {"".join(rows)}
@@ -1578,23 +1687,23 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
                 list_block("다음 달", list(sections.get("next_month") or [])),
             ]
         )
-    elif report_type == "jira_plan":
+    elif report_type == "jira":
         section_blocks.extend(
             [
-                list_block("Task", [f"Name: {sections.get('task_name', '-')}", f"Goal: {sections.get('task_goal', '-')}", *list(sections.get("scope") or [])]),
-                list_block("Subtasks", list(sections.get("subtasks") or [])),
-                list_block("Validation", list(sections.get("validation") or [])),
-                list_block("Risks", list(sections.get("risks") or [])),
-            ]
-        )
-    elif report_type == "jira_result":
-        section_blocks.extend(
-            [
-                list_block("Task Result", [f"Name: {sections.get('task_name', '-')}", *list(sections.get("done_items") or [])]),
-                list_block("Subtask Results", list(sections.get("subtask_results") or [])),
-                list_block("Validation", list(sections.get("validation") or [])),
-                list_block("Issues", list(sections.get("issues") or [])),
-                list_block("Links", list(sections.get("links") or [])),
+                list_block("상위 작업", [f"이름: {sections.get('task_name', '-')}", f"목표: {sections.get('task_goal', '-')}", *list(sections.get("scope") or [])]),
+                list_block(
+                    "스프린트 현황",
+                    [
+                        f"완료: {(sections.get('status_summary') or {}).get('completed_count', len(list(sections.get('completed') or [])))}",
+                        f"진행 중: {(sections.get('status_summary') or {}).get('in_progress_count', len(list(sections.get('in_progress') or [])))}",
+                        f"잔여: {(sections.get('status_summary') or {}).get('remaining_count', len(list(sections.get('remaining') or [])))}",
+                    ],
+                ),
+                list_block("완료된 작업", list(sections.get("completed") or [])),
+                list_block("진행 중인 작업", list(sections.get("in_progress") or [])),
+                list_block("남은 작업", list(sections.get("remaining") or [])),
+                list_block("완료 조건", list(sections.get("validation") or [])),
+                list_block("리스크 및 확인 필요 사항", list(sections.get("risks") or [])),
             ]
         )
 
@@ -1629,7 +1738,7 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
     ) or "<li>No impacted files</li>"
     extra_html = build_image_slots()
     extra_html += build_area_inspection()
-    if report_type == "jira_plan":
+    if report_type == "jira":
         extra_html += build_jira_plan_extras()
 
     return f"""<!doctype html>
@@ -1673,15 +1782,28 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
     .detail-panel h3 {{ margin:0 0 12px; font-size:20px; }}
     .detail-panel ul {{ margin:0; padding-left:20px; }}
     .detail-panel li {{ margin-bottom:8px; line-height:1.5; }}
+    .detail-panel li.checklist-item {{ list-style:none; margin-left:-20px; }}
+    .check-label {{ display:flex; gap:10px; align-items:flex-start; cursor:pointer; }}
+    .check-input {{ position:absolute; opacity:0; pointer-events:none; }}
+    .check-box {{ width:18px; height:18px; border:2px solid #d17a22; border-radius:6px; flex:0 0 auto; margin-top:2px; background:linear-gradient(180deg,#fff9ef,#f8eddc); }}
+    .check-input:checked + .check-box {{ background:linear-gradient(180deg,#e8faf6,#dff5ef); border-color:#2a9d8f; position:relative; }}
+    .check-input:checked + .check-box::after {{ content:""; position:absolute; left:4px; top:0px; width:5px; height:10px; border:solid #166534; border-width:0 2px 2px 0; transform:rotate(45deg); }}
+    .check-text {{ flex:1; }}
+    .check-input:checked ~ .check-text {{ color:#6b7280; text-decoration:line-through; }}
     .detail-panel li span {{ color:var(--muted); margin-left:8px; font-size:12px; }}
     .chart-wrap {{ background:linear-gradient(180deg,#fffdfa,#f9f3e9); border:1px solid var(--line); border-radius:24px; padding:22px; }}
     .chart-large {{ min-height: 320px; }}
     .chart-wrap h3 {{ margin:0 0 12px; font-size:20px; }}
     .image-panel {{ grid-column:1 / -1; }}
     .image-slots {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }}
-    .image-slot {{ min-height:150px; border:2px dashed #d8ccb7; border-radius:20px; padding:18px; background:linear-gradient(180deg,#fffdfa,#f8f1e4); display:flex; flex-direction:column; justify-content:flex-end; }}
-    .image-slot span {{ display:block; font-size:16px; font-weight:700; margin-bottom:8px; }}
+    .image-slot {{ min-height:240px; border:2px dashed #d8ccb7; border-radius:20px; padding:18px; background:linear-gradient(180deg,#fffdfa,#f8f1e4); display:flex; flex-direction:column; gap:12px; }}
+    .image-slot span {{ display:block; font-size:16px; font-weight:700; margin-bottom:4px; }}
     .image-slot small {{ color:var(--muted); line-height:1.5; }}
+    .evidence-meta strong {{ display:block; margin-bottom:6px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:#7c2d12; }}
+    .evidence-meta ul {{ margin:0; padding-left:18px; }}
+    .evidence-meta li {{ margin-bottom:6px; line-height:1.45; }}
+    .evidence-meta a {{ color:var(--accent); font-weight:700; text-decoration:none; }}
+    .evidence-placeholder {{ margin-top:auto; border:1px dashed #c8b9a5; border-radius:14px; padding:12px; font-size:12px; color:var(--muted); background:rgba(255,255,255,.65); }}
     .timeline {{ display:grid; gap:14px; }}
     .timeline-step {{ display:grid; grid-template-columns:auto 1fr; gap:14px; align-items:start; }}
     .timeline-marker {{ width:34px; height:34px; border-radius:50%; background:#12343b; color:#fff; display:flex; align-items:center; justify-content:center; font-weight:700; }}
@@ -1798,6 +1920,22 @@ def render_detail_html(report_type: str, sections: dict[str, Any], payload: dict
     </div>
     {extra_html}
   </div>
+  <script>
+    (function () {{
+      const storagePrefix = "jira-checklist:";
+      document.querySelectorAll(".check-input[data-checklist-id]").forEach((input) => {{
+        const key = storagePrefix + input.dataset.checklistId;
+        try {{
+          input.checked = window.localStorage.getItem(key) === "1";
+        }} catch (error) {{}}
+        input.addEventListener("change", () => {{
+          try {{
+            window.localStorage.setItem(key, input.checked ? "1" : "0");
+          }} catch (error) {{}}
+        }});
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
 
@@ -2114,21 +2252,15 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
         tone = {
             "daily": "tone-daily",
             "plan": "tone-plan",
-            "jira_plan": "tone-jira",
-            "jira_result": "tone-jira2",
+            "jira": "tone-jira",
             "weekly": "tone-weekly",
             "monthly": "tone-monthly",
         }.get(card["report_type"], "tone-default")
-        is_jira_plan = card["report_type"] == "jira_plan"
-        is_jira_result = card["report_type"] == "jira_result"
+        is_jira_plan = card["report_type"] == "jira"
+        is_jira_result = False
         board_html = ""
         if is_jira_plan:
-            result_sections = {}
-            for other in cards:
-                if other["report_type"] == "jira_result":
-                    result_sections = other.get("sections") or {}
-                    break
-            board_html = html_task_board(sections, result_sections)
+            board_html = html_task_board(sections, sections)
         card_html.append(
             f"""
 <section class="card {tone}">
@@ -2429,11 +2561,12 @@ def main() -> int:
         profile_name=profile_name,
     )
 
+    cleanup_legacy_jira_outputs(output_root, today)
+
     output_specs = [
         ("daily", output_root / "reports" / "daily_brief" / f"{today.isoformat()}-daily-report.md"),
         ("plan", output_root / "reports" / "plans" / f"{today.isoformat()}-next-plan.md"),
-        ("jira_plan", output_root / "reports" / "jira" / f"{today.isoformat()}-jira-plan.md"),
-        ("jira_result", output_root / "reports" / "jira" / f"{today.isoformat()}-jira-result.md"),
+        ("jira", output_root / "reports" / "jira" / f"{today.isoformat()}-jira-status.md"),
     ]
     dashboard_cards: list[dict[str, Any]] = []
     for report_type, path in output_specs:

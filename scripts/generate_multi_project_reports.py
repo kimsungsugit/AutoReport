@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from html import escape
 from pathlib import Path
 import re
+from hashlib import sha1
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -81,8 +82,11 @@ def parse_markdown_sections(path: Path) -> dict[str, list[str]]:
 def parse_jira_plan(path: Path) -> dict[str, object]:
     sections = parse_markdown_sections(path)
     task_lines = [line[2:].strip() for line in sections.get("Task", []) if line.startswith("- ")]
-    subtasks = [line[2:].strip() for line in sections.get("Subtasks", []) if line.startswith("- ")]
+    completed = [line[2:].strip() for line in sections.get("Completed", []) if line.startswith("- ")]
+    in_progress = [line[2:].strip() for line in sections.get("In Progress", []) if line.startswith("- ")]
+    remaining = [line[2:].strip() for line in sections.get("Remaining", []) if line.startswith("- ")]
     validation = [line[2:].strip() for line in sections.get("Validation", []) if line.startswith("- ")]
+    sprint_status = [line[2:].strip() for line in sections.get("Sprint Status", []) if line.startswith("- ")]
     task_name = ""
     task_goal = ""
     task_scope: list[str] = []
@@ -97,8 +101,11 @@ def parse_jira_plan(path: Path) -> dict[str, object]:
         "task_name": task_name,
         "task_goal": task_goal,
         "task_scope": task_scope,
-        "subtasks": subtasks,
+        "completed": completed,
+        "in_progress": in_progress,
+        "remaining": remaining,
         "validation": validation,
+        "sprint_status": sprint_status,
     }
 
 
@@ -172,8 +179,11 @@ def build_task_board(item: dict) -> str:
     task_name = str(plan.get("task_name") or item["name"])
     task_goal = str(plan.get("task_goal") or item["message"])
     task_scope = [str(x) for x in (plan.get("task_scope") or [])[:3]]
-    subtasks = [str(x) for x in (plan.get("subtasks") or [])[:4]]
+    completed = [str(x) for x in (plan.get("completed") or [])[:3]]
+    in_progress = [str(x) for x in (plan.get("in_progress") or [])[:3]]
+    remaining = [str(x) for x in (plan.get("remaining") or [])[:4]]
     validation = [str(x) for x in (plan.get("validation") or [])[:3]]
+    sprint_status = [str(x) for x in (plan.get("sprint_status") or [])[:3]]
     work_type = str(daily.get("work_type") or "")
     primary_facets = [str(x) for x in (daily.get("primary_facets") or [])[:3]]
     supporting_facets = [str(x) for x in (daily.get("supporting_facets") or [])[:3]]
@@ -183,23 +193,28 @@ def build_task_board(item: dict) -> str:
     subtask_html = "".join(
         f"""
 <li class="subtask-item">
-  <span class="dot"></span>
+  <label class="check-label">
+  <input class="check-input" type="checkbox" data-checklist-id="{sha1((item['name'] + '::' + text).encode('utf-8')).hexdigest()[:16]}">
+  <span class="checkbox"></span>
   <div>
     <strong>{escape(text)}</strong>
-    <span>Jira Title: {escape(text[:72])}</span>
+    <span>Remaining Work: {escape(text[:72])}</span>
   </div>
+  </label>
 </li>
 """
-        for text in subtasks
-    ) or '<li class="subtask-item"><span class="dot"></span><div><strong>No subtasks</strong><span>Jira Title: define manual subtasks</span></div></li>'
+        for text in remaining
+    ) or '<li class="subtask-item"><span class="checkbox done"></span><div><strong>No remaining tasks</strong><span>Remaining work already cleared</span></div></li>'
     validation_html = "".join(f"<li>{escape(x)}</li>" for x in validation) or "<li>Validation not defined</li>"
+    sprint_html = "".join(f"<li>{escape(x)}</li>" for x in sprint_status) or "<li>Status not defined</li>"
+    completed_html = "".join(f"<li>{escape(x)}</li>" for x in completed) or "<li>No completed items</li>"
+    progress_html = "".join(f"<li>{escape(x)}</li>" for x in in_progress) or "<li>No in-progress items</li>"
     summary_html = "".join(f"<li>{escape(x)}</li>" for x in summary) or "<li>핵심 요약 없음</li>"
     source_change_html = "".join(f"<li>{escape(x)}</li>" for x in source_changes) or "<li>핵심 변경 파일 없음</li>"
     primary_facet_html = "".join(f'<span class="facet-chip primary">{escape(x)}</span>' for x in primary_facets) or '<span class="facet-chip primary">핵심 변경 분류 없음</span>'
     supporting_facet_html = "".join(f'<span class="facet-chip support">{escape(x)}</span>' for x in supporting_facets) or '<span class="facet-chip support">보조 변경 없음</span>'
     auto_status_text = str(auto_status.get("status") or "")
     jira_plan_link = item.get("jira_plan_link", "")
-    jira_result_link = item.get("jira_result_link", "")
     auto_status_link = item.get("automation_status_link", "")
     return f"""
 <section class="task-board">
@@ -226,15 +241,27 @@ def build_task_board(item: dict) -> str:
     <ul>{task_scope_html}</ul>
   </div>
   <div class="task-col subtasks">
-    <div class="task-tag">Subtasks</div>
+    <div class="task-tag">Remaining Work</div>
     <ul class="subtask-list">{subtask_html}</ul>
   </div>
   <div class="task-col result">
-    <div class="task-tag">Definition Of Done</div>
+    <div class="task-tag">Sprint Snapshot</div>
+    <div class="snapshot-block">
+      <div class="facet-title">Status</div>
+      <ul>{sprint_html}</ul>
+    </div>
+    <div class="snapshot-block">
+      <div class="facet-title">Completed</div>
+      <ul>{completed_html}</ul>
+    </div>
+    <div class="snapshot-block">
+      <div class="facet-title">In Progress</div>
+      <ul>{progress_html}</ul>
+    </div>
+    <div class="facet-title">Definition Of Done</div>
     <ul>{validation_html}</ul>
     <div class="task-links">
-      {f'<a href="{escape(jira_plan_link)}">Jira Plan</a>' if jira_plan_link else ''}
-      {f'<a href="{escape(jira_result_link)}">Jira Result</a>' if jira_result_link else ''}
+      {f'<a href="{escape(jira_plan_link)}">Jira Status</a>' if jira_plan_link else ''}
       {f'<a href="{escape(auto_status_link)}">Auto Commit Status</a>' if auto_status_link else ''}
     </div>
   </div>
@@ -291,7 +318,7 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
   <div class="links">
     {f'<a href="{escape(dashboard_link)}">Project Dashboard</a>' if dashboard_link else ''}
     {f'<a href="{escape(daily_link)}">Daily Report</a>' if daily_link else ''}
-    {f'<a href="{escape(jira_plan_link)}">Jira Plan</a>' if jira_plan_link else ''}
+    {f'<a href="{escape(jira_plan_link)}">Jira Status</a>' if jira_plan_link else ''}
     {f'<a href="{escape(item.get("automation_status_link",""))}">Auto Commit Status</a>' if item.get("automation_status_link","") else ''}
   </div>
 </section>
@@ -308,7 +335,7 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
     </div>
     <div class="project-links">
       {f'<a href="{escape(dashboard_link)}">Open Project Dashboard</a>' if dashboard_link else ''}
-      {f'<a href="{escape(jira_plan_link)}">Open Jira Draft</a>' if jira_plan_link else ''}
+      {f'<a href="{escape(jira_plan_link)}">Open Jira Status</a>' if jira_plan_link else ''}
     </div>
   </div>
   {build_task_board(item)}
@@ -379,10 +406,17 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
     .snapshot-block li {{ margin-bottom:6px; line-height:1.5; color:#4b5563; }}
     .task-tag {{ display:inline-block; margin-bottom:10px; padding:6px 10px; border-radius:999px; border:1px solid #ddd2c1; background:rgba(255,255,255,.7); font-size:11px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:#6b7280; }}
     .subtask-list {{ list-style:none; padding-left:0; }}
-    .subtask-item {{ display:grid; grid-template-columns:auto 1fr; gap:12px; align-items:start; margin-bottom:12px; }}
+    .subtask-item {{ list-style:none; margin-bottom:12px; }}
+    .check-label {{ display:grid; grid-template-columns:auto 1fr; gap:12px; align-items:start; cursor:pointer; }}
+    .check-input {{ position:absolute; opacity:0; pointer-events:none; }}
     .subtask-item strong {{ display:block; margin-bottom:4px; font-size:14px; overflow-wrap:anywhere; word-break:break-word; }}
     .subtask-item span {{ display:block; color:#6b7280; font-size:12px; overflow-wrap:anywhere; word-break:break-word; }}
-    .dot {{ width:14px; height:14px; border-radius:50%; margin-top:4px; background:#d17a22; box-shadow:0 0 0 4px rgba(209,122,34,.14); }}
+    .checkbox {{ width:18px; height:18px; margin-top:2px; border-radius:6px; border:2px solid #d17a22; background:linear-gradient(180deg,#fff9ef,#fbf1de); }}
+    .checkbox.done {{ border-color:#2a9d8f; background:linear-gradient(180deg,#e8faf6,#dff5ef); }}
+    .check-input:checked + .checkbox {{ border-color:#2a9d8f; background:linear-gradient(180deg,#e8faf6,#dff5ef); position:relative; }}
+    .check-input:checked + .checkbox::after {{ content:""; position:absolute; left:4px; top:0px; width:5px; height:10px; border:solid #166534; border-width:0 2px 2px 0; transform:rotate(45deg); }}
+    .check-input:checked ~ div strong,
+    .check-input:checked ~ div span {{ color:#6b7280; text-decoration:line-through; }}
     .task-links {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }}
     .task-links a {{ text-decoration:none; color:#7c2d12; background:#fff7ed; border:1px solid #f5d0a9; padding:9px 12px; border-radius:999px; font-weight:700; }}
     .portfolio-grid {{ display:grid; grid-template-columns:1fr; gap:18px; }}
@@ -407,6 +441,22 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
       {"".join(cards)}
     </div>
   </div>
+  <script>
+    (function () {{
+      const storagePrefix = "portfolio-checklist:";
+      document.querySelectorAll(".check-input[data-checklist-id]").forEach((input) => {{
+        const key = storagePrefix + input.dataset.checklistId;
+        try {{
+          input.checked = window.localStorage.getItem(key) === "1";
+        }} catch (error) {{}}
+        input.addEventListener("change", () => {{
+          try {{
+            window.localStorage.setItem(key, input.checked ? "1" : "0");
+          }} catch (error) {{}}
+        }});
+      }});
+    }})();
+  </script>
 </body>
 </html>"""
 
@@ -437,9 +487,8 @@ def main() -> int:
         dashboard = output_root / "reports" / "dashboard" / f"{run_date}-startup-dashboard.html"
         daily = output_root / "reports" / "daily_brief" / f"{run_date}-daily-report.html"
         daily_md = output_root / "reports" / "daily_brief" / f"{run_date}-daily-report.md"
-        jira_plan = output_root / "reports" / "jira" / f"{run_date}-jira-plan.html"
-        jira_result = output_root / "reports" / "jira" / f"{run_date}-jira-result.html"
-        jira_plan_md = output_root / "reports" / "jira" / f"{run_date}-jira-plan.md"
+        jira_plan = output_root / "reports" / "jira" / f"{run_date}-jira-status.html"
+        jira_plan_md = output_root / "reports" / "jira" / f"{run_date}-jira-status.md"
         items.append(
             {
                 "name": name,
@@ -449,7 +498,6 @@ def main() -> int:
                 "dashboard_link": dashboard.as_uri() if dashboard.exists() else "",
                 "daily_link": daily.as_uri() if daily.exists() else "",
                 "jira_plan_link": jira_plan.as_uri() if jira_plan.exists() else "",
-                "jira_result_link": jira_result.as_uri() if jira_result.exists() else "",
                 "jira_plan_data": parse_jira_plan(jira_plan_md),
                 "daily_data": parse_daily_facets(daily_md),
                 "automation_status_link": automation_html.as_uri() if automation_html.exists() else "",
