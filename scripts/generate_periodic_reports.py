@@ -27,6 +27,7 @@ from scripts.design_system import (
     SVG_PALETTE, SVG_BG_DARK, SVG_STROKE, SVG_TEXT_DARK, SVG_TEXT_DARKER,
     SVG_TEXT_LIGHT, SVG_TEXT_MUTED, SVG_TEXT_ACCENT, SVG_IMPACT_STROKE,
     SVG_SUBTITLE_TINTS, svg_text_color_for,
+    SVG_SUB_ON_DARK, SVG_SUB_ON_WARM, SVG_META_LIGHT,
 )
 
 
@@ -1997,7 +1998,7 @@ def svg_architecture_delta(areas: list[dict[str, Any]], top_files: list[dict[str
   <text x="735" y="234" text-anchor="middle" fill="{t[4]}" font-size="13">Risk / quality check</text>
   <rect x="900" y="120" width="160" height="72" rx="18" fill="{p[0]}"></rect>
   <text x="980" y="150" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Report Pack</text>
-  <text x="980" y="174" text-anchor="middle" fill="#dbeafe" font-size="12">Daily / Weekly / Jira</text>
+  <text x="980" y="174" text-anchor="middle" fill="{SVG_SUB_ON_DARK}" font-size="12">Daily / Weekly / Jira</text>
   <line x1="210" y1="156" x2="290" y2="68" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
   <line x1="210" y1="156" x2="290" y2="160" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
   <line x1="210" y1="156" x2="290" y2="252" stroke="{SVG_STROKE}" stroke-width="4" marker-end="url(#arch-arrow)"></line>
@@ -2026,7 +2027,7 @@ def svg_change_impact_map(areas: list[dict[str, Any]], top_files: list[dict[str,
     parts.append(f'<defs><marker id="impact-arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="{_is}"></path></marker></defs>')
     parts.append(f'<rect x="30" y="126" width="190" height="70" rx="18" fill="{_is}"></rect>')
     parts.append(f'<text x="125" y="156" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Changed Sources</text>')
-    parts.append(f'<text x="125" y="178" text-anchor="middle" fill="#ffedd5" font-size="12">Evidence from git diff</text>')
+    parts.append(f'<text x="125" y="178" text-anchor="middle" fill="{SVG_SUB_ON_WARM}" font-size="12">Evidence from git diff</text>')
     x_positions = [320, 320, 320, 630, 630]
     y_positions = [24, 116, 208, 70, 186]
     for idx, node in enumerate(nodes[:5]):
@@ -2035,14 +2036,14 @@ def svg_change_impact_map(areas: list[dict[str, Any]], top_files: list[dict[str,
         y = y_positions[idx]
         fill = imp_colors[idx % len(imp_colors)]
         text_fill = svg_text_color_for(fill)
-        meta_fill = "#e5e7eb" if text_fill == SVG_TEXT_LIGHT else SVG_TEXT_MUTED
+        meta_fill = SVG_META_LIGHT if text_fill == SVG_TEXT_LIGHT else SVG_TEXT_MUTED
         parts.append(f'<rect x="{x}" y="{y}" width="230" height="74" rx="18" fill="{fill}"></rect>')
         parts.append(f'<text x="{x+115}" y="{y+28}" text-anchor="middle" fill="{text_fill}" font-size="16">{escape(title)}</text>')
         parts.append(f'<text x="{x+115}" y="{y+48}" text-anchor="middle" fill="{text_fill}" font-size="13">{escape(label[:34])}</text>')
         parts.append(f'<text x="{x+115}" y="{y+64}" text-anchor="middle" fill="{meta_fill}" font-size="11">{escape(meta)}</text>')
     parts.append(f'<rect x="920" y="126" width="150" height="70" rx="18" fill="{SVG_BG_DARK}"></rect>')
     parts.append(f'<text x="995" y="156" text-anchor="middle" fill="{SVG_TEXT_LIGHT}" font-size="18">Impacted Output</text>')
-    parts.append(f'<text x="995" y="178" text-anchor="middle" fill="#dbeafe" font-size="12">UI / API / Docs / Jira</text>')
+    parts.append(f'<text x="995" y="178" text-anchor="middle" fill="{SVG_SUB_ON_DARK}" font-size="12">UI / API / Docs / Jira</text>')
     for target_y in (61, 153, 245):
         parts.append(f'<line x1="220" y1="161" x2="320" y2="{target_y}" stroke="{_is}" stroke-width="4" marker-end="url(#impact-arrow)"></line>')
     parts.append(f'<line x1="550" y1="61" x2="630" y2="107" stroke="{_is}" stroke-width="4" marker-end="url(#impact-arrow)"></line>')

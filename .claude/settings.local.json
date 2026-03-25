@@ -17,7 +17,13 @@
       "Bash(\"C:/Users/kss11/AppData/Local/Programs/Python/Python312/python.exe\" \"D:/Project/Program/AutoReport/scripts/mcp/autoreport_mcp_server.py\" --help)",
       "Bash(\"C:/Users/kss11/AppData/Local/Programs/Python/Python312/python.exe\" -c \"import mcp; print\\('mcp package available'\\)\" 2>&1)",
       "Bash(grep:*)",
-      "Bash(echo \"EXIT: $?\")"
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(python3 -c \":*)",
+      "Bash(cmd.exe //c 'where python')",
+      "Read(//d/Project/Program/AutoReport/$APPDATA/Microsoft/Windows/Start Menu/Programs/Startup/**)",
+      "Read(//d/Project/devops/260105/scripts/**)",
+      "Bash(schtasks /query /fo LIST /v)",
+      "Bash(powershell.exe -Command \"\\(Get-Command python -ErrorAction SilentlyContinue\\).Source; python --version\" 2>&1)"
     ]
   },
   "mcpServers": {

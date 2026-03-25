@@ -13,6 +13,7 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $PythonCandidates = @(
     (Join-Path $RepoRoot ".venv\Scripts\python.exe"),
     (Join-Path $RepoRoot "backend\venv\Scripts\python.exe"),
+    "C:\msys64\mingw64\bin\python.exe",
     "python"
 )
 
@@ -38,7 +39,7 @@ foreach ($candidate in $PythonCandidates) {
     }
 
     try {
-        $check = & $resolved -c "import importlib.util; print('OK' if importlib.util.find_spec('google.genai') else 'MISSING')"
+        $check = & $resolved -c "import importlib.util`ntry:`n    s = importlib.util.find_spec('google.genai')`n    print('OK' if s else 'MISSING')`nexcept Exception:`n    print('MISSING')" 2>$null
         if (($check | Out-String).Trim() -eq "OK") {
             $PythonExe = $resolved
             break

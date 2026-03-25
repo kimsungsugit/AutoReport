@@ -22,6 +22,11 @@ SVG_IMPACT_STROKE = "#7c2d12"   # impact map connector color
 # Subtitle tints (light pastel for each palette slot)
 SVG_SUBTITLE_TINTS = ["#e6fffb", "#e6fffb", "#fef3c7", "#ffedd5", "#fee2e2", "#f3e8ff"]
 
+# SVG subtitle labels on dark/light boxes
+SVG_SUB_ON_DARK = "#dbeafe"      # subtitle on dark fills (blue tint)
+SVG_SUB_ON_WARM = "#ffedd5"      # subtitle on warm/brown fills
+SVG_META_LIGHT = "#e5e7eb"       # meta text on dark fills
+
 
 def svg_text_color_for(fill: str) -> str:
     """Return appropriate text color for a given SVG fill background."""
@@ -83,6 +88,34 @@ DESIGN_CSS = r"""
   --tone-weekly: #2a9d8f;
   --tone-monthly: #8f5f3f;
 
+  /* highlight (warm orange accent) */
+  --hl-bg: #fff1dd;
+  --hl-bg-deep: #ffe3b8;
+  --hl-border: #f59e0b;
+  --hl-ink: #9a3412;
+  --hl-ink-deep: #7c2d12;
+
+  /* support (muted parchment) */
+  --sup-bg: #f5efe5;
+  --sup-border: #d6c6aa;
+
+  /* status (purple) */
+  --status-bg: #ede9fe;
+  --status-ink: #5b21b6;
+  --status-border: #ddd6fe;
+
+  /* task board tints */
+  --task-parent-a: #f0fafa;
+  --task-parent-b: #e8f5f2;
+  --task-child-a: #fff9ef;
+  --task-child-b: #fbf1de;
+  --task-result-a: #fff4f1;
+  --task-result-b: #faece8;
+
+  /* task link */
+  --task-link-bg: #fff7ed;
+  --task-link-border: #f5d0a9;
+
   /* radii */
   --r-sm: 12px;
   --r-md: 18px;
@@ -131,6 +164,24 @@ DESIGN_CSS = r"""
     --danger-ink: #fca5a5;
     --info-bg: #0a2e3e;
     --info-ink: #7dd3fc;
+    --hl-bg: #3d2800;
+    --hl-bg-deep: #4a3000;
+    --hl-border: #b8860b;
+    --hl-ink: #fbbf24;
+    --hl-ink-deep: #f59e0b;
+    --sup-bg: #22303c;
+    --sup-border: #384956;
+    --status-bg: #2e1065;
+    --status-ink: #c4b5fd;
+    --status-border: #4c1d95;
+    --task-parent-a: #0d2a2a;
+    --task-parent-b: #153333;
+    --task-child-a: #2a2000;
+    --task-child-b: #332800;
+    --task-result-a: #2a1515;
+    --task-result-b: #331a1a;
+    --task-link-bg: #2a2000;
+    --task-link-border: #6b4c1a;
     --shadow-sm: 0 4px 12px rgba(0,0,0,0.25);
     --shadow-md: 0 14px 30px rgba(0,0,0,0.35);
     --shadow-lg: 0 24px 60px rgba(0,0,0,0.45);
@@ -412,18 +463,18 @@ body {
 }
 .facet-badge:hover { transform: translateY(-1px); }
 .facet-badge-primary {
-  background: linear-gradient(180deg, #fff1dd, #ffe3b8);
-  border-color: #f59e0b;
+  background: linear-gradient(180deg, var(--hl-bg), var(--hl-bg-deep));
+  border-color: var(--hl-border);
 }
 .facet-badge-support {
-  background: linear-gradient(180deg, var(--paper), #f5efe5);
-  border-color: #d6c6aa;
+  background: linear-gradient(180deg, var(--paper), var(--sup-bg));
+  border-color: var(--sup-border);
 }
 .facet-badge strong {
   font-size: 12px;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: #7c2d12;
+  color: var(--hl-ink-deep);
 }
 .facet-badge em {
   font-style: normal;
@@ -447,9 +498,9 @@ body {
   background: linear-gradient(180deg, var(--paper), var(--paper-alt));
   box-shadow: var(--shadow-inner);
 }
-.task-box.parent { background: linear-gradient(180deg, #f0fafa, #e8f5f2); }
-.task-box.child  { background: linear-gradient(180deg, #fff9ef, #fbf1de); }
-.task-box.result { background: linear-gradient(180deg, #fff4f1, #faece8); }
+.task-box.parent { background: linear-gradient(180deg, var(--task-parent-a), var(--task-parent-b)); }
+.task-box.child  { background: linear-gradient(180deg, var(--task-child-a), var(--task-child-b)); }
+.task-box.result { background: linear-gradient(180deg, var(--task-result-a), var(--task-result-b)); }
 .task-box h4 {
   margin: 0 0 10px;
   font-size: 18px;
@@ -486,8 +537,8 @@ body {
   border: 1px solid var(--line);
   background: var(--paper);
 }
-.badge-ok   { background: var(--ok-bg); color: var(--ok-ink); border-color: #a7f3d0; }
-.badge-warn { background: var(--warn-bg); color: var(--warn-ink); border-color: #fde68a; }
+.badge-ok   { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-bg); }
+.badge-warn { background: var(--warn-bg); color: var(--warn-ink); border-color: var(--warn-bg); }
 
 /* --- Mini chips (portfolio cards) ------------------------------------- */
 .mini-chip {
@@ -500,8 +551,8 @@ body {
   border: 1px solid var(--line);
   background: var(--paper);
 }
-.mini-chip.primary { background: #fff1dd; border-color: #f59e0b; color: #9a3412; }
-.mini-chip.support { background: var(--paper-alt); border-color: #d6c6aa; color: var(--muted); }
+.mini-chip.primary { background: var(--hl-bg); border-color: var(--hl-border); color: var(--hl-ink); }
+.mini-chip.support { background: var(--paper-alt); border-color: var(--sup-border); color: var(--muted); }
 
 /* --- File link button ------------------------------------------------- */
 .file-link {
@@ -566,11 +617,11 @@ body {
   border-radius: 6px;
   flex: 0 0 auto;
   margin-top: 2px;
-  background: linear-gradient(180deg, #fff9ef, #f8eddc);
+  background: linear-gradient(180deg, var(--task-child-a), var(--task-child-b));
   transition: all var(--dur-fast) var(--ease);
 }
 .check-input:checked + .check-box {
-  background: linear-gradient(180deg, #e8faf6, #dff5ef);
+  background: linear-gradient(180deg, var(--task-parent-a), var(--task-parent-b));
   border-color: var(--ok);
   position: relative;
 }
@@ -579,7 +630,7 @@ body {
   position: absolute;
   left: 5px; top: 1px;
   width: 5px; height: 10px;
-  border: solid #166534;
+  border: solid var(--ok-ink);
   border-width: 0 2.5px 2.5px 0;
   transform: rotate(45deg);
 }
@@ -636,6 +687,7 @@ code {
   padding: 22px;
 }
 .chart-wrap--light h3 { margin: 0 0 12px; font-size: 17px; font-weight: 700; }
+/* Force light palette on chart wrappers even in dark mode (SVG readability) */
 @media (prefers-color-scheme: dark) {
   .chart-wrap--light {
     background: linear-gradient(180deg, #f5f0e8, #ede5d6);
@@ -797,19 +849,19 @@ code {
 
 /* --- Mini badges (priority/impact/risk) ------------------------------- */
 .mini-badge { display: inline-flex; align-items: center; padding: 7px 10px; border-radius: var(--r-pill); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; border: 1px solid var(--line); background: var(--paper); }
-.priority-high, .impact-high, .risk-high { background: var(--danger-bg); color: var(--danger-ink); border-color: #fecaca; }
-.priority-medium, .impact-medium, .risk-medium { background: var(--warn-bg); color: var(--warn-ink); border-color: #fde68a; }
-.priority-low, .impact-low, .risk-low { background: var(--ok-bg); color: var(--ok-ink); border-color: #bbf7d0; }
-.owner { background: var(--info-bg); color: var(--info-ink); border-color: #bae6fd; }
-.status { background: #ede9fe; color: #5b21b6; border-color: #ddd6fe; }
+.priority-high, .impact-high, .risk-high { background: var(--danger-bg); color: var(--danger-ink); border-color: var(--danger-bg); }
+.priority-medium, .impact-medium, .risk-medium { background: var(--warn-bg); color: var(--warn-ink); border-color: var(--warn-bg); }
+.priority-low, .impact-low, .risk-low { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-bg); }
+.owner { background: var(--info-bg); color: var(--info-ink); border-color: var(--info-bg); }
+.status { background: var(--status-bg); color: var(--status-ink); border-color: var(--status-border); }
 
 /* --- Facet variants (detail report) ----------------------------------- */
 .facet-groups { display: grid; gap: 14px; margin: 0 0 18px; }
 .facet-group h3 { margin: 0 0 8px; font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .facet { display: inline-flex; flex-direction: column; gap: 4px; min-width: 170px; padding: 12px 14px; border-radius: var(--r-md); border: 1px solid var(--line); background: linear-gradient(180deg, var(--paper), var(--paper-alt)); transition: transform var(--dur-fast) var(--ease); }
 .facet:hover { transform: translateY(-1px); }
-.facet-primary { background: linear-gradient(180deg, #fff1dd, #ffe3b8); border-color: #f59e0b; }
-.facet-support { background: linear-gradient(180deg, var(--paper), #f5efe5); border-color: #d6c6aa; }
+.facet-primary { background: linear-gradient(180deg, var(--hl-bg), var(--hl-bg-deep)); border-color: var(--hl-border); }
+.facet-support { background: linear-gradient(180deg, var(--paper), var(--sup-bg)); border-color: var(--sup-border); }
 .facet strong { font-size: 13px; text-transform: uppercase; color: var(--accent-2); }
 .facet em { font-style: normal; color: var(--muted); font-size: 12px; line-height: 1.45; }
 
@@ -819,8 +871,8 @@ code {
 .facet-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .facet-chip { display: inline-flex; align-items: center; padding: 8px 10px; border-radius: var(--r-pill); font-size: 12px; font-weight: 700; border: 1px solid var(--line); max-width: 100%; overflow-wrap: anywhere; word-break: break-word; transition: transform var(--dur-fast) var(--ease); }
 .facet-chip:hover { transform: translateY(-1px); }
-.facet-chip.primary { background: #fff1dd; border-color: #f59e0b; color: #9a3412; }
-.facet-chip.support { background: var(--paper-alt); border-color: #d6c6aa; color: var(--muted); }
+.facet-chip.primary { background: var(--hl-bg); border-color: var(--hl-border); color: var(--hl-ink); }
+.facet-chip.support { background: var(--paper-alt); border-color: var(--sup-border); color: var(--muted); }
 
 /* --- State badges ----------------------------------------------------- */
 .state { display: inline-flex; align-items: center; border-radius: var(--r-pill); padding: 6px 10px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
@@ -836,9 +888,9 @@ code {
 
 /* --- Task columns (portfolio) ----------------------------------------- */
 .task-col { min-width: 0; border: 1px solid var(--line); border-radius: var(--r-lg); padding: 18px; background: linear-gradient(180deg, var(--paper), var(--paper-alt)); }
-.task-col.parent { background: linear-gradient(180deg, #f0fafa, #e8f5f2); }
-.task-col.subtasks { background: linear-gradient(180deg, #fff9ef, #fbf1de); }
-.task-col.result { background: linear-gradient(180deg, #fff4f1, #faece8); }
+.task-col.parent { background: linear-gradient(180deg, var(--task-parent-a), var(--task-parent-b)); }
+.task-col.subtasks { background: linear-gradient(180deg, var(--task-child-a), var(--task-child-b)); }
+.task-col.result { background: linear-gradient(180deg, var(--task-result-a), var(--task-result-b)); }
 .task-col h3 { margin: 0 0 10px; font-size: 20px; line-height: 1.2; }
 .task-col p { margin: 0 0 12px; color: var(--muted); line-height: 1.55; }
 .task-col ul { margin: 0; padding-left: 20px; }
@@ -854,11 +906,11 @@ code {
 .source-box li { margin-bottom: 6px; color: var(--muted); line-height: 1.5; }
 
 /* --- Work type / task tags -------------------------------------------- */
-.work-type { display: inline-flex; margin-bottom: 10px; padding: 8px 12px; border-radius: var(--r-pill); background: #fff1dd; border: 1px solid #f59e0b; font-size: 12px; font-weight: 800; color: #9a3412; }
+.work-type { display: inline-flex; margin-bottom: 10px; padding: 8px 12px; border-radius: var(--r-pill); background: var(--hl-bg); border: 1px solid var(--hl-border); font-size: 12px; font-weight: 800; color: var(--hl-ink); }
 .work-type-line { margin: 14px 0 8px; font-size: 13px; color: var(--muted); }
 .task-tag { display: inline-block; margin-bottom: 10px; padding: 6px 10px; border-radius: var(--r-pill); border: 1px solid var(--line); background: rgba(255,255,255,.7); font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .task-links { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
-.task-links a { text-decoration: none; color: var(--accent-2); background: #fff7ed; border: 1px solid #f5d0a9; padding: 9px 12px; border-radius: var(--r-pill); font-weight: 700; transition: all var(--dur) var(--ease); }
+.task-links a { text-decoration: none; color: var(--accent-2); background: var(--task-link-bg); border: 1px solid var(--task-link-border); padding: 9px 12px; border-radius: var(--r-pill); font-weight: 700; transition: all var(--dur) var(--ease); }
 .task-links a:hover { background: var(--accent-2); color: #fff; }
 
 /* --- Subtask checklist (portfolio) ------------------------------------ */
@@ -889,7 +941,7 @@ code {
 .overview-head p { margin: 0; color: var(--muted); font-size: 13px; }
 .overview-card ul { margin: 0 0 14px; padding-left: 18px; }
 .overview-card li { margin-bottom: 6px; line-height: 1.5; }
-.mini-status { padding: 8px 12px; border-radius: var(--r-pill); background: var(--warn-bg); border: 1px solid #e6c8a2; font-size: 12px; font-weight: 700; color: var(--warn-ink); }
+.mini-status { padding: 8px 12px; border-radius: var(--r-pill); background: var(--warn-bg); border: 1px solid var(--sup-border); font-size: 12px; font-weight: 700; color: var(--warn-ink); }
 .table-panel { background: var(--paper); border: 1px solid var(--line); border-radius: var(--r-xl); padding: 24px; box-shadow: var(--shadow-md); margin-bottom: 18px; overflow: auto; }
 td a { color: var(--accent); font-weight: 700; text-decoration: none; }
 
