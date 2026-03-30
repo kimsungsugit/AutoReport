@@ -149,7 +149,7 @@ def collect_project_history() -> dict[str, list[dict[str, Any]]]:
                 }
             )
 
-        for md_path in sorted(jira_dir.glob("*-jira-plan.md")):
+        for md_path in sorted(jira_dir.glob("*-jira-status.md")):
             run_date = infer_report_date(md_path)
             html_path = md_path.with_suffix(".html")
             history[project_name].append(

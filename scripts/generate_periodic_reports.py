@@ -254,14 +254,16 @@ def previous_business_day(target: date) -> date:
 
 
 def should_generate_weekly(today: date) -> bool:
-    return today.weekday() == 4
+    # Thursday(3) first, then Friday(4), then Monday(0)
+    return today.weekday() in (3, 4, 0)
 
 
 def should_generate_monthly(today: date) -> bool:
-    if today.weekday() != 0:
+    # Generate on first 5 business days of new month (Mon-Fri)
+    if today.weekday() >= 5:
         return False
     _, prev_month_end = previous_month(today)
-    return today > prev_month_end
+    return today > prev_month_end and today.day <= 7
 
 
 def ensure_parent(path: Path) -> None:
@@ -2296,6 +2298,9 @@ def make_payload(
 def build_week_window(today: date) -> ReportWindow:
     monday = today - timedelta(days=today.weekday())
     end = previous_business_day(today)
+    # On Monday, end becomes previous Friday — use previous week's window
+    if end < monday:
+        monday = monday - timedelta(days=7)
     return ReportWindow(start=monday, end=end, label=f"{monday.isoformat()}_to_{end.isoformat()}")
 
 
@@ -2420,30 +2425,37 @@ def main() -> int:
 
     if should_generate_weekly(today):
         week_window = build_week_window(today)
-        weekly_commits = get_commits(repo_root, branch, week_window.start, week_window.end)
-        weekly_files = [path for path in get_changed_files(repo_root, branch, week_window.start, week_window.end) if is_relevant_path(path)]
-        weekly_payload = make_payload(
-            today=today,
-            report_type="weekly",
-            window=week_window,
-            repo_root=repo_root,
-            branch=branch,
-            remote_url=remote_url,
-            upstream=upstream,
-            sync_state=sync_state,
-            commits=weekly_commits,
-            changed_files=weekly_files,
-            uncommitted=uncommitted,
-            profile_name=profile_name,
-        )
-        weekly_path = output_root / "reports" / "weekly_brief" / f"{today.isoformat()}-weekly-report.md"
-        weekly_text, weekly_mode, weekly_sections = generate_document("weekly", weekly_payload)
-        write_text(weekly_path, weekly_text)
-        weekly_html_path = weekly_path.with_suffix(".html")
-        write_text(weekly_html_path, render_detail_html("weekly", weekly_sections, weekly_payload, weekly_mode, weekly_path))
-        generated.append(weekly_path)
-        generated.append(weekly_html_path)
-        dashboard_cards.append({"report_type": "weekly", "title": weekly_text.splitlines()[0].lstrip("# ").strip(), "path": weekly_path, "html_path": weekly_html_path, "payload": weekly_payload, "mode": weekly_mode, "sections": weekly_sections})
+        weekly_dir = output_root / "reports" / "weekly_brief"
+        monday = today - timedelta(days=today.weekday())
+        week_already_exists = any(
+            weekly_dir.glob(f"{(monday + timedelta(days=d)).isoformat()}-weekly-report.md")
+            for d in range(7)
+        ) if weekly_dir.exists() else False
+        if not week_already_exists:
+            weekly_commits = get_commits(repo_root, branch, week_window.start, week_window.end)
+            weekly_files = [path for path in get_changed_files(repo_root, branch, week_window.start, week_window.end) if is_relevant_path(path)]
+            weekly_payload = make_payload(
+                today=today,
+                report_type="weekly",
+                window=week_window,
+                repo_root=repo_root,
+                branch=branch,
+                remote_url=remote_url,
+                upstream=upstream,
+                sync_state=sync_state,
+                commits=weekly_commits,
+                changed_files=weekly_files,
+                uncommitted=uncommitted,
+                profile_name=profile_name,
+            )
+            weekly_path = output_root / "reports" / "weekly_brief" / f"{today.isoformat()}-weekly-report.md"
+            weekly_text, weekly_mode, weekly_sections = generate_document("weekly", weekly_payload)
+            write_text(weekly_path, weekly_text)
+            weekly_html_path = weekly_path.with_suffix(".html")
+            write_text(weekly_html_path, render_detail_html("weekly", weekly_sections, weekly_payload, weekly_mode, weekly_path))
+            generated.append(weekly_path)
+            generated.append(weekly_html_path)
+            dashboard_cards.append({"report_type": "weekly", "title": weekly_text.splitlines()[0].lstrip("# ").strip(), "path": weekly_path, "html_path": weekly_html_path, "payload": weekly_payload, "mode": weekly_mode, "sections": weekly_sections})
 
     if should_generate_monthly(today):
         month_window = build_previous_month_window(today)

@@ -23,7 +23,8 @@
       "Read(//d/Project/Program/AutoReport/$APPDATA/Microsoft/Windows/Start Menu/Programs/Startup/**)",
       "Read(//d/Project/devops/260105/scripts/**)",
       "Bash(schtasks /query /fo LIST /v)",
-      "Bash(powershell.exe -Command \"\\(Get-Command python -ErrorAction SilentlyContinue\\).Source; python --version\" 2>&1)"
+      "Bash(powershell.exe -Command \"\\(Get-Command python -ErrorAction SilentlyContinue\\).Source; python --version\" 2>&1)",
+      "Bash(done)"
     ]
   },
   "mcpServers": {

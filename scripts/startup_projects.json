@@ -17,6 +17,24 @@
       "path": "D:/Project/Program/AutoReport",
       "profile": "reporting_automation",
       "enabled": true
+    },
+    {
+      "name": "Release",
+      "path": "D:/Project/devops/Release",
+      "profile": "uds_quality",
+      "enabled": true
+    },
+    {
+      "name": "Release_claude",
+      "path": "D:/Project/devops/Release_claude",
+      "profile": "uds_quality",
+      "enabled": true
+    },
+    {
+      "name": "AutoDoc",
+      "path": "D:/Project/Program/AutoDoc",
+      "profile": "general_software",
+      "enabled": true
     }
   ]
 }

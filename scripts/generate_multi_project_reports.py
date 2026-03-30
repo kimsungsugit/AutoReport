@@ -59,7 +59,10 @@ def run_project_report(project: dict, report_date: str | None) -> tuple[bool, st
         cmd.extend(["--profile", profile])
     if report_date:
         cmd.extend(["--date", report_date])
-    proc = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8", errors="replace")
+    try:
+        proc = subprocess.run(cmd, text=True, capture_output=True, encoding="utf-8", errors="replace", timeout=600)
+    except subprocess.TimeoutExpired:
+        return False, "Timed out after 600s"
     if proc.returncode == 0:
         return True, proc.stdout.strip()
     return False, (proc.stderr.strip() or proc.stdout.strip() or "Unknown error")
