@@ -1,0 +1,180 @@
+{
+  "sprint": {
+    "name": "[KIM] (동적/정적) 분석 산출물 자동화를 위한 시스템 개발",
+    "start": "2026-03-30",
+    "end": "2026-05-09"
+  },
+  "tasks": [
+    {
+      "key": "APPL-374",
+      "title": "대시보드 UI 컴포넌트 구현 및 연동",
+      "start": "2026-03-30",
+      "end": "2026-04-10",
+      "subtasks": [
+        {"title": "UI 컴포넌트 설계 및 구현", "description": "레이아웃, 요약 카드, SVG 차트 등 전체 컴포넌트 개발", "status": "in_progress"},
+        {"title": "백엔드 연동 및 스타일 적용", "description": "API 데이터 바인딩, design_system.py 기반 스타일/다크모드 적용", "status": "pending"}
+      ],
+      "keywords": [
+        {"word": "dashboard", "weight": 3},
+        {"word": "design_system", "weight": 3},
+        {"word": "render", "weight": 2},
+        {"word": "svg", "weight": 2},
+        {"word": "html", "weight": 1},
+        {"word": "css", "weight": 1},
+        {"word": "UI", "weight": 1},
+        {"word": "dark", "weight": 1}
+      ]
+    },
+    {
+      "key": "APPL-375",
+      "title": "GitLab 파이프라인 구축",
+      "start": "2026-03-30",
+      "end": "2026-03-31",
+      "subtasks": [
+        {"title": "GitLab CI/CD 및 Runner 구성", "description": "프로젝트 생성, 파이프라인 작성, Runner 설치/서비스 등록", "status": "done"},
+        {"title": "GitHub Actions 및 Pre-commit hook 구성", "description": "6개 프로젝트 CI 자동화, 커밋 시 자동 검증 hook 설치", "status": "done"}
+      ],
+      "keywords": [
+        {"word": "gitlab", "weight": 3},
+        {"word": "pipeline", "weight": 3},
+        {"word": "runner", "weight": 3},
+        {"word": "ci", "weight": 2},
+        {"word": "pre-commit", "weight": 2},
+        {"word": "github-actions", "weight": 2},
+        {"word": "hook", "weight": 1},
+        {"word": "workflow", "weight": 1}
+      ]
+    },
+    {
+      "key": "APPL-376",
+      "title": "백엔드 구성 및 최적화",
+      "start": "2026-03-30",
+      "end": "2026-04-10",
+      "subtasks": [
+        {"title": "API 설계 및 구현", "description": "FastAPI 엔드포인트, 리포트 생성/조회, Jira 연동 API", "status": "in_progress"},
+        {"title": "성능 최적화", "description": "LLM 어댑터 retry/backoff 튜닝, 캐싱, DB 구조 설계", "status": "pending"}
+      ],
+      "keywords": [
+        {"word": "fastapi", "weight": 3},
+        {"word": "backend", "weight": 3},
+        {"word": "router", "weight": 2},
+        {"word": "endpoint", "weight": 2},
+        {"word": "adapter", "weight": 2},
+        {"word": "api", "weight": 1},
+        {"word": "retry", "weight": 1},
+        {"word": "cache", "weight": 1},
+        {"word": "db", "weight": 1}
+      ]
+    },
+    {
+      "key": "APPL-377",
+      "title": "영향분석 고도화",
+      "start": "2026-04-06",
+      "end": "2026-04-17",
+      "subtasks": [
+        {"title": "파싱 및 영향 매핑 개선", "description": "C 소스 파싱 정확도 향상, 함수 단위 변경 영향 범위 산출", "status": "pending"},
+        {"title": "외부 연동 및 리포트 생성", "description": "Jenkins 트리거, VectorCAST 매핑, 영향분석 리포트 자동 출력", "status": "pending"}
+      ],
+      "keywords": [
+        {"word": "impact", "weight": 3},
+        {"word": "c_parsing", "weight": 3},
+        {"word": "tree-sitter", "weight": 3},
+        {"word": "vectorcast", "weight": 2},
+        {"word": "jenkins", "weight": 2},
+        {"word": "trigger", "weight": 1},
+        {"word": "analysis", "weight": 1}
+      ]
+    },
+    {
+      "key": "APPL-378",
+      "title": "정적/동적 분석 결과 리포트 자동 작성",
+      "start": "2026-04-13",
+      "end": "2026-04-24",
+      "subtasks": [
+        {"title": "분석 결과 파싱 및 요약", "description": "정적/동적 분석 결과 파서, LLM 기반 한글 요약 자동 생성", "status": "pending"},
+        {"title": "리포트 생성 및 대시보드 연동", "description": "HTML/PDF 템플릿, 멀티 프로젝트 통합, 히스토리 추이 비교", "status": "pending"}
+      ],
+      "keywords": [
+        {"word": "flake8", "weight": 3},
+        {"word": "lizard", "weight": 3},
+        {"word": "radon", "weight": 3},
+        {"word": "coverage", "weight": 2},
+        {"word": "static", "weight": 2},
+        {"word": "dynamic", "weight": 2},
+        {"word": "report", "weight": 1},
+        {"word": "pdf", "weight": 1}
+      ]
+    },
+    {
+      "key": "APPL-379",
+      "title": "환경구성",
+      "start": "2026-03-30",
+      "end": "2026-04-03",
+      "subtasks": [
+        {"title": "의존성 및 환경변수 정리", "description": "requirements.txt 정리, .env 템플릿, startup_projects.json 설정", "status": "in_progress"},
+        {"title": "스케줄러 및 인프라 확인", "description": "Windows 작업 스케줄러, GitLab Runner, 개발/운영 환경 분리", "status": "done"}
+      ],
+      "keywords": [
+        {"word": "requirements", "weight": 3},
+        {"word": "scheduler", "weight": 3},
+        {"word": "env", "weight": 2},
+        {"word": "config", "weight": 1},
+        {"word": "setup", "weight": 1},
+        {"word": "install", "weight": 1}
+      ]
+    },
+    {
+      "key": "APPL-380",
+      "title": "통합 테스트 및 QA",
+      "start": "2026-04-21",
+      "end": "2026-04-28",
+      "subtasks": [
+        {"title": "통합 테스트 수행", "description": "전체 파이프라인 E2E 테스트, API 연동 검증, 리포트 생성 시나리오 테스트", "status": "pending"},
+        {"title": "버그 수정 및 안정화", "description": "테스트 중 발견된 이슈 수정, 엣지 케이스 처리, 에러 핸들링 보강", "status": "pending"}
+      ],
+      "keywords": [
+        {"word": "e2e", "weight": 3},
+        {"word": "qa", "weight": 3},
+        {"word": "integration", "weight": 2},
+        {"word": "stabilize", "weight": 2},
+        {"word": "bug", "weight": 1}
+      ]
+    },
+    {
+      "key": "APPL-381",
+      "title": "운영 배포",
+      "start": "2026-04-28",
+      "end": "2026-04-30",
+      "subtasks": [
+        {"title": "배포 환경 구성 및 릴리즈", "description": "운영 환경 설정, 배포 스크립트 작성, 버전 태깅 및 릴리즈", "status": "pending"},
+        {"title": "운영 모니터링 설정", "description": "스케줄러 정상 동작 확인, 로그 수집, 장애 알림 구성", "status": "pending"}
+      ],
+      "keywords": [
+        {"word": "deploy", "weight": 3},
+        {"word": "release", "weight": 3},
+        {"word": "production", "weight": 3},
+        {"word": "tag", "weight": 2},
+        {"word": "monitor", "weight": 1},
+        {"word": "log", "weight": 1}
+      ]
+    },
+    {
+      "key": "APPL-382",
+      "title": "사용자 피드백 및 개선",
+      "start": "2026-05-01",
+      "end": "2026-05-09",
+      "subtasks": [
+        {"title": "사용자 피드백 수집 및 반영", "description": "팀원 피드백 수집, 리포트 품질/UI 개선 요청 반영", "status": "pending"},
+        {"title": "문서화 및 인수인계", "description": "사용 가이드 작성, 운영 매뉴얼, 유지보수 절차 정리", "status": "pending"}
+      ],
+      "keywords": [
+        {"word": "feedback", "weight": 3},
+        {"word": "document", "weight": 2},
+        {"word": "guide", "weight": 2},
+        {"word": "manual", "weight": 1},
+        {"word": "improve", "weight": 1},
+        {"word": "docs", "weight": 1}
+      ]
+    }
+  ]
+}

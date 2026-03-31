@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from collections import Counter
@@ -42,6 +43,125 @@ def load_get_adapter():
 
 
 get_adapter = load_get_adapter()
+
+
+def load_sprint_tasks() -> dict[str, Any]:
+    """Load sprint task definitions via TaskProvider.
+
+    Uses JiraApiTaskProvider if JIRA_URL/JIRA_TOKEN are set,
+    otherwise falls back to sprint_tasks.json.
+    """
+    try:
+        task_provider_path = REPO_ROOT / "workflow" / "task_provider.py"
+        spec = importlib.util.spec_from_file_location("task_provider", task_provider_path)
+        if spec and spec.loader:
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.get_task_provider().get_tasks()
+    except Exception:
+        pass
+    # Direct fallback
+    path = Path(__file__).resolve().parent / "sprint_tasks.json"
+    if not path.exists():
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _keyword_pattern(keyword: str) -> re.Pattern[str]:
+    """Build a word-boundary-aware regex for a keyword.
+
+    Hyphens and underscores in keywords are treated as flexible
+    separators so that e.g. ``github-actions`` matches ``github actions``,
+    ``github-actions``, and ``github_actions``.  Short keywords (<=2 chars)
+    always require word boundaries to avoid false positives
+    (e.g. ``ci`` matching ``spe*ci*fication``).
+    """
+    # Split on hyphens/underscores, escape each part, rejoin with flexible separator
+    parts = re.split(r"[-_]", keyword)
+    normalized = r"[-_ ]?".join(re.escape(p) for p in parts)
+    return re.compile(rf"(?<![a-z0-9]){normalized}(?![a-z0-9])", re.IGNORECASE)
+
+
+def _parse_keywords(raw_keywords: list) -> list[dict[str, Any]]:
+    """Normalize keywords to [{word, weight, pattern}] format.
+
+    Supports both old format (list of strings) and new format
+    (list of {word, weight} dicts).
+    """
+    result = []
+    for kw in raw_keywords:
+        if isinstance(kw, str):
+            result.append({"word": kw.lower(), "weight": 1, "pattern": _keyword_pattern(kw)})
+        elif isinstance(kw, dict):
+            word = str(kw.get("word", "")).lower()
+            weight = int(kw.get("weight", 1))
+            if word:
+                result.append({"word": word, "weight": weight, "pattern": _keyword_pattern(word)})
+    return result
+
+
+def match_commits_to_tasks(
+    commits: list[dict[str, str]],
+    changed_files: list[str],
+    sprint_data: dict[str, Any],
+    report_date: date,
+) -> list[dict[str, Any]]:
+    """Match commits and changed files to sprint tasks by weighted keywords."""
+    tasks = sprint_data.get("tasks") or []
+    if not tasks:
+        return []
+    search_text = " ".join(
+        [c.get("subject", "") for c in commits]
+        + changed_files
+    ).lower()
+    matched = []
+    for task in tasks:
+        try:
+            task_start = date.fromisoformat(task["start"])
+            task_end = date.fromisoformat(task["end"])
+        except (ValueError, KeyError) as exc:
+            print(f"[WARN] task {task.get('key', '?')} 날짜 파싱 실패: {exc}")
+            continue
+        # subtask status 집계
+        subtasks = task.get("subtasks", [])
+        subtask_done = sum(1 for s in subtasks if s.get("status") == "done")
+        subtask_total = len(subtasks)
+        # 날짜 + subtask 기반 상태 결정
+        if report_date < task_start:
+            status = "예정"
+        elif report_date > task_end:
+            status = "완료"
+        elif subtask_total > 0 and subtask_done == subtask_total:
+            status = "완료"
+        else:
+            status = "진행 중"
+        kw_entries = _parse_keywords(task.get("keywords", []))
+        weighted_score = sum(
+            entry["weight"] for entry in kw_entries
+            if entry["pattern"].search(search_text)
+        )
+        related_commits = [
+            c["subject"] for c in commits
+            if any(entry["pattern"].search(c.get("subject", "")) for entry in kw_entries)
+        ]
+        matched.append({
+            "key": task["key"],
+            "title": task["title"],
+            "start": task["start"],
+            "end": task["end"],
+            "status": status,
+            "subtasks": subtasks,
+            "hit_count": weighted_score,
+            "related_commits": related_commits[:5],
+            "subtask_progress": f"{subtask_done}/{subtask_total}",
+        })
+    matched.sort(key=lambda x: x["hit_count"], reverse=True)
+    return matched
+
 
 FIELD_SEP = "\x1f"
 DEFAULT_EXCLUDED_TOP_LEVEL_DIRS = {
@@ -705,6 +825,12 @@ def build_context_payload(
         "changed_docs": changed_markdown_docs(changed_files)[:20],
         "uncommitted": uncommitted[:30],
         "github": github_meta,
+        "sprint_tasks": match_commits_to_tasks(
+            [{"hash": c.short_hash, "time": c.authored_at, "author": c.author, "subject": c.subject} for c in commits[:20]],
+            changed_files,
+            load_sprint_tasks(),
+            today,
+        ),
     }
 
 
@@ -754,42 +880,62 @@ def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str,
     areas = payload["top_areas"]
     commits = payload["recent_commits"]
     work_type = work_type_label(payload["work_type"])
-    diff = payload.get("diff_summary") or {}
     source_insights = list(payload.get("source_insights") or [])
-    top_files = [str(item.get("path", "")) for item in (diff.get("top_files") or [])[:4]]
-    area_items = [str(item.get("area", "")) for item in areas[:4]]
-    area_subtasks = [
-        f"{area} 영역 변경 검토 및 검증 정리"
-        for area in area_items[:3]
-        if area
-    ]
-    if top_files:
-        area_subtasks.append(f"핵심 영향 파일 리뷰 및 결과 반영 ({', '.join(top_files[:2])})")
-    area_subtasks = area_subtasks[:4] or ["핵심 변경 영역 검토 및 결과 정리"]
-    done_items = [entry["subject"] for entry in commits[:5]] or ["집계된 완료 항목이 없습니다."]
-    progress_items = [
-        f"{area} 영역 변경 검토와 검증 범위 정리를 진행 중입니다."
-        for area in area_items[:3]
-        if area
-    ]
-    if top_files:
-        progress_items.append(f"핵심 영향 파일 리뷰를 진행 중입니다. ({', '.join(top_files[:2])})")
+    sprint_tasks = list(payload.get("sprint_tasks") or [])
+
+    # Sprint task 기반 completed / in_progress / remaining 분류
+    completed_tasks = []
+    in_progress_tasks = []
+    remaining_tasks = []
+    for task in sprint_tasks:
+        entry = f"[{task['key']}] {task['title']}"
+        if task.get("related_commits"):
+            entry += f" — {', '.join(task['related_commits'][:2])}"
+        if task["status"] == "완료":
+            completed_tasks.append(entry)
+        elif task["status"] == "진행 중":
+            if task["hit_count"] > 0:
+                in_progress_tasks.append(entry)
+            else:
+                remaining_tasks.append(entry)
+        else:
+            remaining_tasks.append(entry)
+
+    # 커밋 기반 보충
+    if not completed_tasks and not in_progress_tasks:
+        completed_tasks = [c["subject"] for c in commits[:5]] or ["집계된 완료 항목이 없습니다."]
+
+    # task_board: 작업별 하위작업 구조
+    task_board = []
+    for task in sprint_tasks:
+        subtasks = task.get("subtasks", [])
+        task_board.append({
+            "key": task["key"],
+            "title": task["title"],
+            "status": task["status"],
+            "period": f"{task['start']} ~ {task['end']}",
+            "subtasks": subtasks,
+            "subtask_progress": task.get("subtask_progress", f"0/{len(subtasks)}"),
+            "related_commits": task.get("related_commits", []),
+        })
+
     return {
-        "title": f"[{work_type}] {payload['today']} 작업 현황",
-        "summary": source_insights[0] if source_insights else f"{work_type} 유형 작업에 대한 Jira 통합 현황 초안입니다.",
+        "title": f"[{work_type}] {payload['today']} 스프린트 현황",
+        "summary": source_insights[0] if source_insights else f"{work_type} 유형 작업에 대한 스프린트 현황입니다.",
         "task_name": f"{payload['repository']} {work_type} 작업",
-        "task_goal": source_insights[1] if len(source_insights) > 1 else "최근 변경 이력과 영향 파일을 기준으로 계획, 완료, 잔여 작업을 한 문서에서 연결합니다.",
-        "scope": [*source_insights[:2], *[f"{item['area']} 영역 후속 작업" for item in areas[:4]]][:4] or ["주요 변경 영역 후속 작업"],
-        "completed": done_items,
-        "in_progress": progress_items[:4] or ["현재 진행 중인 하위 작업을 추가 정리해야 합니다."],
-        "remaining": area_subtasks,
-        "validation": ["커밋 이력 확인", "변경 파일 검토", "추가 검증 필요 여부 확인"],
+        "task_goal": "Jira 스프린트 작업 기반으로 계획, 진행, 완료 현황을 추적합니다.",
+        "scope": [f"[{t['key']}] {t['title']}" for t in sprint_tasks if t["status"] == "진행 중"][:4] or ["스프린트 작업 범위 확인 필요"],
+        "completed": completed_tasks or ["완료된 작업이 없습니다."],
+        "in_progress": in_progress_tasks or ["진행 중인 작업이 없습니다."],
+        "remaining": remaining_tasks or ["잔여 작업이 없습니다."],
+        "task_board": task_board,
+        "validation": ["커밋-작업 매핑 확인", "하위작업 완료 여부 점검"],
         "risks": ["미커밋 변경이 남아 있으면 결과 정리에 추가 확인이 필요합니다."] if payload["uncommitted_count"] else ["즉시 보이는 로컬 미커밋 변경은 없습니다."],
         "links": [item.get("html_url", "") for item in payload.get("github", {}).get("commits", [])[:5] if item.get("html_url")] or [],
         "status_summary": {
-            "completed_count": len(done_items),
-            "in_progress_count": len(progress_items[:4] or []),
-            "remaining_count": len(area_subtasks),
+            "completed_count": len(completed_tasks),
+            "in_progress_count": len(in_progress_tasks),
+            "remaining_count": len(remaining_tasks),
         },
     }
 
@@ -918,7 +1064,7 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
         "plan": '{"title": str, "summary": [str], "priority_actions": [str], "mid_term_actions": [str], "risks": [str], "notes": [str]}',
         "weekly": '{"title": str, "summary": [str], "highlights": [str], "areas": [str], "risks": [str], "next_week": [str]}',
         "monthly": '{"title": str, "summary": [str], "highlights": [str], "areas": [str], "risks": [str], "next_month": [str]}',
-        "jira": '{"title": str, "summary": str, "task_name": str, "task_goal": str, "scope": [str], "completed": [str], "in_progress": [str], "remaining": [str], "validation": [str], "risks": [str], "links": [str], "status_summary": {"completed_count": int, "in_progress_count": int, "remaining_count": int}}',
+        "jira": '{"title": str, "summary": str, "task_name": str, "task_goal": str, "scope": [str], "completed": [str], "in_progress": [str], "remaining": [str], "task_board": [{"key": str, "title": str, "status": str, "period": str, "subtasks": [str], "related_commits": [str]}], "validation": [str], "risks": [str], "links": [str], "status_summary": {"completed_count": int, "in_progress_count": int, "remaining_count": int}}',
     }
     system = (
         "You are an engineering reporting assistant. "
@@ -934,7 +1080,7 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
         "- Keep the work type framing consistent.\n"
         f"- Domain profile: {payload.get('domain_profile_name', '')}\n"
         f"- Domain focus: {', '.join(payload.get('domain_focus') or [])}\n"
-        "- For jira, structure the content as one parent task with completed, in-progress, and remaining work in the same document.\n"
+        "- For jira, use the sprint_tasks data to map commits to APPL-xxx task keys. Show each task with its subtasks, status (완료/진행 중/예정), and related commits. Structure as task_board entries.\n"
         "- No markdown fence, JSON only.\n\n"
         f"Context JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
@@ -1272,6 +1418,32 @@ def render_jira_markdown(doc_type: str, sections: dict[str, Any], payload: dict[
             f"잔여: {status_summary.get('remaining_count', len(list(sections.get('remaining') or [])))}",
         ],
     )
+    # Task board: 작업별 계획 + 완료 내역
+    task_board = list(sections.get("task_board") or [])
+    if task_board:
+        lines.extend(["## 작업별 상세 현황", ""])
+        for tb in task_board:
+            status_icon = {"완료": "✅", "진행 중": "🔄", "예정": "⏳"}.get(tb["status"], "⏳")
+            progress = tb.get("subtask_progress", "")
+            progress_str = f" ({progress})" if progress else ""
+            lines.append(f"### {status_icon} [{tb['key']}] {tb['title']}{progress_str}")
+            lines.append(f"- 기간: `{tb['period']}`")
+            lines.append(f"- 상태: **{tb['status']}**")
+            if tb.get("subtasks"):
+                lines.append("- 하위작업:")
+                sub_icons = {"done": "✅", "in_progress": "🔄", "pending": "⏳"}
+                for st in tb["subtasks"]:
+                    if isinstance(st, dict):
+                        si = sub_icons.get(st.get("status", "pending"), "⏳")
+                        lines.append(f"  - {si} {st['title']}: {st.get('description', '')}")
+                    else:
+                        lines.append(f"  {st}")
+            if tb.get("related_commits"):
+                lines.append("- 관련 커밋:")
+                for rc in tb["related_commits"][:3]:
+                    lines.append(f"  - {rc}")
+            lines.append("")
+
     add("완료된 작업", list(sections.get("completed") or []))
     add("진행 중인 작업", list(sections.get("in_progress") or []))
     add("남은 작업", list(sections.get("remaining") or []))
@@ -1316,7 +1488,7 @@ def generate_document(report_type: str, payload: dict[str, Any]) -> tuple[str, s
         mode = "gemini"
         sections_error = ""
     except Exception as exc:
-        sections = build_fallback_jira_doc(report_type, payload) if report_type.startswith("jira_") else build_fallback_sections(report_type, payload)
+        sections = build_fallback_jira_doc(report_type, payload) if report_type.startswith("jira") else build_fallback_sections(report_type, payload)
         mode = "fallback"
         sections_error = f"{type(exc).__name__}: {exc}"
 

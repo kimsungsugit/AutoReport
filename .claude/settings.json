@@ -2,7 +2,33 @@
   "permissions": {
     "allow": [
       "Bash(gh auth:*)",
-      "Read(//d/Project/Program/AutoDoc/**)"
+      "Read(//d/Project/Program/AutoDoc/**)",
+      "Bash(mkdir -p C:/GitLab-Runner)",
+      "Bash(curl -L --output C:/GitLab-Runner/gitlab-runner.exe \"https://gitlab-runner-downloads.s3.amazonaws.com/latest/binaries/gitlab-runner-windows-amd64.exe\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/571/trace\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/571\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines/126/jobs\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/574/trace\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" -X POST \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipeline?ref=main\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines/127/jobs\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/576/trace\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines?per_page=1\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines/128/jobs\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/579/trace\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines/129/jobs\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/581/trace\")",
+      "Bash(python -c \"import sys,json; d=json.loads\\(sys.stdin.read\\(\\)\\); print\\(''''pipeline:'''', d[0][''''id''''], ''''status:'''', d[0][''''status'''']\\)\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines/130/jobs\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/583/trace\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines/131/jobs\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/585/trace\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines/132/jobs\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/jobs/587/trace\")",
+      "Bash(curl -s --header \"PRIVATE-TOKEN: dNzeyh6wt1usC1_ENDeK\" \"https://git.hb-rnd.synology.me/api/v4/projects/123/pipelines/133/jobs\")"
+    ],
+    "additionalDirectories": [
+      "D:\\Project\\Program\\AutoReport",
+      "C:\\GitLab-Runner"
     ]
   }
 }
