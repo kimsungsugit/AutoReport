@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    name: Python Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check syntax of changed Python files
+        run: |
+          CHANGED_PY=$(git diff --name-only HEAD~1..HEAD -- '*.py' 2>/dev/null || true)
+          if [ -n "$CHANGED_PY" ]; then
+            echo "Checking: $CHANGED_PY"
+            FAIL=0
+            for f in $CHANGED_PY; do
+              [ -f "$f" ] && python -m py_compile "$f" || FAIL=1
+            done
+            [ $FAIL -ne 0 ] && exit 1
+            echo "All syntax checks passed"
+          else
+            echo "No Python files changed"
+          fi
