@@ -834,46 +834,29 @@ def build_context_payload(
     }
 
 
-def build_fallback_sections(report_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-    commits = payload["recent_commits"]
-    areas = payload["top_areas"]
-    uncommitted_count = payload["uncommitted_count"]
-    work_type = work_type_label(payload["work_type"])
-    if report_type == "daily":
-        return {
-            "title": f"데일리 리포트 - {payload['today']}",
-            "summary": [f"작업 유형은 {work_type}로 분류했습니다.", "전일 변경 이력을 기준으로 자동 생성한 요약입니다.", *(entry["subject"] for entry in commits[:2])][:4],
-            "completed": [entry["subject"] for entry in commits[:5]] or ["집계 구간 내 커밋이 없습니다."],
-            "focus": [f"{item['area']} 영역 점검" for item in areas[:3]] or ["신규 작업 우선순위 확인"],
-            "risks": ["미커밋 변경이 남아 있습니다."] if uncommitted_count else ["즉시 보이는 로컬 변경 리스크는 없습니다."],
-            "next_actions": [f"{item['area']} 후속 검증 진행" for item in areas[:3]] or ["다음 작업 후보를 정리합니다."],
-        }
-    if report_type == "plan":
-        return {
-            "title": f"진행 계획서 - {payload['today']}",
-            "summary": [f"작업 유형은 {work_type}이며 최근 변경을 기준으로 계획 초안을 생성했습니다."],
-            "priority_actions": [("미커밋 변경을 정리하고 커밋 단위를 명확히 합니다." if uncommitted_count else "최근 변경사항 검증을 우선 수행합니다."), *[f"{item['area']} 영역 테스트 및 마무리 작업" for item in areas[:3]]][:4],
-            "mid_term_actions": [f"{item['area']} 관련 문서와 테스트를 보강합니다." for item in areas[:3]] or ["다음 요구사항 후보를 정리합니다."],
-            "risks": ["작업 범위가 넓어 문서 반영 누락 가능성이 있습니다."],
-            "notes": ["자동 생성 초안이므로 실제 우선순위와 비교해 조정이 필요합니다."],
-        }
-    if report_type == "weekly":
-        return {
-            "title": f"주간 리포트 - {payload['window_start']} to {payload['window_end']}",
-            "summary": [f"이번 주 작업 유형 중심은 {work_type} 입니다."],
-            "highlights": [entry["subject"] for entry in commits[:5]] or ["이번 주 커밋이 없습니다."],
-            "areas": [f"{item['area']} {item['count']}개 파일 변경" for item in areas[:5]] or ["주요 변경 영역이 없습니다."],
-            "risks": ["다음 주 초반 안정화 작업이 필요할 수 있습니다."],
-            "next_week": [f"{item['area']} 안정화 및 검증" for item in areas[:3]] or ["다음 주 우선순위 재정의"],
-        }
-    return {
-        "title": f"월간 리포트 - {payload['window_start']} to {payload['window_end']}",
-        "summary": [f"이번 달 작업 유형 중심은 {work_type} 입니다."],
-        "highlights": [entry["subject"] for entry in commits[:6]] or ["이번 달 커밋이 없습니다."],
-        "areas": [f"{item['area']} {item['count']}개 파일 변경" for item in areas[:6]] or ["주요 변경 영역이 없습니다."],
-        "risks": ["반복 변경 영역은 설계 문서 보강이 필요할 수 있습니다."],
-        "next_month": [f"{item['area']} 구조 안정화 및 테스트 보강" for item in areas[:3]] or ["다음 달 우선순위 정리"],
-    }
+def _build_sprint_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build sprint task summary with completion details for weekly/monthly reports."""
+    sprint_tasks = list(payload.get("sprint_tasks") or [])
+    if not sprint_tasks:
+        return []
+    summary = []
+    for task in sprint_tasks:
+        subtasks = task.get("subtasks", [])
+        done_subtasks = [s for s in subtasks if s.get("status") == "done"]
+        in_progress_subtasks = [s for s in subtasks if s.get("status") == "in_progress"]
+        completion_details = []
+        for s in done_subtasks:
+            completion_details.append(f"{s['title']}: {s.get('description', '')}")
+        summary.append({
+            "key": task["key"],
+            "title": task["title"],
+            "status": task["status"],
+            "subtask_progress": task.get("subtask_progress", f"{len(done_subtasks)}/{len(subtasks)}"),
+            "completion_details": completion_details,
+            "in_progress_details": [s["title"] for s in in_progress_subtasks],
+            "related_commits": task.get("related_commits", []),
+        })
+    return summary
 
 
 def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -892,7 +875,11 @@ def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str,
         if task.get("related_commits"):
             entry += f" — {', '.join(task['related_commits'][:2])}"
         if task["status"] == "완료":
+            # 완료 상세 내역 추가
+            done_subtasks = [s for s in task.get("subtasks", []) if s.get("status") == "done"]
             completed_tasks.append(entry)
+            for s in done_subtasks:
+                completed_tasks.append(f"  ✅ {s['title']}: {s.get('description', '')}")
         elif task["status"] == "진행 중":
             if task["hit_count"] > 0:
                 in_progress_tasks.append(entry)
@@ -1023,7 +1010,7 @@ def build_fallback_sections(report_type: str, payload: dict[str, Any]) -> dict[s
             ],
         }
     if report_type == "weekly":
-        return {
+        result = {
             "title": f"주간 리포트 - {payload['window_start']} to {payload['window_end']}",
             "summary": [
                 f"주간 기준 커밋 {commit_count}건, 변경 파일 {changed_count}건, 라인 변화 +{total_added}/-{total_deleted}가 누적되었습니다.",
@@ -1038,7 +1025,9 @@ def build_fallback_sections(report_type: str, payload: dict[str, Any]) -> dict[s
             ],
             "next_week": [f"{item['area']} 영역 일정 정리 및 검증 완료" for item in areas[:3]] or ["다음 주 우선순위와 검증 계획을 다시 정리합니다."],
         }
-    return {
+        result["sprint_summary"] = _build_sprint_summary(payload)
+        return result
+    result = {
         "title": f"월간 리포트 - {payload['window_start']} to {payload['window_end']}",
         "summary": [
             f"월간 기준 커밋 {commit_count}건, 변경 파일 {changed_count}건, 라인 변화 +{total_added}/-{total_deleted}가 누적되었습니다.",
@@ -1053,6 +1042,8 @@ def build_fallback_sections(report_type: str, payload: dict[str, Any]) -> dict[s
         ],
         "next_month": [f"{item['area']} 영역 구조 안정화와 검증 계획을 수립합니다." for item in areas[:3]] or ["다음 달 우선순위와 검증 계획을 다시 정리합니다."],
     }
+    result["sprint_summary"] = _build_sprint_summary(payload)
+    return result
 
 def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     cfg = choose_gemini_config()
@@ -1191,6 +1182,49 @@ def build_auto_commit_status_items(status: dict[str, Any]) -> list[str]:
     return result[:5]
 
 
+def _render_sprint_summary(lines: list[str], sections: dict[str, Any], period_label: str) -> None:
+    """Render sprint task summary into weekly/monthly markdown."""
+    sprint_summary = list(sections.get("sprint_summary") or [])
+    if not sprint_summary:
+        return
+    # 완료/진행 중 필터
+    completed = [t for t in sprint_summary if t["status"] == "완료"]
+    in_progress = [t for t in sprint_summary if t["status"] == "진행 중"]
+    lines.extend(["", f"## {period_label} 스프린트 작업 현황", ""])
+    if completed:
+        lines.append(f"### 완료된 작업 ({len(completed)}건)")
+        lines.append("")
+        for t in completed:
+            lines.append(f"**[{t['key']}] {t['title']}** ({t['subtask_progress']})")
+            if t.get("completion_details"):
+                lines.append("- 완료 내역:")
+                for detail in t["completion_details"]:
+                    lines.append(f"  - ✅ {detail}")
+            if t.get("related_commits"):
+                lines.append("- 관련 커밋:")
+                for rc in t["related_commits"][:3]:
+                    lines.append(f"  - {rc}")
+            lines.append("")
+    if in_progress:
+        lines.append(f"### 진행 중인 작업 ({len(in_progress)}건)")
+        lines.append("")
+        for t in in_progress:
+            lines.append(f"**[{t['key']}] {t['title']}** ({t['subtask_progress']})")
+            if t.get("completion_details"):
+                lines.append("- 완료된 하위작업:")
+                for detail in t["completion_details"]:
+                    lines.append(f"  - ✅ {detail}")
+            if t.get("in_progress_details"):
+                lines.append("- 진행 중:")
+                for detail in t["in_progress_details"]:
+                    lines.append(f"  - 🔄 {detail}")
+            if t.get("related_commits"):
+                lines.append("- 관련 커밋:")
+                for rc in t["related_commits"][:3]:
+                    lines.append(f"  - {rc}")
+            lines.append("")
+
+
 def render_report_markdown(report_type: str, sections: dict[str, Any], payload: dict[str, Any], mode: str) -> str:
     lines = [str(sections.get("title") or report_type.title()), "", "## 기준 정보", ""]
     lines.extend(
@@ -1286,12 +1320,14 @@ def render_report_markdown(report_type: str, sections: dict[str, Any], payload: 
         add_section("주간 요약", list(sections.get("summary") or []))
         add_section("주요 하이라이트", list(sections.get("highlights") or []))
         add_section("변경 영역", list(sections.get("areas") or []))
+        _render_sprint_summary(lines, sections, "이번 주")
         add_section("리스크", list(sections.get("risks") or []))
         add_section("다음 주 초점", list(sections.get("next_week") or []))
     else:
         add_section("월간 요약", list(sections.get("summary") or []))
         add_section("주요 하이라이트", list(sections.get("highlights") or []))
         add_section("변경 영역", list(sections.get("areas") or []))
+        _render_sprint_summary(lines, sections, "이번 달")
         add_section("리스크", list(sections.get("risks") or []))
         add_section("다음 달 초점", list(sections.get("next_month") or []))
 

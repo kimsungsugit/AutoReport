@@ -16,6 +16,9 @@ from scripts.generate_periodic_reports import (
     load_sprint_tasks,
     match_commits_to_tasks,
     build_fallback_jira_doc,
+    build_fallback_sections,
+    _build_sprint_summary,
+    _render_sprint_summary,
     _keyword_pattern,
 )
 
@@ -338,3 +341,181 @@ class TestBuildFallbackJiraDoc:
         doc = build_fallback_jira_doc("jira", self._make_payload(tasks))
         # Should fall back to commit subjects
         assert "fix pipeline" in doc["completed"]
+
+    def test_completed_task_with_done_subtasks(self):
+        """Completed tasks should include done subtask details."""
+        tasks = [
+            {"key": "A-1", "title": "Done task", "status": "완료", "hit_count": 1,
+             "start": "2026-04-01", "end": "2026-04-03",
+             "subtasks": [
+                 {"title": "Sub1", "description": "Desc1", "status": "done"},
+                 {"title": "Sub2", "description": "Desc2", "status": "done"},
+             ],
+             "related_commits": ["commit 1"]},
+        ]
+        doc = build_fallback_jira_doc("jira", self._make_payload(tasks))
+        # Should have the main entry plus subtask detail lines
+        assert any("A-1" in c for c in doc["completed"])
+        assert any("Sub1" in c for c in doc["completed"])
+        assert any("Sub2" in c for c in doc["completed"])
+
+    def test_in_progress_task_with_zero_hits_goes_to_remaining(self):
+        """진행 중 task with 0 hit_count should be classified as remaining."""
+        tasks = [
+            {"key": "A-1", "title": "No hits", "status": "진행 중", "hit_count": 0,
+             "start": "2026-04-01", "end": "2026-04-10",
+             "subtasks": [], "related_commits": []},
+        ]
+        doc = build_fallback_jira_doc("jira", self._make_payload(tasks))
+        assert any("A-1" in c for c in doc["remaining"])
+        assert not any("A-1" in c for c in doc["in_progress"])
+
+
+# ---------------------------------------------------------------------------
+# _build_sprint_summary
+# ---------------------------------------------------------------------------
+
+class TestBuildSprintSummary:
+    def _make_payload(self, sprint_tasks=None):
+        return {
+            "sprint_tasks": sprint_tasks or [],
+        }
+
+    def test_empty_sprint_tasks(self):
+        result = _build_sprint_summary(self._make_payload())
+        assert result == []
+
+    def test_done_subtasks_in_completion_details(self):
+        tasks = [
+            {"key": "A-1", "title": "Task1", "status": "완료",
+             "subtask_progress": "2/2",
+             "subtasks": [
+                 {"title": "S1", "description": "D1", "status": "done"},
+                 {"title": "S2", "description": "D2", "status": "done"},
+             ],
+             "related_commits": ["c1"]},
+        ]
+        result = _build_sprint_summary(self._make_payload(tasks))
+        assert len(result) == 1
+        assert result[0]["status"] == "완료"
+        assert len(result[0]["completion_details"]) == 2
+        assert "S1: D1" in result[0]["completion_details"]
+
+    def test_in_progress_subtasks_tracked(self):
+        tasks = [
+            {"key": "A-2", "title": "Task2", "status": "진행 중",
+             "subtask_progress": "1/2",
+             "subtasks": [
+                 {"title": "S1", "description": "D1", "status": "done"},
+                 {"title": "S2", "description": "D2", "status": "in_progress"},
+             ],
+             "related_commits": []},
+        ]
+        result = _build_sprint_summary(self._make_payload(tasks))
+        assert result[0]["in_progress_details"] == ["S2"]
+
+    def test_subtask_without_status_ignored(self):
+        """Subtasks missing 'status' key should not crash and not count as done."""
+        tasks = [
+            {"key": "A-3", "title": "Task3", "status": "진행 중",
+             "subtask_progress": "0/1",
+             "subtasks": [{"title": "S1", "description": "D1"}],
+             "related_commits": []},
+        ]
+        result = _build_sprint_summary(self._make_payload(tasks))
+        assert result[0]["completion_details"] == []
+        assert result[0]["in_progress_details"] == []
+
+
+# ---------------------------------------------------------------------------
+# _render_sprint_summary
+# ---------------------------------------------------------------------------
+
+class TestRenderSprintSummary:
+    def test_empty_sprint_summary_no_output(self):
+        lines = []
+        _render_sprint_summary(lines, {}, "주간")
+        assert lines == []
+
+    def test_completed_tasks_rendered(self):
+        sections = {
+            "sprint_summary": [
+                {"key": "A-1", "title": "Done", "status": "완료",
+                 "subtask_progress": "2/2",
+                 "completion_details": ["S1: D1"],
+                 "in_progress_details": [],
+                 "related_commits": ["c1"]},
+            ],
+        }
+        lines = []
+        _render_sprint_summary(lines, sections, "주간")
+        text = "\n".join(lines)
+        assert "주간 스프린트 작업 현황" in text
+        assert "완료된 작업 (1건)" in text
+        assert "[A-1] Done" in text
+        assert "S1: D1" in text
+
+    def test_in_progress_tasks_rendered(self):
+        sections = {
+            "sprint_summary": [
+                {"key": "A-2", "title": "Active", "status": "진행 중",
+                 "subtask_progress": "1/2",
+                 "completion_details": ["S1: D1"],
+                 "in_progress_details": ["S2"],
+                 "related_commits": []},
+            ],
+        }
+        lines = []
+        _render_sprint_summary(lines, sections, "월간")
+        text = "\n".join(lines)
+        assert "진행 중인 작업 (1건)" in text
+        assert "완료된 하위작업" in text
+        assert "S2" in text
+
+
+# ---------------------------------------------------------------------------
+# build_fallback_sections (weekly/monthly sprint_summary)
+# ---------------------------------------------------------------------------
+
+class TestBuildFallbackSectionsSprintSummary:
+    def _make_payload(self, sprint_tasks=None):
+        return {
+            "today": "2026-04-05",
+            "window_start": "2026-03-30",
+            "window_end": "2026-04-05",
+            "recent_commits": [{"subject": "fix ci", "author": "dev", "time": "2026-04-05"}],
+            "top_areas": [{"area": "scripts", "count": 3}],
+            "uncommitted_count": 0,
+            "work_type": "feature",
+            "commit_count": 1,
+            "changed_file_count": 3,
+            "diff_summary": {"total_added": 10, "total_deleted": 2, "top_files": []},
+            "source_insights": [],
+            "sprint_tasks": sprint_tasks or [],
+            "repository": "TestRepo",
+            "branch": "main",
+            "remote_url": "https://example.com",
+            "domain_profile_name": "test",
+            "github": {},
+        }
+
+    def test_weekly_includes_sprint_summary(self):
+        tasks = [
+            {"key": "A-1", "title": "Task", "status": "완료",
+             "subtask_progress": "1/1",
+             "subtasks": [{"title": "S1", "description": "D1", "status": "done"}],
+             "related_commits": []},
+        ]
+        result = build_fallback_sections("weekly", self._make_payload(tasks))
+        assert "sprint_summary" in result
+        assert len(result["sprint_summary"]) == 1
+        assert result["sprint_summary"][0]["key"] == "A-1"
+
+    def test_monthly_includes_sprint_summary(self):
+        result = build_fallback_sections("monthly", self._make_payload())
+        assert "sprint_summary" in result
+        assert result["sprint_summary"] == []
+
+    def test_daily_no_sprint_summary(self):
+        result = build_fallback_sections("daily", self._make_payload())
+        assert "sprint_summary" not in result
