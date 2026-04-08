@@ -859,6 +859,365 @@ def _build_sprint_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return summary
 
 
+def generate_jira_suggestions(
+    payload: dict[str, Any],
+    ai_sections: dict[str, Any] | None = None,
+    max_suggestions: int = 10,
+) -> list[dict[str, Any]]:
+    """Generate actionable Jira suggestions from commit-task matching and AI analysis.
+
+    Returns a list of suggestion dicts with id, task_key, type, title,
+    suggested_text, reason, confidence, status fields.
+    """
+    # Always prefer Jira live data for suggestions (match_commits_to_tasks
+    # overrides status based on dates, which diverges from actual Jira state)
+    sprint_tasks = []
+    try:
+        from workflow.task_provider import get_task_provider
+        _sp_path = Path(__file__).resolve().parent / "startup_projects.json"
+        _pcs = []
+        if _sp_path.exists():
+            with open(_sp_path, encoding="utf-8") as _f:
+                _pcs = json.load(_f).get("projects", [])
+        for _pc in _pcs:
+            if isinstance(_pc.get("jira"), dict):
+                provider = get_task_provider(_pc)
+                live_data = provider.get_tasks()
+                sprint_tasks = live_data.get("tasks", [])
+                break
+    except Exception:
+        pass
+    # Fallback to payload data if Jira unavailable
+    if not sprint_tasks:
+        sprint_tasks = list(payload.get("sprint_tasks") or [])
+    if not sprint_tasks:
+        return []
+
+    suggestions: list[dict[str, Any]] = []
+    sid = 0
+    today = date.today()
+
+    # Build commit evidence — use sprint-wide commits, not just daily
+    all_commits = [c.get("subject", "") for c in (payload.get("recent_commits") or [])]
+    # Extend with git log from sprint period if available
+    try:
+        repo_root = Path(payload.get("repo_root", ""))
+        if repo_root.exists():
+            import subprocess
+            sprint_start = sprint_tasks[0].get("start", "") if sprint_tasks else ""
+            if sprint_start:
+                result = subprocess.run(
+                    ["git", "log", f"--since={sprint_start}", "--format=%s", "-50"],
+                    cwd=str(repo_root), capture_output=True, text=True, timeout=5,
+                    encoding="utf-8", errors="replace",
+                )
+                if result.returncode == 0:
+                    git_commits = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+                    all_commits = list(dict.fromkeys(git_commits + all_commits))  # dedupe
+    except Exception:
+        pass
+    local_sprint = {}
+    try:
+        _local_path = Path(__file__).resolve().parent / "sprint_tasks.json"
+        if _local_path.exists():
+            with open(_local_path, encoding="utf-8") as _f:
+                local_sprint = {t["key"]: t for t in json.load(_f).get("tasks", []) if t.get("key")}
+    except Exception:
+        pass
+
+    # Noise patterns — skip these commits in suggestions
+    _NOISE_PREFIXES = ("chore(auto)", "chore:", "merge", "fix gitlab ci", "fix ci", "skip hanging")
+    _NOISE_KEYWORDS = {"ci", "build", "fix", "merge", "snapshot", "chore"}
+
+    def _is_noise_commit(subj: str) -> bool:
+        sl = subj.lower().strip()
+        return any(sl.startswith(p) for p in _NOISE_PREFIXES)
+
+    def _match_commits_for(task_title: str, task_key: str) -> list[str]:
+        """Find commits relevant to a task by keyword matching."""
+        kw_task = local_sprint.get(task_key, {})
+        keywords = [e.get("word", "").lower() for e in kw_task.get("keywords", [])
+                     if e.get("word") and e.get("word", "").lower() not in _NOISE_KEYWORDS]
+        # Also use words from the title (exclude generic words)
+        title_words = [w.lower() for w in task_title.split()
+                       if len(w) >= 3 and w.lower() not in ("및", "위한", "통한", "결과")]
+        search_terms = set(keywords + title_words)
+        if not search_terms:
+            return []
+        matched = []
+        for subj in all_commits:
+            if _is_noise_commit(subj):
+                continue
+            subj_lower = subj.lower()
+            if any(term in subj_lower for term in search_terms):
+                matched.append(subj)
+        return matched[:5]
+
+    def _summarize_commits(commits: list[str]) -> str:
+        """Create a short summary from commit messages."""
+        if not commits:
+            return ""
+        # Deduplicate and trim
+        unique = list(dict.fromkeys(commits))[:3]
+        return "; ".join(c[:60] for c in unique)
+
+    for task in sprint_tasks:
+        key = task.get("key", "")
+        if not key:
+            continue
+
+        title = task.get("title", "")
+        status = task.get("status", "")
+        subtasks = task.get("subtasks", [])
+        done_subs = [s for s in subtasks if s.get("status") == "done"]
+        in_prog_subs = [s for s in subtasks if s.get("status") == "in_progress"]
+        pending_subs = [s for s in subtasks if s.get("status") == "pending"]
+        is_in_progress = status in ("진행 중", "in_progress")
+        is_pending = status in ("예정", "pending")
+        is_done = status in ("완료", "done")
+        t_start = task.get("start", "")
+        t_end = task.get("end", "")
+
+        if is_done:
+            continue
+
+        # ── 하위작업 개별 제안 ──
+        for sub in subtasks:
+            skey = sub.get("key", "")
+            stitle = sub.get("title", "")
+            sst = sub.get("status", "")
+            if not skey:
+                continue
+
+            # 진행 중 부작업 → 완료 처리 제안 (커밋 + description 기반 구체적 결과)
+            if sst == "in_progress":
+                sid += 1
+                related = _match_commits_for(stitle, key)
+                summary = _summarize_commits(related)
+                # Get description from local sprint_tasks.json
+                desc = sub.get("description", "")
+                if not desc:
+                    local_task = local_sprint.get(key, {})
+                    for ls in local_task.get("subtasks", []):
+                        if ls.get("title") == stitle:
+                            desc = ls.get("description", "")
+                            break
+                if desc:
+                    text = f"{stitle} 완료. {desc}"
+                else:
+                    text = f"{stitle} 완료."
+                suggestions.append({
+                    "id": f"s{sid}",
+                    "task_key": skey,
+                    "type": "complete",
+                    "title": f"  └ {stitle} — 완료 처리",
+                    "suggested_text": text,
+                    "reason": f"{key} 하위작업, 현재 진행 중",
+                    "confidence": "medium",
+                    "status": "pending",
+                })
+
+            # pending 부작업 + 상위 시작일 도래 → 시작 제안
+            elif sst == "pending" and t_start:
+                try:
+                    if date.fromisoformat(t_start) <= today:
+                        sid += 1
+                        suggestions.append({
+                            "id": f"s{sid}",
+                            "task_key": skey,
+                            "type": "transition",
+                            "title": f"  └ {stitle} — 작업 시작",
+                            "suggested_text": f"상위 작업({key}) 시작일 도래. 작업을 시작합니다.",
+                            "reason": f"시작일 {t_start} ≤ 오늘",
+                            "confidence": "low",
+                            "status": "pending",
+                        })
+                except ValueError:
+                    pass
+
+        # ── 상위 작업 제안 ──
+
+        # Rule 1: 부작업 전부 done → 상위 완료 보고
+        if subtasks and len(done_subs) == len(subtasks) and is_in_progress:
+            sid += 1
+            sub_lines = []
+            for s in done_subs:
+                local_task = local_sprint.get(key, {})
+                desc = ""
+                for ls in local_task.get("subtasks", []):
+                    if ls.get("title") == s.get("title"):
+                        desc = ls.get("description", "")
+                        break
+                sub_lines.append(f"- {s.get('title', '')}: {desc or '완료'}")
+            sub_results = "\n".join(sub_lines)
+            suggestions.append({
+                "id": f"s{sid}",
+                "task_key": key,
+                "type": "complete",
+                "title": f"{title} — 전체 완료 보고",
+                "suggested_text": f"전체 하위작업 완료.\n{sub_results}\n종료 요청합니다.",
+                "reason": f"부작업 {len(done_subs)}/{len(subtasks)} 완료",
+                "confidence": "high",
+                "status": "pending",
+            })
+            continue
+
+        # Rule 2: 기한 초과 → 완료 처리 제안
+        if t_end and is_in_progress:
+            try:
+                end_date = date.fromisoformat(t_end)
+                if end_date < today:
+                    sid += 1
+                    days_over = (today - end_date).days
+                    sub_status_lines = []
+                    for s in subtasks:
+                        st_label = {"done": "완료", "in_progress": "진행 중", "pending": "대기"}.get(s.get("status", ""), "?")
+                        local_task = local_sprint.get(key, {})
+                        detail = ""
+                        for ls in local_task.get("subtasks", []):
+                            if ls.get("title") == s.get("title") and ls.get("description"):
+                                detail = f" ({ls['description'][:50]})"
+                                break
+                        sub_status_lines.append(f"- {s.get('title', '')}: {st_label}{detail}")
+                    sub_report = "\n".join(sub_status_lines) if sub_status_lines else ""
+                    suggestions.append({
+                        "id": f"s{sid}",
+                        "task_key": key,
+                        "type": "complete",
+                        "title": f"{title} — 기한 초과 ({days_over}일), 완료 처리",
+                        "suggested_text": f"기한({t_end}) 대비 {days_over}일 경과.\n{sub_report}\n종료 요청합니다.",
+                        "reason": f"종료일 {t_end} 경과 ({len(done_subs)}/{len(subtasks)} 부작업 완료)",
+                        "confidence": "high",
+                        "status": "pending",
+                    })
+                    continue
+            except ValueError:
+                pass
+
+        # Rule 3: 시작일 도래 + pending → 진행 중 전환
+        if is_pending and t_start:
+            try:
+                if date.fromisoformat(t_start) <= today:
+                    sid += 1
+                    suggestions.append({
+                        "id": f"s{sid}",
+                        "task_key": key,
+                        "type": "transition",
+                        "title": f"{title} — 작업 시작",
+                        "suggested_text": f"시작일({t_start}) 도래. 작업을 시작합니다.",
+                        "reason": f"시작일 {t_start} ≤ 오늘 {today.isoformat()}",
+                        "confidence": "high",
+                        "status": "pending",
+                    })
+                    continue
+            except ValueError:
+                pass
+
+    # ── 커밋 기반 새 작업/하위작업 추가 제안 ──
+    # Collect all keywords from all tasks
+    all_keywords: set[str] = set()
+    for lt in local_sprint.values():
+        for kw in lt.get("keywords", []):
+            w = kw.get("word", "").lower()
+            if w:
+                all_keywords.add(w)
+        for st in lt.get("subtasks", []):
+            for w in st.get("title", "").lower().split():
+                if len(w) >= 3 and w not in ("및", "위한", "통한"):
+                    all_keywords.add(w)
+
+    # Find feature/fix commits that don't match any existing task keyword
+    unmatched_commits: list[str] = []
+    for subj in all_commits:
+        if _is_noise_commit(subj):
+            continue
+        subj_lower = subj.lower()
+        if not any(kw in subj_lower for kw in all_keywords):
+            unmatched_commits.append(subj)
+
+    # Group unmatched commits and suggest subtask additions
+    if unmatched_commits and len(suggestions) < max_suggestions:
+        # Find best parent: in_progress task closest to today
+        best_parent = None
+        for task in sprint_tasks:
+            if task.get("status") in ("진행 중", "in_progress"):
+                best_parent = task
+                break
+        if not best_parent:
+            for task in sprint_tasks:
+                if task.get("status") in ("예정", "pending"):
+                    best_parent = task
+                    break
+
+        # Also suggest for commits that DO match a task but NOT any subtask
+        # → suggests adding a new subtask for that specific area
+        for commit_subj in unmatched_commits[:3]:
+            if len(suggestions) >= max_suggestions:
+                break
+            # Clean commit message: remove conventional commit prefix
+            clean = commit_subj
+            for prefix in ("feat: ", "fix: ", "refactor: ", "test: ", "chore: ", "docs: "):
+                if clean.lower().startswith(prefix):
+                    clean = clean[len(prefix):]
+                    break
+            clean = clean[:60]
+
+            if best_parent:
+                sid += 1
+                suggestions.append({
+                    "id": f"s{sid}",
+                    "task_key": best_parent["key"],
+                    "type": "add_subtask",
+                    "title": f"{best_parent['title']} — 하위작업 추가",
+                    "suggested_text": clean,
+                    "reason": f"커밋 \"{commit_subj[:50]}\" 이 기존 태스크에 매칭되지 않음",
+                    "confidence": "low",
+                    "status": "pending",
+                })
+
+    # Find commits matching a parent task but not covered by any subtask
+    for task in sprint_tasks:
+        if len(suggestions) >= max_suggestions:
+            break
+        tkey = task.get("key", "")
+        ttitle = task.get("title", "")
+        if task.get("status") in ("완료", "done"):
+            continue
+        task_commits = _match_commits_for(ttitle, tkey)
+        if not task_commits:
+            continue
+        # Check which commits are NOT covered by any subtask title
+        existing_sub_words = set()
+        for s in task.get("subtasks", []):
+            for w in s.get("title", "").lower().split():
+                if len(w) >= 3:
+                    existing_sub_words.add(w)
+        for tc in task_commits[:2]:
+            tc_words = set(w.lower() for w in tc.split() if len(w) >= 3)
+            # If commit has significant words not in any subtask → new area
+            new_words = tc_words - existing_sub_words - {"feat", "fix", "chore", "test", "refactor"}
+            if len(new_words) >= 2:
+                clean = tc
+                for prefix in ("feat: ", "fix: ", "refactor: ", "test: ", "chore: ", "docs: "):
+                    if clean.lower().startswith(prefix):
+                        clean = clean[len(prefix):]
+                        break
+                sid += 1
+                suggestions.append({
+                    "id": f"s{sid}",
+                    "task_key": tkey,
+                    "type": "add_subtask",
+                    "title": f"{ttitle} — 하위작업 추가",
+                    "suggested_text": clean[:60],
+                    "reason": f"커밋이 {tkey} 매칭되나 기존 부작업에 없는 영역",
+                    "confidence": "medium",
+                    "status": "pending",
+                })
+                break
+
+    return suggestions[:max_suggestions]
+
+
 def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     areas = payload["top_areas"]
     commits = payload["recent_commits"]
@@ -2264,6 +2623,461 @@ def svg_change_impact_map(areas: list[dict[str, Any]], top_files: list[dict[str,
     parts.append('</svg>')
     return ''.join(parts)
 
+def svg_sprint_gantt(tasks: list[dict[str, Any]], sprint: dict[str, Any], today: date | None = None) -> str:
+    """Render a Gantt chart SVG for sprint tasks."""
+    if today is None:
+        today = date.today()
+
+    # Only parent tasks with dates
+    gantt_tasks = [t for t in tasks if t.get("start") and t.get("end")]
+    if not gantt_tasks:
+        return ""
+
+    # Sort by start date
+    gantt_tasks.sort(key=lambda t: t.get("start", ""))
+
+    # Determine time range from actual task dates (tighter than full sprint)
+    task_dates = []
+    for t in gantt_tasks:
+        try:
+            task_dates.append(date.fromisoformat(t["start"]))
+            task_dates.append(date.fromisoformat(t["end"]))
+        except (ValueError, TypeError):
+            pass
+    if task_dates:
+        range_start = min(task_dates) - timedelta(days=3)
+        range_end = max(max(task_dates), today) + timedelta(days=7)
+    else:
+        range_start = today - timedelta(days=14)
+        range_end = today + timedelta(days=30)
+
+    total_days = max((range_end - range_start).days, 1)
+
+    row_h = 32
+    header_h = 40
+    left_margin = 320
+    right_margin = 20
+    chart_w = 1000
+    bar_area = chart_w - left_margin - right_margin
+    svg_h = header_h + len(gantt_tasks) * row_h + 20
+
+    parts = [f'<div class="gantt-wrap"><svg viewBox="0 0 {chart_w} {svg_h}" role="img" aria-label="Sprint Gantt Chart">']
+    parts.append(f'<title>Sprint Gantt Chart</title>')
+
+    # Header: weekly markers only
+    current = range_start
+    while current <= range_end:
+        x = left_margin + int(((current - range_start).days / total_days) * bar_area)
+        if current.weekday() == 0:  # Monday
+            parts.append(f'<text x="{x}" y="16" class="gantt-header">{current.strftime("%m/%d")}</text>')
+            parts.append(f'<line x1="{x}" y1="22" x2="{x}" y2="{svg_h - 10}" stroke="var(--line)" stroke-width="0.5"/>')
+        current += timedelta(days=1)
+
+    # Today line
+    if range_start <= today <= range_end:
+        today_x = left_margin + int(((today - range_start).days / total_days) * bar_area)
+        parts.append(f'<line x1="{today_x}" y1="22" x2="{today_x}" y2="{svg_h - 10}" class="gantt-today"/>')
+        parts.append(f'<text x="{today_x}" y="{svg_h - 2}" class="gantt-date" text-anchor="middle">Today</text>')
+
+    # Task bars
+    status_cls_map = {"done": "done", "in_progress": "in-progress", "pending": "pending"}
+    for idx, task in enumerate(gantt_tasks):
+        y = header_h + idx * row_h
+        key = escape(task.get("key", ""))
+        title = escape(task.get("title", ""))[:28]
+
+        try:
+            t_start = date.fromisoformat(task["start"])
+            t_end = date.fromisoformat(task["end"])
+        except (ValueError, TypeError):
+            continue
+
+        st = task.get("status", "pending")
+        cls = status_cls_map.get(st, "pending")
+        # Overdue check
+        if t_end < today and st != "done":
+            cls = "overdue"
+
+        bar_x = left_margin + max(0, int(((t_start - range_start).days / total_days) * bar_area))
+        bar_w = max(8, int(((t_end - t_start).days / total_days) * bar_area))
+
+        # Label
+        parts.append(f'<text x="{left_margin - 8}" y="{y + 18}" class="gantt-label" text-anchor="end">{key} {title}</text>')
+        # Bar
+        parts.append(f'<rect x="{bar_x}" y="{y + 6}" width="{bar_w}" height="{row_h - 12}" class="gantt-bar {cls}"/>')
+        # Date text on bar
+        parts.append(f'<text x="{bar_x + 4}" y="{y + 20}" class="gantt-date">{task["start"][5:]} ~ {task["end"][5:]}</text>')
+
+    parts.append('</svg></div>')
+    return ''.join(parts)
+
+
+def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
+    """Render an interactive Jira task board with action buttons.
+
+    Fetches live data from Jira if configured, otherwise returns empty string.
+    The board includes comment, complete, and add-subtask buttons that call
+    the local jira_proxy server (localhost:18923).
+    """
+    try:
+        from workflow.task_provider import get_task_provider
+        provider = get_task_provider(project_config)
+        if not hasattr(provider, 'add_comment'):
+            return ""
+        data = provider.get_tasks()
+    except Exception:
+        return ""
+
+    tasks = data.get("tasks", [])
+    if not tasks:
+        return ""
+
+    sprint = data.get("sprint", {})
+    sprint_name = escape(sprint.get("name", ""))
+    sprint_period = ""
+    if sprint.get("start") and sprint.get("end"):
+        sprint_period = f'{sprint["start"]} ~ {sprint["end"]}'
+
+    status_cls = {"done": "done", "in_progress": "in-progress", "pending": "pending"}
+    status_label = {"done": "Done", "in_progress": "In Progress", "pending": "To Do"}
+
+    today = date.today()
+    rows = []
+    for task in tasks:
+        key = escape(task.get("key", ""))
+        title = escape(task.get("title", ""))
+        st = task.get("status", "pending")
+        cls = status_cls.get(st, "pending")
+        label = status_label.get(st, "To Do")
+        t_start = task.get("start", "")
+        t_end = task.get("end", "")
+
+        # Date display with overdue check
+        date_html = ""
+        if t_start and t_end:
+            overdue_cls = ""
+            try:
+                if date.fromisoformat(t_end) < today and st != "done":
+                    overdue_cls = " overdue"
+            except ValueError:
+                pass
+            date_html = f'<span class="jira-date{overdue_cls}">{t_start[5:]} ~ {t_end[5:]}</span>'
+
+        actions = ""
+        if st == "in_progress":
+            actions = f'''<button class="jira-btn complete" onclick="jiraComplete('{key}')">Complete</button>'''
+        actions += f'''<button class="jira-btn" onclick="jiraComment('{key}')">Comment</button>'''
+        actions += f'''<button class="jira-btn add" onclick="jiraAddSub('{key}')">+ Sub</button>'''
+
+        rows.append(f'''<div class="jira-task" data-key="{key}">
+  <span class="jira-key">{key}</span>
+  <span class="jira-summary">{title}</span>
+  {date_html}
+  <span class="jira-task-actions">
+    <span class="jira-status {cls}">{label}</span>
+    {actions}
+  </span>
+</div>''')
+
+        for sub in task.get("subtasks", []):
+            skey = escape(sub.get("key", ""))
+            stitle = escape(sub.get("title", ""))
+            sst = sub.get("status", "pending")
+            scls = status_cls.get(sst, "pending")
+            slabel = status_label.get(sst, "To Do")
+
+            sub_actions = ""
+            if sst == "in_progress":
+                sub_actions = f'''<button class="jira-btn complete" onclick="jiraComplete('{skey}')">Complete</button>'''
+            sub_actions += f'''<button class="jira-btn" onclick="jiraComment('{skey}')">Comment</button>'''
+
+            rows.append(f'''<div class="jira-task subtask" data-key="{skey}">
+  <span class="jira-key">{skey}</span>
+  <span class="jira-summary">{stitle}</span>
+  <span class="jira-task-actions">
+    <span class="jira-status {scls}">{slabel}</span>
+    {sub_actions}
+  </span>
+</div>''')
+
+    # Count all items including subtasks
+    all_items = []
+    for t in tasks:
+        all_items.append(t)
+        all_items.extend(t.get("subtasks", []))
+    done_count = sum(1 for t in all_items if t.get("status") == "done")
+    in_prog = sum(1 for t in all_items if t.get("status") == "in_progress")
+    pending = sum(1 for t in all_items if t.get("status") == "pending")
+
+    gantt_html = svg_sprint_gantt(tasks, sprint, today)
+
+    return f'''
+{gantt_html}
+<div class="jira-board" id="jira-live-board">
+  <div class="jira-board-header">
+    <div>
+      <h3>Jira Sprint Board</h3>
+      <span class="sprint-meta">{sprint_name} &middot; {sprint_period}</span>
+    </div>
+    <div class="jira-board-actions">
+      <span class="jira-status done">{done_count} Done</span>
+      <span class="jira-status in-progress">{in_prog} In Progress</span>
+      <span class="jira-status pending">{pending} To Do</span>
+    </div>
+  </div>
+  {"".join(rows)}
+  <div class="jira-board-footer">
+    <button class="jira-btn" onclick="jiraRefresh()">Refresh</button>
+  </div>
+</div>
+<div id="jira-toast" class="jira-toast"></div>
+'''
+
+
+JIRA_BOARD_SCRIPT = """
+<script>
+(function() {
+  const API = 'http://localhost:18923';
+
+  window.jiraToast = function(msg) {
+    const el = document.getElementById('jira-toast');
+    el.textContent = msg;
+    el.classList.add('show');
+    setTimeout(() => el.classList.remove('show'), 2500);
+  };
+
+  window.jiraComplete = function(key) {
+    const overlay = document.createElement('div');
+    overlay.className = 'jira-modal-overlay';
+    overlay.innerHTML = `
+      <div class="jira-modal">
+        <h4>${key} - 완료 처리</h4>
+        <textarea id="jira-modal-text" rows="3" placeholder="완료 내용을 간단히 정리하세요..."></textarea>
+        <div class="modal-actions">
+          <button class="jira-btn" onclick="this.closest('.jira-modal-overlay').remove()">취소</button>
+          <button class="jira-btn complete" onclick="jiraDoComplete('${key}', this)">종료 요청</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('textarea').focus();
+  };
+
+  window.jiraDoComplete = function(key, btn) {
+    const text = document.getElementById('jira-modal-text').value;
+    if (!text.trim()) { jiraToast('댓글을 입력하세요'); return; }
+    btn.disabled = true;
+    btn.textContent = '처리 중...';
+    fetch(API + '/api/issue/' + key + '/complete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({comment: text})
+    }).then(r => r.json()).then(d => {
+      btn.closest('.jira-modal-overlay').remove();
+      if (d.ok) {
+        jiraToast(key + ' → 종료 요청 완료');
+        const row = document.querySelector('[data-key="' + key + '"]');
+        if (row) {
+          const st = row.querySelector('.jira-status');
+          if (st) { st.className = 'jira-status done'; st.textContent = 'Done'; }
+        }
+      } else { jiraToast('실패: ' + (d.error || 'unknown')); }
+    }).catch(e => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py) (localhost:18923)'); });
+  };
+
+  window.jiraComment = function(key) {
+    const overlay = document.createElement('div');
+    overlay.className = 'jira-modal-overlay';
+    overlay.innerHTML = `
+      <div class="jira-modal">
+        <h4>${key} - 댓글 작성</h4>
+        <textarea id="jira-modal-text" rows="3" placeholder="진행 상황이나 메모를 남기세요..."></textarea>
+        <div class="modal-actions">
+          <button class="jira-btn" onclick="this.closest('.jira-modal-overlay').remove()">취소</button>
+          <button class="jira-btn" onclick="jiraDoComment('${key}', this)">작성</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('textarea').focus();
+  };
+
+  window.jiraDoComment = function(key, btn) {
+    const text = document.getElementById('jira-modal-text').value;
+    if (!text.trim()) { jiraToast('댓글을 입력하세요'); return; }
+    btn.disabled = true;
+    fetch(API + '/api/issue/' + key + '/comment', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({comment: text})
+    }).then(r => r.json()).then(d => {
+      btn.closest('.jira-modal-overlay').remove();
+      jiraToast(d.ok ? key + ' 댓글 작성 완료' : '실패');
+    }).catch(() => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
+  };
+
+  window.jiraAddSub = function(parentKey) {
+    const overlay = document.createElement('div');
+    overlay.className = 'jira-modal-overlay';
+    overlay.innerHTML = `
+      <div class="jira-modal">
+        <h4>${parentKey} - 부작업 추가</h4>
+        <input id="jira-modal-text" type="text" placeholder="부작업 제목을 입력하세요...">
+        <div class="modal-actions">
+          <button class="jira-btn" onclick="this.closest('.jira-modal-overlay').remove()">취소</button>
+          <button class="jira-btn add" onclick="jiraDoAdd('${parentKey}', this)">생성</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.querySelector('input').focus();
+  };
+
+  window.jiraDoAdd = function(parentKey, btn) {
+    const text = document.getElementById('jira-modal-text').value;
+    if (!text.trim()) { jiraToast('제목을 입력하세요'); return; }
+    btn.disabled = true;
+    fetch(API + '/api/issue/create', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({parent_key: parentKey, summary: text})
+    }).then(r => r.json()).then(d => {
+      btn.closest('.jira-modal-overlay').remove();
+      if (d.ok) { jiraToast(d.key + ' 생성 완료 (' + parentKey + ' 하위)'); }
+      else { jiraToast('실패: ' + (d.error || 'unknown')); }
+    }).catch(() => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
+  };
+
+  window.jiraRefresh = function() { location.reload(); };
+})();
+</script>
+"""
+
+
+def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
+    """Render an interactive suggestion review panel for auto-generated Jira actions."""
+    if not suggestions:
+        return ""
+
+    pending = [s for s in suggestions if s.get("status") == "pending"]
+    if not pending:
+        return ""
+
+    high_count = sum(1 for s in pending if s.get("confidence") == "high")
+    type_icons = {"comment": "Comment", "complete": "Complete", "add_subtask": "+ Sub", "transition": "Start"}
+
+    rows = []
+    for s in pending:
+        sid = escape(s.get("id", ""))
+        key = escape(s.get("task_key", ""))
+        stype = s.get("type", "comment")
+        title = escape(s.get("title", ""))
+        text = escape(s.get("suggested_text", ""))
+        reason = escape(s.get("reason", ""))
+        conf = s.get("confidence", "medium")
+        icon_label = type_icons.get(stype, "Action")
+        collapsed = ' suggestion-collapsed' if conf == "low" else ""
+
+        rows.append(f'''<div class="jira-suggestion{collapsed}" data-sid="{sid}" data-key="{key}" data-type="{stype}">
+  <div class="suggestion-head">
+    <span class="jira-key">{key}</span>
+    <span class="suggestion-type {stype}">{icon_label}</span>
+    <span class="confidence {conf}">{conf}</span>
+    <span style="flex:1"></span>
+    <strong style="font-size:13px">{title}</strong>
+  </div>
+  <div class="suggestion-reason">{reason}</div>
+  <textarea class="suggestion-text" id="text-{sid}">{text}</textarea>
+  <div class="suggestion-actions">
+    <button class="jira-btn approve" onclick="suggApprove('{sid}')">승인</button>
+    <button class="jira-btn reject" onclick="suggReject('{sid}')">거절</button>
+  </div>
+</div>''')
+
+    low_count = sum(1 for s in pending if s.get("confidence") == "low")
+    toggle = ""
+    if low_count:
+        toggle = f'<button class="suggestion-toggle" onclick="suggToggleLow()">낮은 확신 {low_count}건 더 보기</button>'
+
+    return f'''
+<div class="jira-suggestions" id="jira-suggestions-panel">
+  <div class="jira-suggestions-header">
+    <div>
+      <h3>Jira 제안 리뷰</h3>
+      <span class="sprint-meta">{len(pending)}건 대기 &middot; {high_count}건 높은 확신</span>
+    </div>
+    <div class="jira-board-actions">
+      <button class="jira-btn approve" onclick="suggBatchApprove()">전체 승인</button>
+    </div>
+  </div>
+  {"".join(rows)}
+  {toggle}
+</div>
+'''
+
+
+JIRA_SUGGESTIONS_SCRIPT = """
+<script>
+(function() {
+  const API = 'http://localhost:18923';
+
+  window.suggApprove = function(sid) {
+    const card = document.querySelector('[data-sid="' + sid + '"]');
+    if (!card) return;
+    const key = card.dataset.key;
+    const type = card.dataset.type;
+    const text = document.getElementById('text-' + sid).value;
+    const btn = card.querySelector('.approve');
+    btn.disabled = true;
+    btn.textContent = '처리 중...';
+
+    fetch(API + '/api/suggestions/' + sid + '/approve', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({task_key: key, type: type, text: text})
+    }).then(r => r.json()).then(d => {
+      if (d.ok) {
+        card.classList.add('applied');
+        btn.textContent = '완료';
+        jiraToast(key + ' 제안 승인 완료');
+      } else {
+        btn.textContent = '실패';
+        jiraToast('실패: ' + (d.error || 'unknown'));
+      }
+    }).catch(() => { btn.textContent = '연결 실패'; jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
+  };
+
+  window.suggReject = function(sid) {
+    const card = document.querySelector('[data-sid="' + sid + '"]');
+    if (!card) return;
+    fetch(API + '/api/suggestions/' + sid + '/reject', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    }).then(r => r.json()).then(d => {
+      card.classList.add('applied');
+      card.querySelector('.reject').textContent = '거절됨';
+      jiraToast(card.dataset.key + ' 제안 거절');
+    }).catch(() => { jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
+  };
+
+  window.suggBatchApprove = function() {
+    const cards = document.querySelectorAll('.jira-suggestion:not(.applied):not(.suggestion-collapsed)');
+    cards.forEach(card => {
+      const sid = card.dataset.sid;
+      suggApprove(sid);
+    });
+  };
+
+  window.suggToggleLow = function() {
+    document.querySelectorAll('.suggestion-collapsed').forEach(el => {
+      el.classList.remove('suggestion-collapsed');
+    });
+    const btn = document.querySelector('.suggestion-toggle');
+    if (btn) btn.remove();
+  };
+})();
+</script>
+"""
+
+
 def html_task_board(plan_sections: dict[str, Any], result_sections: dict[str, Any]) -> str:
     task_name = escape(str(plan_sections.get("task_name") or result_sections.get("task_name") or "-"))
     task_goal = escape(str(plan_sections.get("task_goal") or "-"))
@@ -2333,11 +3147,20 @@ def html_task_board(plan_sections: dict[str, Any], result_sections: dict[str, An
 """
 
 
-def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
+def render_html_dashboard(today: date, cards: list[dict[str, Any]], project_configs: list[dict[str, Any]] | None = None, jira_suggestions: list[dict[str, Any]] | None = None) -> str:
     total_commits = sum(int(card["payload"].get("commit_count", 0)) for card in cards)
     total_files = sum(int(card["payload"].get("changed_file_count", 0)) for card in cards)
     total_added = sum(int((card["payload"].get("diff_summary") or {}).get("total_added", 0)) for card in cards)
     total_deleted = sum(int((card["payload"].get("diff_summary") or {}).get("total_deleted", 0)) for card in cards)
+    # Build Jira live boards for projects that have jira config
+    jira_boards_html = ""
+    if project_configs:
+        for pc in project_configs:
+            if isinstance(pc.get("jira"), dict):
+                jira_boards_html += html_jira_live_board(pc)
+    # Add suggestions panel below Jira board
+    suggestions_html = html_jira_suggestions_panel(jira_suggestions or [])
+    jira_boards_html += suggestions_html
     card_html = []
     for card in cards:
         payload = card["payload"]
@@ -2448,6 +3271,7 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
 </head>
   <body>
   <a href="#main-content" class="skip-link">Skip to content</a>
+  <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">Light</button>
   <div class="wrap" id="main-content">
     <header class="hero">
       <div class="hero-grid">
@@ -2464,8 +3288,32 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]]) -> str:
         </div>
       </div>
     </header>
+    {jira_boards_html}
     {"".join(card_html)}
   </div>
+{JIRA_BOARD_SCRIPT if jira_boards_html else ""}
+{JIRA_SUGGESTIONS_SCRIPT if suggestions_html else ""}
+<script>
+(function() {{
+  const btn = document.getElementById('theme-toggle');
+  const saved = localStorage.getItem('dashboard-theme');
+  if (saved) {{
+    document.documentElement.setAttribute('data-theme', saved);
+    btn.textContent = saved === 'dark' ? 'Light' : 'Dark';
+  }} else {{
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    btn.textContent = isDark ? 'Light' : 'Dark';
+  }}
+  window.toggleTheme = function() {{
+    const current = document.documentElement.getAttribute('data-theme');
+    const isDark = current === 'dark' || (!current && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    const next = isDark ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('dashboard-theme', next);
+    btn.textContent = next === 'dark' ? 'Light' : 'Dark';
+  }};
+}})();
+</script>
 </body>
 </html>"""
 
@@ -2580,6 +3428,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # Load .env for Jira credentials and other config
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    except ImportError:
+        pass
+
     args = parse_args()
     repo_root = detect_repo_root(Path(args.repo).resolve())
     output_root = Path(args.output_root).resolve() if args.output_root else repo_root
@@ -2693,8 +3548,53 @@ def main() -> int:
             generated.append(monthly_html_path)
             dashboard_cards.append({"report_type": "monthly", "title": monthly_text.splitlines()[0].lstrip("# ").strip(), "path": monthly_path, "html_path": monthly_html_path, "payload": monthly_payload, "mode": monthly_mode, "sections": monthly_sections})
 
+    # Auto-start Jira proxy server if not running
+    try:
+        import urllib.request
+        urllib.request.urlopen("http://localhost:18923/api/sprint/tasks", timeout=2)
+    except Exception:
+        try:
+            import subprocess
+            proxy_script = Path(__file__).resolve().parent / "jira_proxy.py"
+            if proxy_script.exists():
+                subprocess.Popen(
+                    [sys.executable, str(proxy_script)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                print("Started jira_proxy.py (http://localhost:18923)")
+        except Exception:
+            pass
+
+    # Load project configs for Jira board integration
+    _project_configs = []
+    try:
+        _sp_path = Path(__file__).resolve().parent / "startup_projects.json"
+        if _sp_path.exists():
+            with open(_sp_path, encoding="utf-8") as _f:
+                _project_configs = json.load(_f).get("projects", [])
+    except Exception:
+        pass
+
+    # Generate Jira suggestions from matched tasks + AI analysis
+    _jira_suggestions: list[dict[str, Any]] = []
+    for card in dashboard_cards:
+        if card["report_type"] == "jira":
+            _jira_suggestions = generate_jira_suggestions(
+                card["payload"],
+                card.get("sections"),
+            )
+            if _jira_suggestions:
+                sugg_path = output_root / "reports" / "jira" / f"{today.isoformat()}-jira-suggestions.json"
+                write_text(sugg_path, json.dumps(
+                    {"date": today.isoformat(), "suggestions": _jira_suggestions},
+                    ensure_ascii=False, indent=2,
+                ))
+                generated.append(sugg_path)
+            break
+
     dashboard_path = output_root / "reports" / "dashboard" / f"{today.isoformat()}-startup-dashboard.html"
-    write_text(dashboard_path, render_html_dashboard(today, dashboard_cards))
+    write_text(dashboard_path, render_html_dashboard(today, dashboard_cards, _project_configs, _jira_suggestions))
     generated.append(dashboard_path)
 
     print("Generated reports:")

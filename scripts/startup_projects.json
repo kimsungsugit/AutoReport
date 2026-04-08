@@ -28,7 +28,12 @@
       "name": "Release_claude",
       "path": "D:/Project/devops/Release_claude",
       "profile": "uds_quality",
-      "enabled": true
+      "enabled": true,
+      "jira": {
+        "project_key": "APPL",
+        "sprint_id": 152,
+        "board_id": 239
+      }
     },
     {
       "name": "AutoDoc",

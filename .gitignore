@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 OAI_CONFIG_LIST
 OAI_CONFIG_LIST.local
+.env

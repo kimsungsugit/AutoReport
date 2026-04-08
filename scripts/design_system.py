@@ -137,9 +137,8 @@ DESIGN_CSS = r"""
   --dur-slow: 0.5s;
 }
 
-/* --- Dark mode -------------------------------------------------------- */
-@media (prefers-color-scheme: dark) {
-  :root {
+/* --- Dark mode (toggle via data-theme or OS preference) --------------- */
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
     --bg: #0f1419;
     --bg-deep: #161c22;
     --paper: #1c2530;
@@ -186,8 +185,50 @@ DESIGN_CSS = r"""
     --shadow-md: 0 14px 30px rgba(0,0,0,0.35);
     --shadow-lg: 0 24px 60px rgba(0,0,0,0.45);
     --shadow-inner: inset 0 1px 0 rgba(255,255,255,0.04);
-  }
+} }
+/* Manual dark toggle — same vars as above */
+[data-theme="dark"] {
+  --bg: #0f1419; --bg-deep: #161c22; --paper: #1c2530; --paper-alt: #22303c;
+  --ink: #e7e9ea; --muted: #8b98a5; --subtle: #6b7b8d; --line: #2f3b47; --line-light: #384956;
+  --hero-a: #0d2a30; --hero-b: #1a4d44; --hero-glow: rgba(209,122,34,0.12);
+  --accent: #5eb8cc; --accent-hover: #7ec8d8; --accent-2: #e8a04c; --accent-2-hover: #f0b56a;
+  --ok-bg: #0d3320; --ok-ink: #6ee7a8; --ok: #22c55e; --err-bg: #3b0d0d; --err-ink: #fca5a5;
+  --warn-bg: #3d2800; --warn-ink: #fbbf24; --danger-bg: #3b0d0d; --danger-ink: #fca5a5;
+  --info-bg: #0a2e3e; --info-ink: #7dd3fc;
+  --hl-bg: #3d2800; --hl-bg-deep: #4a3000; --hl-border: #b8860b; --hl-ink: #fbbf24; --hl-ink-deep: #f59e0b;
+  --sup-bg: #22303c; --sup-border: #384956;
+  --status-bg: #2e1065; --status-ink: #c4b5fd; --status-border: #4c1d95;
+  --task-parent-a: #0d2a2a; --task-parent-b: #153333;
+  --task-child-a: #2a2000; --task-child-b: #332800;
+  --task-result-a: #2a1515; --task-result-b: #331a1a;
+  --task-link-bg: #2a2000; --task-link-border: #6b4c1a;
+  --shadow-sm: 0 4px 12px rgba(0,0,0,0.25); --shadow-md: 0 14px 30px rgba(0,0,0,0.35);
+  --shadow-lg: 0 24px 60px rgba(0,0,0,0.45); --shadow-inner: inset 0 1px 0 rgba(255,255,255,0.04);
 }
+
+/* Manual light override (OS dark but user wants light) */
+[data-theme="light"] {
+  --bg: #f5efe4; --bg-deep: #ede5d6; --paper: #fffdf9; --paper-alt: #f9f3e9;
+  --ink: #17212b; --muted: #5f6b76; --subtle: #9ca3af; --line: #ddd2c1; --line-light: #ece3d4;
+  --hero-a: #12343b; --hero-b: #2c6e63; --hero-glow: rgba(209,122,34,0.18);
+  --accent: #0f4c5c; --accent-hover: #0b3a48; --accent-2: #d17a22; --accent-2-hover: #b86a1c;
+  --ok: #1b7a5c; --ok-bg: #d8f3dc; --ok-ink: #1b4332; --err-bg: #fee2e2; --err-ink: #991b1b;
+  --warn-bg: #fef3c7; --warn-ink: #92400e; --danger-bg: #fee2e2; --danger-ink: #991b1b;
+  --info-bg: #e0f2fe; --info-ink: #075985;
+  --hl-bg: #fff1dd; --hl-bg-deep: #ffe3b8; --hl-border: #f59e0b; --hl-ink: #9a3412; --hl-ink-deep: #7c2d12;
+  --sup-bg: #f5efe5; --sup-border: #d6c6aa;
+  --status-bg: #ede9fe; --status-ink: #5b21b6; --status-border: #ddd6fe;
+  --task-parent-a: #f0fafa; --task-parent-b: #e8f5f2;
+  --task-child-a: #fff9ef; --task-child-b: #fbf1de;
+  --task-result-a: #fff4f1; --task-result-b: #faece8;
+  --task-link-bg: #fff7ed; --task-link-border: #f5d0a9;
+  --shadow-sm: 0 4px 12px rgba(23,33,43,0.06); --shadow-md: 0 14px 30px rgba(23,33,43,0.08);
+  --shadow-lg: 0 24px 60px rgba(18,52,59,0.18); --shadow-inner: inset 0 1px 0 rgba(255,255,255,0.65);
+}
+
+/* --- Theme toggle button ---------------------------------------------- */
+.theme-toggle { position: fixed; top: 16px; right: 16px; z-index: 1001; padding: 8px 14px; border-radius: var(--r-pill); border: 1px solid var(--line); background: var(--paper); color: var(--ink); font-size: 13px; font-weight: 700; cursor: pointer; transition: all var(--dur) var(--ease); box-shadow: var(--shadow-sm); }
+.theme-toggle:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
 
 /* --- Reset & base ----------------------------------------------------- */
 *, *::before, *::after { box-sizing: border-box; }
@@ -689,11 +730,16 @@ code {
 .chart-wrap--light h3 { margin: 0 0 12px; font-size: 17px; font-weight: 700; }
 /* Force light palette on chart wrappers even in dark mode (SVG readability) */
 @media (prefers-color-scheme: dark) {
-  .chart-wrap--light {
+  :root:not([data-theme="light"]) .chart-wrap--light {
     background: linear-gradient(180deg, #f5f0e8, #ede5d6);
     color: #17212b;
     border-color: #ddd2c1;
   }
+}
+[data-theme="dark"] .chart-wrap--light {
+  background: linear-gradient(180deg, #f5f0e8, #ede5d6);
+  color: #17212b;
+  border-color: #ddd2c1;
 }
 
 /* --- Detail panel (used in detail HTML) ------------------------------- */
@@ -912,6 +958,85 @@ code {
 .task-links { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px; }
 .task-links a { text-decoration: none; color: var(--accent-2); background: var(--task-link-bg); border: 1px solid var(--task-link-border); padding: 9px 12px; border-radius: var(--r-pill); font-weight: 700; transition: all var(--dur) var(--ease); }
 .task-links a:hover { background: var(--accent-2); color: #fff; }
+
+/* --- Gantt chart ------------------------------------------------------ */
+.gantt-wrap { margin: 0 0 18px; border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--paper); }
+.gantt-wrap svg { display: block; width: 100%; height: auto; }
+.gantt-bar { rx: 4; ry: 4; }
+.gantt-bar.done { fill: var(--ok); }
+.gantt-bar.in-progress { fill: var(--accent); }
+.gantt-bar.pending { fill: var(--line); }
+.gantt-bar.overdue { fill: var(--err-bg); stroke: var(--err-ink); stroke-width: 1.5; }
+.gantt-today { stroke: var(--err-ink); stroke-width: 2; stroke-dasharray: 6 3; }
+.gantt-label { font-size: 12px; fill: var(--ink); font-weight: 600; }
+.gantt-date { font-size: 10px; fill: var(--muted); }
+.gantt-header { font-size: 11px; fill: var(--muted); font-weight: 700; }
+
+/* --- Jira live board (interactive) ------------------------------------ */
+.jira-board { margin: 0 0 18px; border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--paper); box-shadow: var(--shadow-md); }
+.jira-board-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; background: linear-gradient(180deg, var(--hero-a), var(--hero-b)); color: #fff; border-bottom: 1px solid var(--line); }
+.jira-board-header h3 { color: #fff; }
+.jira-board-header .sprint-meta { color: rgba(255,255,255,0.9); font-size: 13px; }
+.jira-board-header h3 { margin: 0; font-size: 16px; }
+.jira-board-header .sprint-meta { font-size: 12px; color: var(--muted); }
+.jira-board-actions { display: flex; gap: 8px; }
+.jira-task { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--line); transition: background var(--dur-fast) var(--ease); }
+.jira-task:last-child { border-bottom: none; }
+.jira-task:nth-child(even) { background: var(--paper-alt); }
+.jira-task:hover { background: var(--bg-deep); }
+.jira-task.subtask { padding-left: 48px; }
+.jira-key { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--accent); white-space: nowrap; }
+.jira-summary { font-size: 14px; line-height: 1.4; }
+.jira-date { font-size: 11px; color: var(--muted); white-space: nowrap; font-family: var(--mono); }
+.jira-date.overdue { color: var(--err-ink); font-weight: 700; }
+.jira-task-actions { display: flex; gap: 6px; align-items: center; }
+.jira-btn { display: inline-flex; align-items: center; gap: 4px; padding: 5px 10px; border-radius: var(--r-pill); border: 1px solid var(--line); background: var(--paper); font-size: 11px; font-weight: 700; cursor: pointer; transition: all var(--dur-fast) var(--ease); color: var(--ink); }
+.jira-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+.jira-btn.complete:hover { background: var(--ok); border-color: var(--ok); }
+.jira-btn.add:hover { background: var(--accent-2); border-color: var(--accent-2); }
+.jira-status { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: var(--r-pill); font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; }
+.jira-status.in-progress { background: var(--info-bg); color: var(--accent); }
+.jira-status.done { background: var(--ok-bg); color: var(--ok-ink); }
+.jira-status.pending { background: var(--warn-bg); color: var(--warn-ink); }
+.jira-board-footer { padding: 10px 18px; background: var(--paper-alt); border-top: 1px solid var(--line); text-align: center; }
+.jira-board-empty { padding: 32px; text-align: center; color: var(--muted); font-size: 14px; }
+.jira-toast { position: fixed; bottom: 24px; right: 24px; padding: 12px 20px; border-radius: var(--r-md); background: var(--ink); color: var(--paper); font-size: 13px; font-weight: 600; box-shadow: var(--shadow-lg); z-index: 1000; opacity: 0; transform: translateY(10px); transition: all .3s ease; }
+.jira-toast.show { opacity: 1; transform: translateY(0); }
+.jira-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 999; display: flex; align-items: center; justify-content: center; }
+.jira-modal { background: var(--paper); border-radius: var(--r-lg); padding: 24px; width: 420px; max-width: 90vw; box-shadow: var(--shadow-lg); }
+.jira-modal h4 { margin: 0 0 14px; font-size: 16px; }
+.jira-modal textarea, .jira-modal input { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; resize: vertical; box-sizing: border-box; margin-bottom: 12px; }
+.jira-modal .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* --- Jira suggestion panel -------------------------------------------- */
+.jira-suggestions { margin: 0 0 18px; border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--paper); box-shadow: var(--shadow-md); }
+.jira-suggestions-header { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; background: linear-gradient(180deg, var(--accent-2), var(--accent-2-hover)); color: #fff; border-bottom: 1px solid var(--line); }
+.jira-suggestions-header h3 { color: #fff; }
+.jira-suggestions-header .sprint-meta { color: rgba(255,255,255,0.8); }
+.jira-suggestions-header h3 { margin: 0; font-size: 16px; }
+.jira-suggestion { padding: 14px 18px; border-bottom: 1px solid var(--line); transition: background var(--dur-fast) var(--ease); }
+.jira-suggestion:last-child { border-bottom: none; }
+.jira-suggestion:hover { background: var(--paper-alt); }
+.jira-suggestion.applied { opacity: .5; }
+.suggestion-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.suggestion-type { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: var(--r-pill); font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.suggestion-type.comment { background: var(--info-bg); color: var(--accent); }
+.suggestion-type.complete { background: var(--ok-bg); color: var(--ok-ink); }
+.suggestion-type.add_subtask { background: var(--warn-bg); color: var(--warn-ink); }
+.suggestion-type.transition { background: var(--info-bg); color: var(--accent); }
+.confidence { display: inline-flex; padding: 2px 7px; border-radius: var(--r-pill); font-size: 10px; font-weight: 700; }
+.confidence.high { background: var(--ok-bg); color: var(--ok-ink); }
+.confidence.medium { background: var(--warn-bg); color: var(--warn-ink); }
+.confidence.low { background: var(--paper-alt); color: var(--muted); }
+.suggestion-reason { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.suggestion-text { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; resize: vertical; min-height: 40px; box-sizing: border-box; background: var(--paper); color: var(--ink); }
+.suggestion-actions { display: flex; gap: 6px; margin-top: 8px; }
+.suggestion-actions .jira-btn.approve { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-bg); }
+.suggestion-actions .jira-btn.approve:hover { background: var(--ok); color: #fff; }
+.suggestion-actions .jira-btn.reject { background: var(--paper-alt); color: var(--muted); }
+.suggestion-actions .jira-btn.reject:hover { background: var(--err-bg); color: var(--err-ink); }
+.suggestion-collapsed { display: none; }
+.suggestion-toggle { cursor: pointer; color: var(--accent); font-size: 12px; font-weight: 600; background: none; border: none; padding: 4px 0; }
 
 /* --- Subtask checklist (portfolio) ------------------------------------ */
 .subtask-list { list-style: none; padding-left: 0; }
