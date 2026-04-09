@@ -28,6 +28,19 @@ PORT = 18923
 provider = get_task_provider({"jira": {"project_key": "APPL", "sprint_id": 152}})
 
 
+def _find_latest_dashboard() -> Path | None:
+    """Find the most recent startup dashboard HTML."""
+    patterns = [
+        str(REPO_ROOT / "reports" / "projects" / "*" / "reports" / "dashboard" / "*-startup-dashboard.html"),
+        str(Path("D:/Project/devops/Release_claude/reports/dashboard/*-startup-dashboard.html")),
+    ]
+    files = []
+    for p in patterns:
+        files.extend(glob(p))
+    files.sort(reverse=True)
+    return Path(files[0]) if files else None
+
+
 def _find_suggestions_file(target_date: str | None = None) -> Path | None:
     """Find the most recent suggestions JSON file."""
     pattern = str(REPO_ROOT / "reports" / "projects" / "*" / "reports" / "jira" / "*-jira-suggestions.json")
@@ -102,6 +115,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _, data = _load_suggestions(target_date)
             pending = [s for s in data.get("suggestions", []) if s.get("status") == "pending"]
             _json_response(self, {"date": data.get("date", ""), "suggestions": pending})
+
+        elif parsed.path == "/" or parsed.path == "/dashboard":
+            # Serve latest dashboard HTML via HTTP (avoids file:// CORS issues)
+            dashboard = _find_latest_dashboard()
+            if dashboard and dashboard.exists():
+                body = dashboard.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                _json_response(self, {"error": "no dashboard found"}, 404)
 
         else:
             _json_response(self, {"error": "not found"}, 404)

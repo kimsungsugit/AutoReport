@@ -2673,11 +2673,11 @@ def svg_sprint_gantt(tasks: list[dict[str, Any]], sprint: dict[str, Any], today:
             parts.append(f'<line x1="{x}" y1="22" x2="{x}" y2="{svg_h - 10}" stroke="var(--line)" stroke-width="0.5"/>')
         current += timedelta(days=1)
 
-    # Today line
+    # Today line (togglable)
     if range_start <= today <= range_end:
         today_x = left_margin + int(((today - range_start).days / total_days) * bar_area)
-        parts.append(f'<line x1="{today_x}" y1="22" x2="{today_x}" y2="{svg_h - 10}" class="gantt-today"/>')
-        parts.append(f'<text x="{today_x}" y="{svg_h - 2}" class="gantt-date" text-anchor="middle">Today</text>')
+        parts.append(f'<g id="gantt-today-group"><line x1="{today_x}" y1="22" x2="{today_x}" y2="{svg_h - 10}" class="gantt-today"/>')
+        parts.append(f'<text x="{today_x}" y="{svg_h - 2}" class="gantt-date" text-anchor="middle">Today</text></g>')
 
     # Task bars
     status_cls_map = {"done": "done", "in_progress": "in-progress", "pending": "pending"}
@@ -2708,7 +2708,10 @@ def svg_sprint_gantt(tasks: list[dict[str, Any]], sprint: dict[str, Any], today:
         # Date text on bar
         parts.append(f'<text x="{bar_x + 4}" y="{y + 20}" class="gantt-date">{task["start"][5:]} ~ {task["end"][5:]}</text>')
 
-    parts.append('</svg></div>')
+    parts.append('</svg>')
+    parts.append('<div style="text-align:right;padding:6px 12px;">')
+    parts.append('<button class="jira-btn" id="gantt-today-toggle" onclick="toggleGanttToday()">Today OFF</button>')
+    parts.append('</div></div>')
     return ''.join(parts)
 
 
@@ -2874,7 +2877,7 @@ JIRA_BOARD_SCRIPT = """
     }).then(r => r.json()).then(d => {
       btn.closest('.jira-modal-overlay').remove();
       if (d.ok) {
-        jiraToast(key + ' → 종료 요청 완료');
+        jiraToast(key + ' → 종료 요청 완료'); _afterAction();
         const row = document.querySelector('[data-key="' + key + '"]');
         if (row) {
           const st = row.querySelector('.jira-status');
@@ -2910,7 +2913,7 @@ JIRA_BOARD_SCRIPT = """
       body: JSON.stringify({comment: text})
     }).then(r => r.json()).then(d => {
       btn.closest('.jira-modal-overlay').remove();
-      jiraToast(d.ok ? key + ' 댓글 작성 완료' : '실패');
+      if (d.ok) { jiraToast(key + ' 댓글 작성 완료'); _afterAction(); } else { jiraToast('실패'); }
     }).catch(() => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
   };
 
@@ -2940,12 +2943,116 @@ JIRA_BOARD_SCRIPT = """
       body: JSON.stringify({parent_key: parentKey, summary: text})
     }).then(r => r.json()).then(d => {
       btn.closest('.jira-modal-overlay').remove();
-      if (d.ok) { jiraToast(d.key + ' 생성 완료 (' + parentKey + ' 하위)'); }
+      if (d.ok) { jiraToast(d.key + ' 생성 완료 (' + parentKey + ' 하위)'); _afterAction(); }
       else { jiraToast('실패: ' + (d.error || 'unknown')); }
     }).catch(() => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
   };
 
-  window.jiraRefresh = function() { location.reload(); };
+  window.jiraRefresh = function() {
+    const btn = document.querySelector('.jira-board-footer .jira-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '갱신 중...'; }
+    fetch(API + '/api/sprint/tasks')
+      .then(r => r.json())
+      .then(data => {
+        const board = document.getElementById('jira-live-board');
+        if (!board) { location.reload(); return; }
+        const tasks = data.tasks || [];
+        const sprint = data.sprint || {};
+        const statusCls = {done:'done', in_progress:'in-progress', pending:'pending'};
+        const statusLabel = {done:'Done', in_progress:'In Progress', pending:'To Do'};
+        const today = new Date().toISOString().slice(0,10);
+
+        // Count all items including subtasks
+        let allItems = [];
+        tasks.forEach(t => { allItems.push(t); (t.subtasks||[]).forEach(s => allItems.push(s)); });
+        const doneC = allItems.filter(i => i.status==='done').length;
+        const progC = allItems.filter(i => i.status==='in_progress').length;
+        const todoC = allItems.filter(i => i.status==='pending').length;
+
+        // Rebuild header counts
+        const header = board.querySelector('.jira-board-actions');
+        if (header) header.innerHTML =
+          `<span class="jira-status done">${doneC} Done</span>` +
+          `<span class="jira-status in-progress">${progC} In Progress</span>` +
+          `<span class="jira-status pending">${todoC} To Do</span>`;
+
+        // Rebuild rows
+        const rows = board.querySelectorAll('.jira-task');
+        rows.forEach(r => r.remove());
+        const footer = board.querySelector('.jira-board-footer');
+
+        tasks.forEach(task => {
+          const st = task.status || 'pending';
+          const cls = statusCls[st] || 'pending';
+          const label = statusLabel[st] || 'To Do';
+          const tStart = (task.start||'').slice(5);
+          const tEnd = (task.end||'').slice(5);
+          let dateHtml = '';
+          if (task.start && task.end) {
+            const overdue = task.end < today && st !== 'done' ? ' overdue' : '';
+            dateHtml = `<span class="jira-date${overdue}">${tStart} ~ ${tEnd}</span>`;
+          }
+          let actions = '';
+          if (st === 'in_progress') actions += `<button class="jira-btn complete" onclick="jiraComplete('${task.key}')">Complete</button>`;
+          actions += `<button class="jira-btn" onclick="jiraComment('${task.key}')">Comment</button>`;
+          actions += `<button class="jira-btn add" onclick="jiraAddSub('${task.key}')">+ Sub</button>`;
+          const row = document.createElement('div');
+          row.className = 'jira-task';
+          row.dataset.key = task.key;
+          row.innerHTML = `<span class="jira-key">${task.key}</span>` +
+            `<span class="jira-summary">${task.title}</span>${dateHtml}` +
+            `<span class="jira-task-actions"><span class="jira-status ${cls}">${label}</span>${actions}</span>`;
+          board.insertBefore(row, footer);
+
+          (task.subtasks||[]).forEach(sub => {
+            const sst = sub.status || 'pending';
+            const scls = statusCls[sst] || 'pending';
+            const slabel = statusLabel[sst] || 'To Do';
+            let sActions = '';
+            if (sst === 'in_progress') sActions += `<button class="jira-btn complete" onclick="jiraComplete('${sub.key}')">Complete</button>`;
+            sActions += `<button class="jira-btn" onclick="jiraComment('${sub.key}')">Comment</button>`;
+            const srow = document.createElement('div');
+            srow.className = 'jira-task subtask';
+            srow.dataset.key = sub.key;
+            srow.innerHTML = `<span class="jira-key">${sub.key}</span>` +
+              `<span class="jira-summary">${sub.title}</span>` +
+              `<span class="jira-task-actions"><span class="jira-status ${scls}">${slabel}</span>${sActions}</span>`;
+            board.insertBefore(srow, footer);
+          });
+        });
+
+        if (btn) { btn.disabled = false; btn.textContent = 'Refresh'; }
+        jiraToast('Sprint Board 갱신 완료');
+      })
+      .catch(() => {
+        if (btn) { btn.disabled = false; btn.textContent = 'Refresh'; }
+        jiraToast('갱신 실패 — 프록시 서버 확인');
+      });
+  };
+
+  // Auto-refresh board after complete/comment actions
+  window._afterAction = function() { setTimeout(jiraRefresh, 1000); };
+
+  // Gantt Today line toggle
+  window.toggleGanttToday = function() {
+    const g = document.getElementById('gantt-today-group');
+    const btn = document.getElementById('gantt-today-toggle');
+    if (!g) return;
+    const visible = g.style.display !== 'none';
+    g.style.display = visible ? 'none' : '';
+    btn.textContent = visible ? 'Today ON' : 'Today OFF';
+    localStorage.setItem('gantt-today-visible', visible ? '0' : '1');
+  };
+  // Restore saved state (default: visible)
+  (function() {
+    const saved = localStorage.getItem('gantt-today-visible');
+    if (saved === '0') {
+      const g = document.getElementById('gantt-today-group');
+      const btn = document.getElementById('gantt-today-toggle');
+      if (g) { g.style.display = 'none'; }
+      if (btn) { btn.textContent = 'Today ON'; }
+    }
+  })();
 })();
 </script>
 """
@@ -3036,7 +3143,7 @@ JIRA_SUGGESTIONS_SCRIPT = """
       if (d.ok) {
         card.classList.add('applied');
         btn.textContent = '완료';
-        jiraToast(key + ' 제안 승인 완료');
+        jiraToast(key + ' 제안 승인 완료'); _afterAction();
       } else {
         btn.textContent = '실패';
         jiraToast('실패: ' + (d.error || 'unknown'));

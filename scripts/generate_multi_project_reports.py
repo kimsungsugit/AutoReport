@@ -386,6 +386,12 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
 
 
 def main() -> int:
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    except ImportError:
+        pass
+
     args = parse_args()
     config_path = Path(args.config)
     projects = load_projects(config_path)
