@@ -275,9 +275,45 @@ def build_task_board(item: dict) -> str:
 """
 
 
+def _build_jira_sections(run_date: str) -> tuple[str, str]:
+    """Build Jira live board + suggestions panel for portfolio dashboard."""
+    try:
+        from scripts.generate_periodic_reports import (
+            html_jira_live_board, html_jira_suggestions_panel,
+            generate_jira_suggestions, JIRA_BOARD_SCRIPT, JIRA_SUGGESTIONS_SCRIPT,
+        )
+        config_path = SCRIPT_DIR / "startup_projects.json"
+        if not config_path.exists():
+            return "", ""
+        with open(config_path, encoding="utf-8") as f:
+            projects = json.load(f).get("projects", [])
+
+        boards_html = ""
+        suggestions_html = ""
+        for pc in projects:
+            if isinstance(pc.get("jira"), dict):
+                boards_html += html_jira_live_board(pc)
+                # Load suggestions from file
+                sugg_path = WORKSPACE_ROOT / "reports" / "projects" / pc["name"] / "reports" / "jira" / f"{run_date}-jira-suggestions.json"
+                if sugg_path.exists():
+                    with open(sugg_path, encoding="utf-8") as sf:
+                        sugg_data = json.load(sf)
+                    suggestions_html += html_jira_suggestions_panel(sugg_data.get("suggestions", []))
+
+        scripts = ""
+        if boards_html:
+            scripts += JIRA_BOARD_SCRIPT
+        if suggestions_html:
+            scripts += JIRA_SUGGESTIONS_SCRIPT
+        return boards_html + suggestions_html, scripts
+    except Exception:
+        return "", ""
+
+
 def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
     history_dashboard = WORKSPACE_ROOT / "reports" / "history" / f"{run_date}-history-dashboard.html"
     history_link = history_dashboard.as_uri() if history_dashboard.exists() else ""
+    jira_html, jira_scripts = _build_jira_sections(run_date)
     cards = []
     board_sections = []
     for item in items:
@@ -364,12 +400,15 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
 </head>
 <body>
   <a href="#main-content" class="skip-link">Skip to content</a>
+  <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()">Light</button>
+  <div id="jira-toast" class="jira-toast"></div>
   <div class="wrap" id="main-content">
     <section class="hero">
       <h1>Multi Project Startup Dashboard</h1>
       <p>{escape(run_date)} portfolio summary for configured repositories.</p>
       {f'<div class="hero-links"><a href="{escape(history_link)}">Open History Dashboard</a></div>' if history_link else ''}
     </section>
+    {jira_html}
     <h2 class="section-title">Portfolio Task Boards</h2>
     <p class="section-copy">Use each parent task as the Jira task draft, then create the listed subtasks and close them against the shown completion criteria.</p>
     <div class="portfolio-grid">
@@ -381,6 +420,28 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
     </div>
   </div>
 {CHECKLIST_JS}
+{jira_scripts}
+<script>
+(function() {{
+  const btn = document.getElementById('theme-toggle');
+  const saved = localStorage.getItem('dashboard-theme');
+  if (saved) {{
+    document.documentElement.setAttribute('data-theme', saved);
+    btn.textContent = saved === 'dark' ? 'Light' : 'Dark';
+  }} else {{
+    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    btn.textContent = isDark ? 'Light' : 'Dark';
+  }}
+  window.toggleTheme = function() {{
+    const current = document.documentElement.getAttribute('data-theme');
+    const isDark = current === 'dark' || (!current && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    const next = isDark ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    localStorage.setItem('dashboard-theme', next);
+    btn.textContent = next === 'dark' ? 'Light' : 'Dark';
+  }};
+}})();
+</script>
 </body>
 </html>"""
 

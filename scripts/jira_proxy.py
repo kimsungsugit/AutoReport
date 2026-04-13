@@ -116,9 +116,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             pending = [s for s in data.get("suggestions", []) if s.get("status") == "pending"]
             _json_response(self, {"date": data.get("date", ""), "suggestions": pending})
 
-        elif parsed.path == "/" or parsed.path == "/dashboard":
+        elif parsed.path in ("/", "/dashboard", "/portfolio"):
             # Serve latest dashboard HTML via HTTP (avoids file:// CORS issues)
-            dashboard = _find_latest_dashboard()
+            if parsed.path == "/portfolio":
+                pattern = str(REPO_ROOT / "reports" / "portfolio" / "*-multi-project-dashboard.html")
+                files = sorted(glob(pattern), reverse=True)
+                dashboard = Path(files[0]) if files else None
+            else:
+                dashboard = _find_latest_dashboard()
             if dashboard and dashboard.exists():
                 body = dashboard.read_bytes()
                 self.send_response(200)

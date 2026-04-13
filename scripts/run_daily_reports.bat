@@ -14,4 +14,4 @@ if errorlevel 1 (
     start "" /b "C:\msys64\mingw64\bin\python.exe" scripts\jira_proxy.py
     timeout /t 3 /nobreak >nul
 )
-start "" "http://localhost:18923/dashboard"
+start "" "http://localhost:18923/portfolio"

@@ -3031,7 +3031,7 @@ JIRA_BOARD_SCRIPT = """
   };
 
   // Auto-refresh board after complete/comment actions
-  window._afterAction = function() { setTimeout(jiraRefresh, 1000); };
+  window._afterAction = function() { setTimeout(jiraRefresh, 1000); setTimeout(function(){ if(window.suggRefresh) suggRefresh(); }, 1500); };
 
   // Gantt Today line toggle
   window.toggleGanttToday = function() {
@@ -3112,9 +3112,10 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
     </div>
     <div class="jira-board-actions">
       <button class="jira-btn approve" onclick="suggBatchApprove()">전체 승인</button>
+      <button class="jira-btn" onclick="suggRefresh()">Refresh</button>
     </div>
   </div>
-  {"".join(rows)}
+  <div id="jira-suggestions-body">{"".join(rows)}</div>
   {toggle}
 </div>
 '''
@@ -3171,6 +3172,53 @@ JIRA_SUGGESTIONS_SCRIPT = """
       const sid = card.dataset.sid;
       suggApprove(sid);
     });
+  };
+
+  window.suggRefresh = function() {
+    fetch(API + '/api/suggestions')
+      .then(r => r.json())
+      .then(data => {
+        const panel = document.getElementById('jira-suggestions-panel');
+        if (!panel) return;
+        const body = document.getElementById('jira-suggestions-body');
+        if (!body) return;
+        const suggestions = data.suggestions || [];
+        const typeIcons = {comment:'Comment', complete:'Complete', add_subtask:'+ Sub', transition:'Start'};
+
+        // Update header counts
+        const meta = panel.querySelector('.sprint-meta');
+        const highCount = suggestions.filter(s => s.confidence === 'high').length;
+        if (meta) meta.textContent = suggestions.length + '건 대기 · ' + highCount + '건 높은 확신';
+
+        // Rebuild suggestion cards
+        body.innerHTML = '';
+        suggestions.forEach(s => {
+          const collapsed = s.confidence === 'low' ? ' suggestion-collapsed' : '';
+          const card = document.createElement('div');
+          card.className = 'jira-suggestion' + collapsed;
+          card.dataset.sid = s.id;
+          card.dataset.key = s.task_key;
+          card.dataset.type = s.type;
+          card.innerHTML = `
+            <div class="suggestion-head">
+              <span class="jira-key">${s.task_key}</span>
+              <span class="suggestion-type ${s.type}">${typeIcons[s.type]||'Action'}</span>
+              <span class="confidence ${s.confidence}">${s.confidence}</span>
+              <span style="flex:1"></span>
+              <strong style="font-size:13px">${s.title}</strong>
+            </div>
+            <div class="suggestion-reason">${s.reason}</div>
+            <textarea class="suggestion-text" id="text-${s.id}">${s.suggested_text}</textarea>
+            <div class="suggestion-actions">
+              <button class="jira-btn approve" onclick="suggApprove('${s.id}')">승인</button>
+              <button class="jira-btn reject" onclick="suggReject('${s.id}')">거절</button>
+            </div>`;
+          body.appendChild(card);
+        });
+
+        jiraToast('제안 리뷰 갱신 완료 (' + suggestions.length + '건)');
+      })
+      .catch(() => { jiraToast('제안 갱신 실패 — 프록시 서버 확인'); });
   };
 
   window.suggToggleLow = function() {
