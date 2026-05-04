@@ -1007,6 +1007,23 @@ code {
 .jira-modal h4 { margin: 0 0 14px; font-size: 16px; }
 .jira-modal textarea, .jira-modal input { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; resize: vertical; box-sizing: border-box; margin-bottom: 12px; }
 .jira-modal .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.jira-modal .field-group { margin-bottom: 10px; }
+.jira-modal .field-group:last-of-type { margin-bottom: 16px; }
+.jira-modal .field-label { display: block; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+.jira-modal .field-group textarea, .jira-modal .field-group input { margin-bottom: 0; }
+
+/* --- Regenerate banner ------------------------------------------------ */
+.regen-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 0 0 14px; padding: 12px 16px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--paper-alt); }
+.regen-bar .regen-label { font-size: 13px; font-weight: 700; color: var(--ink); }
+.regen-bar .regen-help { font-size: 12px; color: var(--muted); flex: 1 1 auto; min-width: 0; }
+.regen-bar .regen-btn { padding: 8px 16px; border: 1px solid var(--accent); border-radius: var(--r-md); background: var(--accent); color: #fff; font-size: 13px; font-weight: 700; cursor: pointer; transition: all var(--dur-fast) var(--ease); }
+.regen-bar .regen-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.regen-bar .regen-btn:disabled { opacity: .55; cursor: not-allowed; }
+.regen-progress { width: 100%; height: 6px; background: var(--line); border-radius: var(--r-pill); overflow: hidden; margin-top: 8px; display: none; }
+.regen-progress.active { display: block; }
+.regen-progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); width: 30%; animation: regenSlide 1.6s ease-in-out infinite; }
+@keyframes regenSlide { 0% { transform: translateX(-100%); } 100% { transform: translateX(400%); } }
+.regen-status { font-size: 12px; color: var(--muted); margin-top: 6px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
 /* --- Jira suggestion panel -------------------------------------------- */
 .jira-suggestions { margin: 0 0 18px; border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--paper); box-shadow: var(--shadow-md); }
@@ -1018,7 +1035,10 @@ code {
 .jira-suggestion:last-child { border-bottom: none; }
 .jira-suggestion:hover { background: var(--paper-alt); }
 .jira-suggestion.applied { opacity: .5; }
-.suggestion-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.suggestion-head { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; flex-wrap: wrap; }
+.suggestion-spacer { flex: 1 1 auto; min-width: 0; }
+.suggestion-title { font-size: 13px; font-weight: 700; color: var(--ink); overflow-wrap: anywhere; word-break: break-word; }
+.suggestion-subtitle { font-size: 12px; color: var(--muted); margin: 0 0 6px; padding-left: 2px; line-height: 1.4; overflow-wrap: anywhere; word-break: break-word; }
 .suggestion-type { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: var(--r-pill); font-size: 10px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
 .suggestion-type.comment { background: var(--info-bg); color: var(--accent); }
 .suggestion-type.complete { background: var(--ok-bg); color: var(--ok-ink); }
@@ -1030,6 +1050,10 @@ code {
 .confidence.low { background: var(--paper-alt); color: var(--muted); }
 .suggestion-reason { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
 .suggestion-text { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; resize: vertical; min-height: 40px; box-sizing: border-box; background: var(--paper); color: var(--ink); }
+.suggestion-fields { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
+.suggestion-field-label { display: block; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
+.suggestion-field-label .hint { color: var(--muted); font-weight: 500; text-transform: none; letter-spacing: 0; margin-left: 4px; opacity: .8; }
+.suggestion-description { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; resize: vertical; min-height: 56px; box-sizing: border-box; background: var(--paper); color: var(--ink); }
 .suggestion-actions { display: flex; gap: 6px; margin-top: 8px; }
 .suggestion-actions .jira-btn.approve { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-bg); }
 .suggestion-actions .jira-btn.approve:hover { background: var(--ok); color: #fff; }

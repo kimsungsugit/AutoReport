@@ -929,6 +929,23 @@ def generate_jira_suggestions(
     _NOISE_PREFIXES = ("chore(auto)", "chore:", "merge", "fix gitlab ci", "fix ci", "skip hanging")
     _NOISE_KEYWORDS = {"ci", "build", "fix", "merge", "snapshot", "chore"}
 
+    _CC_PREFIXES = ("feat: ", "fix: ", "refactor: ", "test: ", "chore: ", "docs: ",
+                    "feat(", "fix(", "refactor(", "test(", "chore(", "docs(")
+
+    def _strip_cc_prefix(msg: str) -> str:
+        """Drop conventional-commit prefix ('feat: ', 'fix(scope): ', etc) from a subject."""
+        m = msg.lstrip()
+        low = m.lower()
+        for p in _CC_PREFIXES:
+            if low.startswith(p):
+                if "(" in p:  # scoped form 'feat(scope): rest' — find ')' then ': '
+                    paren = m.find(")")
+                    colon = m.find(":", paren)
+                    if paren != -1 and colon != -1:
+                        return m[colon + 1:].lstrip()
+                return m[len(p):].lstrip()
+        return m
+
     def _is_noise_commit(subj: str) -> bool:
         sl = subj.lower().strip()
         return any(sl.startswith(p) for p in _NOISE_PREFIXES)
@@ -994,7 +1011,7 @@ def generate_jira_suggestions(
                 sid += 1
                 related = _match_commits_for(stitle, key)
                 summary = _summarize_commits(related)
-                # Get description from local sprint_tasks.json
+                # Description: prefer Jira live, fall back to local sprint_tasks.json
                 desc = sub.get("description", "")
                 if not desc:
                     local_task = local_sprint.get(key, {})
@@ -1011,7 +1028,9 @@ def generate_jira_suggestions(
                     "task_key": skey,
                     "type": "complete",
                     "title": f"  └ {stitle} — 완료 처리",
+                    "subtitle": f"{key} 하위작업 · {title}",
                     "suggested_text": text,
+                    "suggested_description": desc,
                     "reason": f"{key} 하위작업, 현재 진행 중",
                     "confidence": "medium",
                     "status": "pending",
@@ -1022,12 +1041,21 @@ def generate_jira_suggestions(
                 try:
                     if date.fromisoformat(t_start) <= today:
                         sid += 1
+                        sub_desc = sub.get("description", "")
+                        if not sub_desc:
+                            local_task = local_sprint.get(key, {})
+                            for ls in local_task.get("subtasks", []):
+                                if ls.get("title") == stitle:
+                                    sub_desc = ls.get("description", "")
+                                    break
                         suggestions.append({
                             "id": f"s{sid}",
                             "task_key": skey,
                             "type": "transition",
                             "title": f"  └ {stitle} — 작업 시작",
+                            "subtitle": f"{key} 하위작업 · {title} · 시작일 {t_start}",
                             "suggested_text": f"상위 작업({key}) 시작일 도래. 작업을 시작합니다.",
+                            "suggested_description": sub_desc,
                             "reason": f"시작일 {t_start} ≤ 오늘",
                             "confidence": "low",
                             "status": "pending",
@@ -1043,19 +1071,23 @@ def generate_jira_suggestions(
             sub_lines = []
             for s in done_subs:
                 local_task = local_sprint.get(key, {})
-                desc = ""
-                for ls in local_task.get("subtasks", []):
-                    if ls.get("title") == s.get("title"):
-                        desc = ls.get("description", "")
-                        break
+                desc = s.get("description", "")
+                if not desc:
+                    for ls in local_task.get("subtasks", []):
+                        if ls.get("title") == s.get("title"):
+                            desc = ls.get("description", "")
+                            break
                 sub_lines.append(f"- {s.get('title', '')}: {desc or '완료'}")
             sub_results = "\n".join(sub_lines)
+            parent_desc = task.get("description", "") or local_sprint.get(key, {}).get("description", "")
             suggestions.append({
                 "id": f"s{sid}",
                 "task_key": key,
                 "type": "complete",
                 "title": f"{title} — 전체 완료 보고",
+                "subtitle": f"상위 작업 · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
                 "suggested_text": f"전체 하위작업 완료.\n{sub_results}\n종료 요청합니다.",
+                "suggested_description": parent_desc,
                 "reason": f"부작업 {len(done_subs)}/{len(subtasks)} 완료",
                 "confidence": "high",
                 "status": "pending",
@@ -1074,18 +1106,25 @@ def generate_jira_suggestions(
                         st_label = {"done": "완료", "in_progress": "진행 중", "pending": "대기"}.get(s.get("status", ""), "?")
                         local_task = local_sprint.get(key, {})
                         detail = ""
-                        for ls in local_task.get("subtasks", []):
-                            if ls.get("title") == s.get("title") and ls.get("description"):
-                                detail = f" ({ls['description'][:50]})"
-                                break
+                        live_desc = s.get("description", "")
+                        if live_desc:
+                            detail = f" ({live_desc[:50]})"
+                        else:
+                            for ls in local_task.get("subtasks", []):
+                                if ls.get("title") == s.get("title") and ls.get("description"):
+                                    detail = f" ({ls['description'][:50]})"
+                                    break
                         sub_status_lines.append(f"- {s.get('title', '')}: {st_label}{detail}")
                     sub_report = "\n".join(sub_status_lines) if sub_status_lines else ""
+                    parent_desc = task.get("description", "") or local_sprint.get(key, {}).get("description", "")
                     suggestions.append({
                         "id": f"s{sid}",
                         "task_key": key,
                         "type": "complete",
                         "title": f"{title} — 기한 초과 ({days_over}일), 완료 처리",
+                        "subtitle": f"상위 작업 · 종료일 {t_end} ({days_over}일 경과) · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
                         "suggested_text": f"기한({t_end}) 대비 {days_over}일 경과.\n{sub_report}\n종료 요청합니다.",
+                        "suggested_description": parent_desc,
                         "reason": f"종료일 {t_end} 경과 ({len(done_subs)}/{len(subtasks)} 부작업 완료)",
                         "confidence": "high",
                         "status": "pending",
@@ -1099,12 +1138,15 @@ def generate_jira_suggestions(
             try:
                 if date.fromisoformat(t_start) <= today:
                     sid += 1
+                    parent_desc = task.get("description", "") or local_sprint.get(key, {}).get("description", "")
                     suggestions.append({
                         "id": f"s{sid}",
                         "task_key": key,
                         "type": "transition",
                         "title": f"{title} — 작업 시작",
+                        "subtitle": f"상위 작업 · 시작일 {t_start}",
                         "suggested_text": f"시작일({t_start}) 도래. 작업을 시작합니다.",
+                        "suggested_description": parent_desc,
                         "reason": f"시작일 {t_start} ≤ 오늘 {today.isoformat()}",
                         "confidence": "high",
                         "status": "pending",
@@ -1154,23 +1196,27 @@ def generate_jira_suggestions(
         for commit_subj in unmatched_commits[:3]:
             if len(suggestions) >= max_suggestions:
                 break
-            # Clean commit message: remove conventional commit prefix
-            clean = commit_subj
-            for prefix in ("feat: ", "fix: ", "refactor: ", "test: ", "chore: ", "docs: "):
-                if clean.lower().startswith(prefix):
-                    clean = clean[len(prefix):]
-                    break
-            clean = clean[:60]
-
+            # Strip conventional commit prefix from the title; description gets a
+            # richer template so the two fields show distinct, useful info.
+            clean_full = _strip_cc_prefix(commit_subj)
+            clean_title = clean_full[:60]
             if best_parent:
+                desc = (
+                    f"원본 커밋: {commit_subj}\n"
+                    f"부모: {best_parent['key']} — {best_parent['title']}\n"
+                    f"감지 근거: 기존 스프린트 부작업과 매칭되지 않는 새 영역\n\n"
+                    f"세부 작업:\n- \n\n검증 기준:\n- "
+                )
                 sid += 1
                 suggestions.append({
                     "id": f"s{sid}",
                     "task_key": best_parent["key"],
                     "type": "add_subtask",
                     "title": f"{best_parent['title']} — 하위작업 추가",
-                    "suggested_text": clean,
-                    "reason": f"커밋 \"{commit_subj[:50]}\" 이 기존 태스크에 매칭되지 않음",
+                    "subtitle": f"부모: {best_parent['key']} · 미매칭 커밋 기반",
+                    "suggested_text": clean_title,
+                    "suggested_description": desc,
+                    "reason": f"커밋 \"{clean_full[:50]}\" 이 기존 태스크에 매칭되지 않음",
                     "confidence": "low",
                     "status": "pending",
                 })
@@ -1197,18 +1243,23 @@ def generate_jira_suggestions(
             # If commit has significant words not in any subtask → new area
             new_words = tc_words - existing_sub_words - {"feat", "fix", "chore", "test", "refactor"}
             if len(new_words) >= 2:
-                clean = tc
-                for prefix in ("feat: ", "fix: ", "refactor: ", "test: ", "chore: ", "docs: "):
-                    if clean.lower().startswith(prefix):
-                        clean = clean[len(prefix):]
-                        break
+                clean_full = _strip_cc_prefix(tc)
+                clean_title = clean_full[:60]
+                desc = (
+                    f"원본 커밋: {tc}\n"
+                    f"부모: {tkey} — {ttitle}\n"
+                    f"감지 근거: {tkey} 매칭이지만 기존 부작업이 다루지 않는 영역\n\n"
+                    f"세부 작업:\n- \n\n검증 기준:\n- "
+                )
                 sid += 1
                 suggestions.append({
                     "id": f"s{sid}",
                     "task_key": tkey,
                     "type": "add_subtask",
                     "title": f"{ttitle} — 하위작업 추가",
-                    "suggested_text": clean[:60],
+                    "subtitle": f"부모: {tkey} · 신규 영역 커밋 감지",
+                    "suggested_text": clean_title,
+                    "suggested_description": desc,
                     "reason": f"커밋이 {tkey} 매칭되나 기존 부작업에 없는 영역",
                     "confidence": "medium",
                     "status": "pending",
@@ -2855,7 +2906,14 @@ JIRA_BOARD_SCRIPT = """
     overlay.innerHTML = `
       <div class="jira-modal">
         <h4>${key} - 완료 처리</h4>
-        <textarea id="jira-modal-text" rows="3" placeholder="완료 내용을 간단히 정리하세요..."></textarea>
+        <div class="field-group">
+          <label class="field-label" for="jira-modal-text">댓글 (Comment)</label>
+          <textarea id="jira-modal-text" rows="3" placeholder="완료 보고 댓글을 작성하세요..."></textarea>
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="jira-modal-desc">설명 (Description) — 비워두면 변경 안 함</label>
+          <textarea id="jira-modal-desc" rows="3" placeholder="이슈 설명을 갱신하려면 입력하세요 (선택)"></textarea>
+        </div>
         <div class="modal-actions">
           <button class="jira-btn" onclick="this.closest('.jira-modal-overlay').remove()">취소</button>
           <button class="jira-btn complete" onclick="jiraDoComplete('${key}', this)">종료 요청</button>
@@ -2867,23 +2925,30 @@ JIRA_BOARD_SCRIPT = """
 
   window.jiraDoComplete = function(key, btn) {
     const text = document.getElementById('jira-modal-text').value;
+    const desc = document.getElementById('jira-modal-desc').value;
     if (!text.trim()) { jiraToast('댓글을 입력하세요'); return; }
     btn.disabled = true;
     btn.textContent = '처리 중...';
     fetch(API + '/api/issue/' + key + '/complete', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({comment: text})
+      body: JSON.stringify({comment: text, description: desc})
     }).then(r => r.json()).then(d => {
       btn.closest('.jira-modal-overlay').remove();
       if (d.ok) {
-        jiraToast(key + ' → 종료 요청 완료'); _afterAction();
+        const suffix = desc.trim() ? ' (설명 포함)' : '';
+        jiraToast(key + ' → 종료 요청 완료' + suffix); _afterAction();
         const row = document.querySelector('[data-key="' + key + '"]');
         if (row) {
           const st = row.querySelector('.jira-status');
           if (st) { st.className = 'jira-status done'; st.textContent = 'Done'; }
         }
-      } else { jiraToast('실패: ' + (d.error || 'unknown')); }
+      } else {
+        const reasons = [];
+        if (d.comment_ok === false) reasons.push('완료처리' + (d.comment_error ? ' — ' + d.comment_error : ''));
+        if (d.description_ok === false) reasons.push('설명' + (d.description_error ? ' — ' + d.description_error : ''));
+        jiraToast(key + ' 실패: ' + (reasons.join(' / ') || d.error || 'unknown'));
+      }
     }).catch(e => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py) (localhost:18923)'); });
   };
 
@@ -2892,8 +2957,15 @@ JIRA_BOARD_SCRIPT = """
     overlay.className = 'jira-modal-overlay';
     overlay.innerHTML = `
       <div class="jira-modal">
-        <h4>${key} - 댓글 작성</h4>
-        <textarea id="jira-modal-text" rows="3" placeholder="진행 상황이나 메모를 남기세요..."></textarea>
+        <h4>${key} - 댓글 / 설명</h4>
+        <div class="field-group">
+          <label class="field-label" for="jira-modal-text">댓글 (Comment)</label>
+          <textarea id="jira-modal-text" rows="3" placeholder="진행 상황이나 메모 — 댓글로 추가됩니다"></textarea>
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="jira-modal-desc">설명 (Description) — 비워두면 변경 안 함</label>
+          <textarea id="jira-modal-desc" rows="3" placeholder="이슈 본문 설명을 갱신하려면 입력하세요 (선택)"></textarea>
+        </div>
         <div class="modal-actions">
           <button class="jira-btn" onclick="this.closest('.jira-modal-overlay').remove()">취소</button>
           <button class="jira-btn" onclick="jiraDoComment('${key}', this)">작성</button>
@@ -2905,15 +2977,27 @@ JIRA_BOARD_SCRIPT = """
 
   window.jiraDoComment = function(key, btn) {
     const text = document.getElementById('jira-modal-text').value;
-    if (!text.trim()) { jiraToast('댓글을 입력하세요'); return; }
+    const desc = document.getElementById('jira-modal-desc').value;
+    if (!text.trim() && !desc.trim()) { jiraToast('댓글 또는 설명 중 하나는 입력하세요'); return; }
     btn.disabled = true;
     fetch(API + '/api/issue/' + key + '/comment', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({comment: text})
+      body: JSON.stringify({comment: text, description: desc})
     }).then(r => r.json()).then(d => {
       btn.closest('.jira-modal-overlay').remove();
-      if (d.ok) { jiraToast(key + ' 댓글 작성 완료'); _afterAction(); } else { jiraToast('실패'); }
+      if (d.ok) {
+        const parts = [];
+        if (text.trim()) parts.push('댓글');
+        if (desc.trim()) parts.push('설명');
+        jiraToast(key + ' ' + parts.join('+') + ' 반영 완료');
+        _afterAction();
+      } else {
+        const reasons = [];
+        if (d.comment_ok === false) reasons.push('댓글' + (d.comment_error ? ' — ' + d.comment_error : ''));
+        if (d.description_ok === false) reasons.push('설명' + (d.description_error ? ' — ' + d.description_error : ''));
+        jiraToast(key + ' 실패: ' + (reasons.join(' / ') || 'unknown'));
+      }
     }).catch(() => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
   };
 
@@ -2923,7 +3007,14 @@ JIRA_BOARD_SCRIPT = """
     overlay.innerHTML = `
       <div class="jira-modal">
         <h4>${parentKey} - 부작업 추가</h4>
-        <input id="jira-modal-text" type="text" placeholder="부작업 제목을 입력하세요...">
+        <div class="field-group">
+          <label class="field-label" for="jira-modal-text">제목 (Summary)</label>
+          <input id="jira-modal-text" type="text" placeholder="부작업 제목을 입력하세요...">
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="jira-modal-desc">설명 (Description) — 선택</label>
+          <textarea id="jira-modal-desc" rows="3" placeholder="부작업 본문 설명 (선택)"></textarea>
+        </div>
         <div class="modal-actions">
           <button class="jira-btn" onclick="this.closest('.jira-modal-overlay').remove()">취소</button>
           <button class="jira-btn add" onclick="jiraDoAdd('${parentKey}', this)">생성</button>
@@ -2935,16 +3026,20 @@ JIRA_BOARD_SCRIPT = """
 
   window.jiraDoAdd = function(parentKey, btn) {
     const text = document.getElementById('jira-modal-text').value;
+    const desc = document.getElementById('jira-modal-desc').value;
     if (!text.trim()) { jiraToast('제목을 입력하세요'); return; }
     btn.disabled = true;
     fetch(API + '/api/issue/create', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({parent_key: parentKey, summary: text})
+      body: JSON.stringify({parent_key: parentKey, summary: text, description: desc})
     }).then(r => r.json()).then(d => {
       btn.closest('.jira-modal-overlay').remove();
-      if (d.ok) { jiraToast(d.key + ' 생성 완료 (' + parentKey + ' 하위)'); _afterAction(); }
-      else { jiraToast('실패: ' + (d.error || 'unknown')); }
+      if (d.ok) {
+        const suffix = desc.trim() ? ' (설명 포함)' : '';
+        jiraToast(d.key + ' 생성 완료 (' + parentKey + ' 하위)' + suffix);
+        _afterAction();
+      } else { jiraToast('실패: ' + (d.error || 'unknown')); }
     }).catch(() => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
   };
 
@@ -3076,22 +3171,39 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
         key = escape(s.get("task_key", ""))
         stype = s.get("type", "comment")
         title = escape(s.get("title", ""))
+        subtitle = escape(s.get("subtitle", ""))
         text = escape(s.get("suggested_text", ""))
+        desc_text = escape(s.get("suggested_description", ""))
         reason = escape(s.get("reason", ""))
         conf = s.get("confidence", "medium")
         icon_label = type_icons.get(stype, "Action")
         collapsed = ' suggestion-collapsed' if conf == "low" else ""
+        # add_subtask 타입은 댓글 필드를 "부작업 제목"으로 사용 → 설명 필드도 본문 description으로 매핑됨
+        comment_label = "부작업 제목" if stype == "add_subtask" else "댓글 (Comment)"
+        desc_label = "부작업 본문 (Description)" if stype == "add_subtask" else "설명 (Description)"
+        desc_hint = "" if stype == "add_subtask" else '<span class="hint">— 비워두면 변경 안 함</span>'
+        subtitle_html = f'<div class="suggestion-subtitle">{subtitle}</div>' if subtitle else ""
 
         rows.append(f'''<div class="jira-suggestion{collapsed}" data-sid="{sid}" data-key="{key}" data-type="{stype}">
   <div class="suggestion-head">
     <span class="jira-key">{key}</span>
     <span class="suggestion-type {stype}">{icon_label}</span>
     <span class="confidence {conf}">{conf}</span>
-    <span style="flex:1"></span>
-    <strong style="font-size:13px">{title}</strong>
+    <span class="suggestion-spacer"></span>
+    <strong class="suggestion-title">{title}</strong>
   </div>
+  {subtitle_html}
   <div class="suggestion-reason">{reason}</div>
-  <textarea class="suggestion-text" id="text-{sid}">{text}</textarea>
+  <div class="suggestion-fields">
+    <div>
+      <label class="suggestion-field-label" for="text-{sid}">{comment_label}</label>
+      <textarea class="suggestion-text" id="text-{sid}">{text}</textarea>
+    </div>
+    <div>
+      <label class="suggestion-field-label" for="desc-{sid}">{desc_label}{desc_hint}</label>
+      <textarea class="suggestion-description" id="desc-{sid}">{desc_text}</textarea>
+    </div>
+  </div>
   <div class="suggestion-actions">
     <button class="jira-btn approve" onclick="suggApprove('{sid}')">승인</button>
     <button class="jira-btn reject" onclick="suggReject('{sid}')">거절</button>
@@ -3121,6 +3233,125 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
 '''
 
 
+REGENERATE_BAR_HTML = """
+<div class="regen-bar" id="regen-bar">
+  <span class="regen-label">리포트 재생성</span>
+  <span class="regen-help">멀티 프로젝트 리포트(대시보드/제안/Jira 상태)를 새로 만듭니다. 평소 5–15분 정도 걸려요.</span>
+  <button class="regen-btn" id="regen-btn" onclick="regenStart()">재생성 시작</button>
+  <div class="regen-progress" id="regen-progress"><div class="regen-progress-fill"></div></div>
+  <div class="regen-status" id="regen-status"></div>
+</div>
+"""
+
+REGENERATE_SCRIPT = """
+<script>
+(function() {
+  const API = 'http://localhost:18923';
+  const POLL_MS = 4000;
+  // Track which finished-run we have already shown toast/reload for, keyed by
+  // started_at — without this, a completed lock file makes every page open
+  // toast + reload in an infinite cycle.
+  const SEEN_KEY = 'regen-seen-started-at';
+  let pollTimer = null;
+
+  function fmtElapsed(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return m > 0 ? `${m}분 ${r}초` : `${r}초`;
+  }
+
+  function setUi(state) {
+    const btn = document.getElementById('regen-btn');
+    const bar = document.getElementById('regen-progress');
+    const status = document.getElementById('regen-status');
+    if (!btn || !bar || !status) return;
+    if (state.running) {
+      btn.disabled = true;
+      btn.textContent = '생성 중…';
+      bar.classList.add('active');
+      status.textContent = `진행 중 · 경과 ${fmtElapsed(state.elapsed_s)} · pid ${state.pid || '?'}`;
+    } else {
+      btn.disabled = false;
+      btn.textContent = '재생성 시작';
+      bar.classList.remove('active');
+      const seenAt = localStorage.getItem(SEEN_KEY);
+      const thisRun = String(state.started_at || '');
+      // Only show finished status for runs the user actually initiated this
+      // session (or hasn't yet acknowledged). Older completed runs render blank.
+      if (thisRun && thisRun === seenAt && state.exit_code !== undefined && state.exit_code !== null) {
+        const ok = state.exit_code === 0;
+        status.textContent = (ok ? '✓ 완료' : '✗ 실패') +
+          ` · 소요 ${fmtElapsed(state.elapsed_s)} · exit ${state.exit_code}`;
+      } else {
+        status.textContent = '';
+      }
+    }
+  }
+
+  function poll() {
+    fetch(API + '/api/regenerate/status')
+      .then(r => r.json())
+      .then(state => {
+        setUi(state);
+        if (state.running) {
+          pollTimer = setTimeout(poll, POLL_MS);
+          return;
+        }
+        if (state.exit_code === undefined || state.exit_code === null) return;
+        // Has the user already seen this finished run? Only act once.
+        const seenAt = localStorage.getItem(SEEN_KEY);
+        const thisRun = String(state.started_at || '');
+        if (!thisRun || thisRun === seenAt) return;
+        // First sighting of completion → ack, toast, reload
+        localStorage.setItem(SEEN_KEY, thisRun);
+        if (typeof jiraToast === 'function') {
+          jiraToast(state.exit_code === 0 ? '리포트 재생성 완료 — 새 데이터 불러오는 중' : '재생성 실패: exit ' + state.exit_code);
+        }
+        // Re-render now that SEEN_KEY matches, so status shows the result
+        setUi(state);
+        if (state.exit_code === 0) {
+          setTimeout(() => location.reload(), 1500);
+        }
+      })
+      .catch(() => {
+        const status = document.getElementById('regen-status');
+        if (status) status.textContent = '프록시 연결 실패 — python scripts/jira_proxy.py';
+      });
+  }
+
+  window.regenStart = function() {
+    const btn = document.getElementById('regen-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '시작 중…'; }
+    fetch(API + '/api/regenerate', {method: 'POST'})
+      .then(r => r.json().then(d => ({status: r.status, body: d})))
+      .then(({status, body}) => {
+        if (status === 200 && body.ok) {
+          if (typeof jiraToast === 'function') jiraToast('리포트 재생성 시작');
+          // Clear seen-marker so when this run completes we'll show its result
+          localStorage.removeItem(SEEN_KEY);
+          setUi(body.state);
+          if (pollTimer) clearTimeout(pollTimer);
+          pollTimer = setTimeout(poll, POLL_MS);
+        } else {
+          const msg = (body && body.error) || '시작 실패';
+          if (typeof jiraToast === 'function') jiraToast(msg);
+          if (body && body.state) setUi(body.state); else setUi({running: false});
+        }
+      })
+      .catch(() => {
+        if (typeof jiraToast === 'function') jiraToast('프록시 미실행 — python scripts/jira_proxy.py');
+        setUi({running: false});
+      });
+  };
+
+  // On load, check whether a job is already running (e.g. user reopened the page)
+  poll();
+})();
+</script>
+"""
+
+
 JIRA_SUGGESTIONS_SCRIPT = """
 <script>
 (function() {
@@ -3132,24 +3363,47 @@ JIRA_SUGGESTIONS_SCRIPT = """
     const key = card.dataset.key;
     const type = card.dataset.type;
     const text = document.getElementById('text-' + sid).value;
+    const descEl = document.getElementById('desc-' + sid);
+    const desc = descEl ? descEl.value : '';
+    if (type === 'add_subtask' && !text.trim()) {
+      jiraToast(key + ' 부작업 제목이 비어 있습니다');
+      return;
+    }
+    if (!text.trim() && !desc.trim()) {
+      jiraToast(key + ' 댓글 또는 설명을 입력하세요');
+      return;
+    }
     const btn = card.querySelector('.approve');
     btn.disabled = true;
     btn.textContent = '처리 중...';
 
+    const actionLabel = {comment:'댓글', complete:'완료처리', transition:'상태전환', add_subtask:'부작업'}[type] || '액션';
+
     fetch(API + '/api/suggestions/' + sid + '/approve', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({task_key: key, type: type, text: text})
+      body: JSON.stringify({task_key: key, type: type, text: text, comment: text, description: desc})
     }).then(r => r.json()).then(d => {
       if (d.ok) {
         card.classList.add('applied');
         btn.textContent = '완료';
-        jiraToast(key + ' 제안 승인 완료'); _afterAction();
+        const parts = [];
+        if (text.trim()) parts.push(actionLabel);
+        if (desc.trim()) parts.push('설명');
+        jiraToast(key + ' 승인 완료 (' + (parts.join('+') || '액션') + ')');
+        _afterAction();
       } else {
         btn.textContent = '실패';
-        jiraToast('실패: ' + (d.error || 'unknown'));
+        const reasons = [];
+        if (d.comment_ok === false) {
+          reasons.push(actionLabel + (d.comment_error ? ' — ' + d.comment_error : ''));
+        }
+        if (d.description_ok === false) {
+          reasons.push('설명' + (d.description_error ? ' — ' + d.description_error : ''));
+        }
+        jiraToast(key + ' 실패: ' + (reasons.join(' / ') || d.error || 'unknown'));
       }
-    }).catch(() => { btn.textContent = '연결 실패'; jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
+    }).catch(() => { btn.textContent = '연결 실패'; jiraToast(key + ' 프록시 서버 미실행'); });
   };
 
   window.suggReject = function(sid) {
@@ -3199,16 +3453,32 @@ JIRA_SUGGESTIONS_SCRIPT = """
           card.dataset.sid = s.id;
           card.dataset.key = s.task_key;
           card.dataset.type = s.type;
+          const isSub = s.type === 'add_subtask';
+          const commentLabel = isSub ? '부작업 제목' : '댓글 (Comment)';
+          const descLabel = isSub ? '부작업 본문 (Description)' : '설명 (Description)';
+          const descHint = isSub ? '' : '<span class="hint">— 비워두면 변경 안 함</span>';
+          const descText = s.suggested_description || '';
+          const subtitleHtml = s.subtitle ? `<div class="suggestion-subtitle">${s.subtitle}</div>` : '';
           card.innerHTML = `
             <div class="suggestion-head">
               <span class="jira-key">${s.task_key}</span>
               <span class="suggestion-type ${s.type}">${typeIcons[s.type]||'Action'}</span>
               <span class="confidence ${s.confidence}">${s.confidence}</span>
-              <span style="flex:1"></span>
-              <strong style="font-size:13px">${s.title}</strong>
+              <span class="suggestion-spacer"></span>
+              <strong class="suggestion-title">${s.title}</strong>
             </div>
+            ${subtitleHtml}
             <div class="suggestion-reason">${s.reason}</div>
-            <textarea class="suggestion-text" id="text-${s.id}">${s.suggested_text}</textarea>
+            <div class="suggestion-fields">
+              <div>
+                <label class="suggestion-field-label" for="text-${s.id}">${commentLabel}</label>
+                <textarea class="suggestion-text" id="text-${s.id}">${s.suggested_text||''}</textarea>
+              </div>
+              <div>
+                <label class="suggestion-field-label" for="desc-${s.id}">${descLabel}${descHint}</label>
+                <textarea class="suggestion-description" id="desc-${s.id}">${descText}</textarea>
+              </div>
+            </div>
             <div class="suggestion-actions">
               <button class="jira-btn approve" onclick="suggApprove('${s.id}')">승인</button>
               <button class="jira-btn reject" onclick="suggReject('${s.id}')">거절</button>
@@ -3443,11 +3713,13 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]], project_conf
         </div>
       </div>
     </header>
+    {REGENERATE_BAR_HTML}
     {jira_boards_html}
     {"".join(card_html)}
   </div>
 {JIRA_BOARD_SCRIPT if jira_boards_html else ""}
 {JIRA_SUGGESTIONS_SCRIPT if suggestions_html else ""}
+{REGENERATE_SCRIPT}
 <script>
 (function() {{
   const btn = document.getElementById('theme-toggle');

@@ -16,6 +16,7 @@ WORKSPACE_ROOT = SCRIPT_DIR.parent
 
 sys.path.insert(0, str(WORKSPACE_ROOT))
 from scripts.design_system import DESIGN_CSS, CHECKLIST_JS
+from scripts.generate_periodic_reports import REGENERATE_BAR_HTML, REGENERATE_SCRIPT
 
 
 def parse_args() -> argparse.Namespace:
@@ -408,6 +409,7 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
       <p>{escape(run_date)} portfolio summary for configured repositories.</p>
       {f'<div class="hero-links"><a href="{escape(history_link)}">Open History Dashboard</a></div>' if history_link else ''}
     </section>
+    {REGENERATE_BAR_HTML}
     {jira_html}
     <h2 class="section-title">Portfolio Task Boards</h2>
     <p class="section-copy">Use each parent task as the Jira task draft, then create the listed subtasks and close them against the shown completion criteria.</p>
@@ -421,6 +423,7 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
   </div>
 {CHECKLIST_JS}
 {jira_scripts}
+{REGENERATE_SCRIPT}
 <script>
 (function() {{
   const btn = document.getElementById('theme-toggle');
