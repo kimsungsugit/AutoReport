@@ -899,6 +899,8 @@ def generate_jira_suggestions(
 
     # Build commit evidence — use sprint-wide commits, not just daily
     all_commits = [c.get("subject", "") for c in (payload.get("recent_commits") or [])]
+    # subject → body mapping for richer add_subtask descriptions
+    commit_bodies: dict[str, str] = {}
     # Extend with git log from sprint period if available
     try:
         repo_root = Path(payload.get("repo_root", ""))
@@ -907,12 +909,24 @@ def generate_jira_suggestions(
             sprint_start = sprint_tasks[0].get("start", "") if sprint_tasks else ""
             if sprint_start:
                 result = subprocess.run(
-                    ["git", "log", f"--since={sprint_start}", "--format=%s", "-50"],
+                    ["git", "log", f"--since={sprint_start}", "--format=%s\x1f%b\x1e", "-50"],
                     cwd=str(repo_root), capture_output=True, text=True, timeout=5,
                     encoding="utf-8", errors="replace",
                 )
                 if result.returncode == 0:
-                    git_commits = [l.strip() for l in result.stdout.splitlines() if l.strip()]
+                    git_commits: list[str] = []
+                    for chunk in result.stdout.split("\x1e"):
+                        chunk = chunk.strip()
+                        if not chunk:
+                            continue
+                        parts = chunk.split("\x1f", 1)
+                        subj = parts[0].strip()
+                        if not subj:
+                            continue
+                        git_commits.append(subj)
+                        body = parts[1].strip() if len(parts) >= 2 else ""
+                        if body and subj not in commit_bodies:
+                            commit_bodies[subj] = body
                     all_commits = list(dict.fromkeys(git_commits + all_commits))  # dedupe
     except Exception:
         pass
@@ -945,6 +959,63 @@ def generate_jira_suggestions(
                         return m[colon + 1:].lstrip()
                 return m[len(p):].lstrip()
         return m
+
+    # Trailer prefixes — strict colon/# matching to avoid false-positive cuts
+    # when a body line happens to start with a similar word.
+    _BODY_TRAILER_PREFIXES = (
+        # Standard git trailers (must end with colon)
+        "co-authored-by:", "signed-off-by:", "reviewed-by:", "acked-by:",
+        "tested-by:", "reported-by:",
+        # Issue closing patterns (with # or colon)
+        "closes #", "closes:", "fixes #", "fixes:", "resolves #", "resolves:",
+        "refs:", "ref:",
+        # Korean section markers that follow the main body — strict colon
+        "검증:", "검증 결과:", "검증 영향:", "검증 안 한 사항:",
+        "발견 출처:", "다음 단계:", "미해결:",
+        "남은 작업:", "남은 logic:", "남은 type:",
+    )
+
+    def _format_body_for_desc(body: str, *, max_lines: int = 8, max_chars: int = 700) -> str:
+        """Build a Jira subtask description from a commit body.
+
+        Preserves headers + dash bullets (not just bullets) so context isn't lost.
+        Normalizes '*'/'•' bullet markers to '-'.
+        Stops at the first trailer line (git trailers + common section markers).
+        Clips by whole lines so the last line never breaks mid-word.
+        """
+        if not body:
+            return ""
+        kept: list[str] = []
+        for raw in body.splitlines():
+            s = raw.rstrip()
+            sl = s.lstrip().lower()
+            if any(sl.startswith(p) for p in _BODY_TRAILER_PREFIXES):
+                break
+            if not s.strip() and not kept:
+                continue  # leading blank lines
+            kept.append(s)
+            if len(kept) >= max_lines + 4:  # over-collect so we can trim trailing blanks
+                break
+        while kept and not kept[-1].strip():
+            kept.pop()
+        if not kept:
+            return ""
+        normalized: list[str] = []
+        for s in kept[:max_lines]:
+            stripped = s.lstrip()
+            if stripped.startswith(("* ", "• ")):
+                indent = s[: len(s) - len(stripped)]
+                normalized.append(indent + "- " + stripped[2:])
+            else:
+                normalized.append(s)
+        out: list[str] = []
+        total = 0
+        for s in normalized:
+            if total + len(s) + 1 > max_chars and out:
+                break
+            out.append(s)
+            total += len(s) + 1
+        return "\n".join(out)
 
     def _is_noise_commit(subj: str) -> bool:
         sl = subj.lower().strip()
@@ -1201,12 +1272,8 @@ def generate_jira_suggestions(
             clean_full = _strip_cc_prefix(commit_subj)
             clean_title = clean_full[:60]
             if best_parent:
-                desc = (
-                    f"원본 커밋: {commit_subj}\n"
-                    f"부모: {best_parent['key']} — {best_parent['title']}\n"
-                    f"감지 근거: 기존 스프린트 부작업과 매칭되지 않는 새 영역\n\n"
-                    f"세부 작업:\n- \n\n검증 기준:\n- "
-                )
+                body_desc = _format_body_for_desc(commit_bodies.get(commit_subj, ""))
+                desc = body_desc if body_desc else f"- {clean_full}"
                 sid += 1
                 suggestions.append({
                     "id": f"s{sid}",
@@ -1245,12 +1312,8 @@ def generate_jira_suggestions(
             if len(new_words) >= 2:
                 clean_full = _strip_cc_prefix(tc)
                 clean_title = clean_full[:60]
-                desc = (
-                    f"원본 커밋: {tc}\n"
-                    f"부모: {tkey} — {ttitle}\n"
-                    f"감지 근거: {tkey} 매칭이지만 기존 부작업이 다루지 않는 영역\n\n"
-                    f"세부 작업:\n- \n\n검증 기준:\n- "
-                )
+                body_desc = _format_body_for_desc(commit_bodies.get(tc, ""))
+                desc = body_desc if body_desc else f"- {clean_full}"
                 sid += 1
                 suggestions.append({
                     "id": f"s{sid}",

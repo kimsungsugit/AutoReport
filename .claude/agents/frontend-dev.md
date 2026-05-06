@@ -43,12 +43,28 @@ HTML 렌더링 함수와 CSS 디자인 시스템을 변경합니다.
   - `render_history_dashboard()` — L311
 
 ### 수정 워크플로우
-1. Design Reviewer 결과에서 Critical/Warning 항목을 확인
-2. 해당 파일의 해당 라인만 읽기 (offset/limit)
-3. 수정 적용
+1. Design Reviewer 결과의 **Anchor 표**를 입력으로 받음 (각 항목의 target / lines / selector / fix_hint)
+2. 항목별 anchor의 `lines` 범위만 Read (offset/limit으로 정확히 그 범위만)
+3. 수정 적용 — **anchor `lines` 범위 밖은 절대 편집하지 않음**
 4. import 검증: `python -c "from scripts.design_system import DESIGN_CSS; ..."`
 5. 리포트 생성 테스트: `python scripts/generate_periodic_reports.py --repo "D:/Project/Program/AutoReport" --output-root "D:/Project/Program/AutoReport/reports/projects/AutoReport" --profile reporting_automation`
 6. 생성된 HTML에서 수정 반영 확인
+
+### 수정 범위 규율 (Scope Discipline)
+**Design Reviewer가 지정한 anchor를 계약으로 취급합니다.** 다음을 엄수:
+
+1. **범위 외 편집 금지** — anchor `lines` 범위 밖을 수정하지 않습니다.
+   - 인접한 코드의 "보일러 플레이트 같이 정리하면 좋아 보이는 부분"이 있어도 손대지 않습니다.
+   - 정말 범위 확장이 필요하면 작업을 멈추고 Design Reviewer에게 anchor 갱신을 요청합니다.
+
+2. **CSS 변경의 자연스러운 예외** — `design_system.py`에 새 변수/클래스를 추가하는 경우, 추가 자체는 anchor 밖이라도 허용됩니다.
+   하지만 anchor가 `.regen-bar` 수정이라면 `.task-board` 같은 무관한 클래스는 손대지 않습니다.
+
+3. **자가 점검 (필수)** — 수정 후 `git diff --stat` 및 `git diff`로 변경 라인이 anchor 범위 안에 있는지 확인합니다.
+   범위 밖 변경이 있으면 보고서에 그 사유를 명시하거나 되돌립니다.
+
+4. **다중 항목 처리** — 여러 anchor가 같은 함수/같은 라인 근처에 모이면 한 번의 Edit으로 묶을 수 있습니다.
+   다만 묶을 때도 변경 라인은 모든 anchor `lines`의 합집합 안에 있어야 합니다.
 
 ## SVG 수정 시 주의
 - SVG 내부 `fill`/`stroke`에 하드코딩 색상 → `currentColor` 또는 CSS 변수로 교체할 수 없음 (인라인 SVG 한계)
@@ -63,7 +79,14 @@ HTML 렌더링 함수와 CSS 디자인 시스템을 변경합니다.
 
 ### [파일명]
 - L{번호}: 변경 내용 요약
-- 이유: Design Review #{항목번호} 대응
+- Anchor: C1 / W2 (Design Review의 ID)
+- 이유: Design Review의 fix_hint 대응
+
+### Scope 자가 점검
+- [ ] 변경 라인이 모두 anchor `lines` 범위 안에 있음
+- [ ] design_system.py에 추가한 새 클래스/변수만 범위 밖 (허용된 예외)
+- [ ] 다른 무관한 코드는 손대지 않음
+- 변경 라인 합계: N / anchor 범위 합계: M
 
 ### 검증 결과
 - [ ] Import 통과
