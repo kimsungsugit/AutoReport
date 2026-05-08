@@ -987,8 +987,14 @@ code {
 .jira-task.subtask { padding-left: 48px; }
 .jira-key { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--accent); white-space: nowrap; }
 .jira-summary { font-size: 14px; line-height: 1.4; }
-.jira-date { font-size: 11px; color: var(--muted); white-space: nowrap; font-family: var(--mono); }
+.jira-date { font-size: 11px; color: var(--muted); white-space: nowrap; font-family: var(--mono); cursor: pointer; padding: 2px 6px; border-radius: 4px; transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
+.jira-date:hover:not(.editing) { background: var(--paper-alt); color: var(--accent); }
 .jira-date.overdue { color: var(--err-ink); font-weight: 700; }
+.jira-date.editing { display: inline-flex; gap: 6px; align-items: center; cursor: default; padding: 0; background: transparent; }
+.jira-date-input { font-family: var(--mono); font-size: 11px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); color: var(--ink); }
+.jira-date-input:focus { outline: none; border-color: var(--accent); }
+.jira-date-dash { color: var(--muted); font-size: 11px; }
+.jira-btn.jira-date-save, .jira-btn.jira-date-cancel { padding: 3px 8px; font-size: 11px; }
 .jira-task-actions { display: flex; gap: 6px; align-items: center; }
 .jira-btn { display: inline-flex; align-items: center; gap: 4px; padding: 5px 10px; border-radius: var(--r-pill); border: 1px solid var(--line); background: var(--paper); font-size: 11px; font-weight: 700; cursor: pointer; transition: all var(--dur-fast) var(--ease); color: var(--ink); }
 .jira-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
@@ -1019,6 +1025,8 @@ code {
 .regen-bar .regen-btn { padding: 8px 16px; border: 1px solid var(--accent); border-radius: var(--r-md); background: var(--accent); color: #fff; font-size: 13px; font-weight: 700; cursor: pointer; transition: all var(--dur-fast) var(--ease); }
 .regen-bar .regen-btn:hover:not(:disabled) { filter: brightness(1.1); }
 .regen-bar .regen-btn:disabled { opacity: .55; cursor: not-allowed; }
+.regen-bar .regen-btn.ghost { background: transparent; color: var(--accent); }
+.regen-bar .regen-btn.ghost:hover:not(:disabled) { background: var(--accent); color: #fff; filter: none; }
 .regen-progress { width: 100%; height: 6px; background: var(--line); border-radius: var(--r-pill); overflow: hidden; margin-top: 8px; display: none; }
 .regen-progress.active { display: block; }
 .regen-progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); width: 30%; animation: regenSlide 1.6s ease-in-out infinite; }
@@ -1054,6 +1062,9 @@ code {
 .suggestion-field-label { display: block; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
 .suggestion-field-label .hint { color: var(--muted); font-weight: 500; text-transform: none; letter-spacing: 0; margin-left: 4px; opacity: .8; }
 .suggestion-description { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; resize: vertical; min-height: 56px; box-sizing: border-box; background: var(--paper); color: var(--ink); }
+.suggestion-dates { margin-top: 8px; }
+.suggestion-date-row { display: flex; gap: 8px; align-items: center; }
+.suggestion-date-row .jira-date-input { flex: 0 0 auto; }
 .suggestion-actions { display: flex; gap: 6px; margin-top: 8px; }
 .suggestion-actions .jira-btn.approve { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-bg); }
 .suggestion-actions .jira-btn.approve:hover { background: var(--ok); color: #fff; }

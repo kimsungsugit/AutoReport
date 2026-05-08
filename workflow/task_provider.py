@@ -49,6 +49,10 @@ class TaskProvider(ABC):
         """Replace the description (설명) of an issue. Returns True on success."""
         return False
 
+    def update_dates(self, issue_key: str, start: str, end: str) -> bool:
+        """Set Start/End date custom fields. Empty string clears. Returns True on success."""
+        return False
+
 
 class JsonFileTaskProvider(TaskProvider):
     """Reads/writes sprint tasks from a local JSON file."""
@@ -239,28 +243,55 @@ class JiraApiTaskProvider(TaskProvider):
             self.last_error = str(e)
             return False
 
-    def _fetch_descriptions(self, issue_keys: list[str]) -> dict[str, str]:
-        """Batch-fetch description bodies for the given issue keys.
+    def _fetch_extra(self, issue_keys: list[str]) -> dict[str, dict[str, str]]:
+        """Batch-fetch description + start/end dates for the given issue keys.
 
-        The Jira agile sprint endpoint returns subtasks without their descriptions,
-        so we issue one JQL search to fill them in. Returns {key: description}.
+        The Jira agile sprint endpoint returns subtasks without their descriptions
+        or custom date fields, so one JQL search fills them in. Returns
+        {key: {"description": str, "start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}}.
+        Missing fields default to empty string.
         """
         if not issue_keys:
             return {}
-        # Jira JQL has URL length limits, chunk the keys
-        descs: dict[str, str] = {}
+        # Jira JQL has URL length limits, chunk the keys.
+        out: dict[str, dict[str, str]] = {}
         chunk = 50
         for i in range(0, len(issue_keys), chunk):
             keys_csv = ",".join(issue_keys[i:i + chunk])
             try:
                 data = self._request("GET",
                     f"/rest/api/2/search?jql=key+in+({keys_csv})"
-                    f"&fields=description&maxResults={chunk}")
+                    f"&fields=description,customfield_10230,customfield_10900"
+                    f"&maxResults={chunk}")
                 for issue in data.get("issues", []):
-                    descs[issue["key"]] = issue.get("fields", {}).get("description") or ""
+                    f = issue.get("fields", {})
+                    out[issue["key"]] = {
+                        "description": f.get("description") or "",
+                        "start": str(f.get("customfield_10230") or "")[:10],
+                        "end": str(f.get("customfield_10900") or "")[:10],
+                    }
             except Exception:
                 pass
-        return descs
+        return out
+
+    def update_dates(self, issue_key: str, start: str, end: str) -> bool:
+        """Set the Start/End date custom fields on an issue.
+
+        Empty string clears the field (sends null to Jira). YYYY-MM-DD strings
+        are passed through verbatim — Jira stores them as ISO dates.
+        """
+        self.last_error = ""
+        try:
+            self._request("PUT", f"/rest/api/2/issue/{issue_key}", {
+                "fields": {
+                    "customfield_10230": (start or None),
+                    "customfield_10900": (end or None),
+                },
+            })
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            return False
 
     def _convert_jira_response(self, data: dict, sprint_info: dict | None = None) -> dict[str, Any]:
         """Convert Jira REST API response to sprint_tasks.json format."""
@@ -276,7 +307,7 @@ class JiraApiTaskProvider(TaskProvider):
             for st in f.get("subtasks", []):
                 if st.get("key"):
                     all_keys.append(st["key"])
-        descs = self._fetch_descriptions(all_keys)
+        extras = self._fetch_extra(all_keys)
 
         for issue in data.get("issues", []):
             key = issue["key"]
@@ -292,20 +323,22 @@ class JiraApiTaskProvider(TaskProvider):
             tasks.append({
                 "key": key,
                 "title": fields.get("summary", ""),
-                "description": descs.get(key, ""),
+                "description": extras.get(key, {}).get("description", ""),
                 "status": status_map.get(status_name, "pending"),
                 "start": str(fields.get("customfield_10230", "") or "")[:10],
                 "end": str(fields.get("customfield_10900", "") or "")[:10],
                 "subtasks": [
                     {
                         "title": st["fields"]["summary"],
-                        "description": descs.get(st.get("key", ""), ""),
+                        "description": extras.get(st.get("key", ""), {}).get("description", ""),
                         "status": (
                             "done" if st["fields"]["status"]["name"] in ("완료", "종료 요청")
                             else "in_progress" if st["fields"]["status"]["name"] == "진행 중"
                             else "pending"
                         ),
                         "key": st.get("key", ""),
+                        "start": extras.get(st.get("key", ""), {}).get("start", ""),
+                        "end": extras.get(st.get("key", ""), {}).get("end", ""),
                     }
                     for st in fields.get("subtasks", [])
                 ],

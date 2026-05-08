@@ -221,6 +221,19 @@ def _last_error() -> str:
     return getattr(provider, "last_error", "") or ""
 
 
+def _is_valid_date(s: str) -> bool:
+    """True if `s` is empty (means clear/skip) or a YYYY-MM-DD ISO date."""
+    if not s:
+        return True
+    if len(s) != 10 or s[4] != "-" or s[7] != "-":
+        return False
+    try:
+        date.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
 def _json_response(handler: BaseHTTPRequestHandler, data: dict, status: int = 200):
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
@@ -263,6 +276,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if sprint_id and hasattr(p, "sprint_id"):
                 p.sprint_id = sprint_id
             tasks = p.get_tasks()
+            # Attach a freshly-rendered Gantt SVG so the client can replace the
+            # chart in-place after task dates change. Lazy import keeps boot light.
+            try:
+                from scripts.generate_periodic_reports import svg_sprint_gantt
+                sprint = tasks.get("sprint", {}) if isinstance(tasks, dict) else {}
+                tasks["gantt_html"] = svg_sprint_gantt(tasks.get("tasks", []), sprint)
+            except Exception:
+                tasks["gantt_html"] = ""
             _json_response(self, tasks)
 
         elif parsed.path == "/api/regenerate/status":
@@ -353,6 +374,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _json_response(self, {"ok": ok_desc and ok_complete,
                                   "comment_ok": ok_complete, "description_ok": ok_desc,
                                   "comment_error": err_complete, "description_error": err_desc})
+
+        # POST /api/issue/{key}/dates  (body: start, end — both YYYY-MM-DD or empty to clear)
+        elif path.startswith("/api/issue/") and path.endswith("/dates"):
+            key = path.split("/")[3]
+            start = (body.get("start") or "").strip()
+            end = (body.get("end") or "").strip()
+            if not _is_valid_date(start) or not _is_valid_date(end):
+                _json_response(self, {"ok": False, "error": "날짜 형식은 YYYY-MM-DD 여야 합니다"}, 400)
+                return
+            if start and end and start > end:
+                _json_response(self, {"ok": False, "error": "시작일이 종료일보다 늦을 수 없습니다"}, 400)
+                return
+            ok = provider.update_dates(key, start, end)
+            err = _last_error() if not ok else ""
+            _json_response(self, {"ok": ok, "key": key, "start": start, "end": end, "error": err})
 
         # POST /api/issue/{key}/transition
         elif path.startswith("/api/issue/") and path.endswith("/transition"):
@@ -447,6 +483,48 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                     if description:
                         sub_fields["description"] = description
+                    # Inherit required custom fields from parent so Jira does not 400.
+                    # 사내 Jira 필수: customfield_10230(Start date), customfield_10900(End date),
+                    # customfield_11100(주간보고 사항). 부모에 값이 있으면 그대로 상속한다.
+                    try:
+                        required_cfs = ("customfield_10230", "customfield_10900", "customfield_11100")
+                        parent = provider._request(
+                            "GET",
+                            f"/rest/api/2/issue/{task_key}?fields={','.join(required_cfs)}",
+                        )
+                        pfields = (parent or {}).get("fields", {}) or {}
+                        for cf in required_cfs:
+                            val = pfields.get(cf)
+                            if val is None:
+                                continue
+                            # Select-list options come back as {id, value, self, ...} —
+                            # only id is needed (and accepted) for a write payload.
+                            if isinstance(val, dict) and "id" in val:
+                                sub_fields[cf] = {"id": val["id"]}
+                            elif isinstance(val, list):
+                                sub_fields[cf] = [
+                                    {"id": v["id"]} if isinstance(v, dict) and "id" in v else v
+                                    for v in val
+                                ]
+                            else:
+                                sub_fields[cf] = val
+                    except Exception:
+                        # If we cannot fetch the parent, fall through and let Jira's
+                        # own 400 surface the missing-field message to the caller.
+                        pass
+                    # User-supplied start/end take precedence over parent inheritance.
+                    # Validated YYYY-MM-DD strings are stored verbatim; empty values
+                    # leave whatever the parent inheritance set above untouched.
+                    user_start = (body.get("start") or "").strip()
+                    user_end = (body.get("end") or "").strip()
+                    if not _is_valid_date(user_start) or not _is_valid_date(user_end):
+                        raise ValueError("날짜 형식은 YYYY-MM-DD 여야 합니다")
+                    if user_start and user_end and user_start > user_end:
+                        raise ValueError("시작일이 종료일보다 늦을 수 없습니다")
+                    if user_start:
+                        sub_fields["customfield_10230"] = user_start
+                    if user_end:
+                        sub_fields["customfield_10900"] = user_end
                     provider._request("POST", "/rest/api/2/issue", {"fields": sub_fields})
                     ok_action = True
                 except Exception as e:
@@ -477,6 +555,69 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         break
                 _save_suggestions(fpath, data)
             _json_response(self, {"ok": True})
+
+        # POST /api/proxy/restart
+        # Spawn a detached child first (so the response can report success/failure
+        # honestly), reply, then close the listening socket and exit self. The new
+        # process re-binds the same port via _ReusableHTTPServer.allow_reuse_address.
+        # The browser polls /api/regenerate/status afterwards to confirm liveness.
+        elif path == "/api/proxy/restart":
+            child_pid: int | None = None
+            spawn_err = ""
+            try:
+                flags = 0
+                if sys.platform == "win32":
+                    DETACHED_PROCESS = 0x00000008
+                    CREATE_NEW_PROCESS_GROUP = 0x00000200
+                    flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+                # Redirect child stdout/stderr so its startup banner & errors are
+                # not silently dropped — useful when spawn appears to "succeed"
+                # but the child crashes immediately on bind.
+                log_path = REPO_ROOT / "reports" / ".proxy.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_fp = open(log_path, "ab", buffering=0)
+                try:
+                    proc = subprocess.Popen(
+                        # -u: unbuffered stdout/stderr so the child's startup
+                        # banner reaches .proxy.log immediately rather than
+                        # sitting in Python's block buffer.
+                        [sys.executable, "-u", str(Path(__file__).resolve())],
+                        cwd=str(REPO_ROOT),
+                        creationflags=flags,
+                        stdin=subprocess.DEVNULL,
+                        stdout=log_fp,
+                        stderr=log_fp,
+                        close_fds=True,
+                    )
+                    child_pid = proc.pid
+                finally:
+                    # Parent does not need the log fd — child inherited its own copy.
+                    try: log_fp.close()
+                    except Exception: pass
+            except Exception as e:
+                spawn_err = str(e)
+            _json_response(self, {
+                "ok": child_pid is not None,
+                "pid": os.getpid(),
+                "child_pid": child_pid,
+                "error": spawn_err,
+            })
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            if child_pid is not None:
+                import threading
+                def _do_exit():
+                    time.sleep(0.4)
+                    # Release the listening socket explicitly so the child can
+                    # bind without depending on TIME_WAIT / SO_REUSEADDR timing.
+                    sock = getattr(self.server, "socket", None)
+                    if sock is not None:
+                        try: sock.close()
+                        except Exception: pass
+                    os._exit(0)
+                threading.Thread(target=_do_exit, daemon=True).start()
 
         else:
             _json_response(self, {"error": "not found"}, 404)

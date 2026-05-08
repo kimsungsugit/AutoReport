@@ -27,7 +27,10 @@
       "Bash(done)",
       "Bash(PYTHONIOENCODING=utf-8 python *)",
       "Bash(python scripts/generate_periodic_reports.py --repo \"D:/Project/devops/Release_claude\" --output-root \"D:/Project/Program/AutoReport/reports/projects/Release_claude\" --profile reporting_automation)",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(tasklist /fi \"imagename eq python.exe\" /v)",
+      "PowerShell(Start-Process \"http://localhost:18923/portfolio\")",
+      "PowerShell(try { \\(Invoke-WebRequest -UseBasicParsing -Uri \"http://localhost:18923/api/regenerate/status\" -TimeoutSec 3\\).Content } catch { \"ERR: $_\" })"
     ]
   },
   "mcpServers": {

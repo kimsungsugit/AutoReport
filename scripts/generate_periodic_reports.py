@@ -1286,6 +1286,9 @@ def generate_jira_suggestions(
                     "reason": f"커밋 \"{clean_full[:50]}\" 이 기존 태스크에 매칭되지 않음",
                     "confidence": "low",
                     "status": "pending",
+                    # 부모 일정을 미리 채워두면 사용자는 변경할 때만 손대면 된다.
+                    "parent_start": best_parent.get("start") or "",
+                    "parent_end": best_parent.get("end") or "",
                 })
 
     # Find commits matching a parent task but not covered by any subtask
@@ -1326,6 +1329,9 @@ def generate_jira_suggestions(
                     "reason": f"커밋이 {tkey} 매칭되나 기존 부작업에 없는 영역",
                     "confidence": "medium",
                     "status": "pending",
+                    # 부모 일정을 미리 채워두면 사용자는 변경할 때만 손대면 된다.
+                    "parent_start": task.get("start") or "",
+                    "parent_end": task.get("end") or "",
                 })
                 break
 
@@ -2869,16 +2875,22 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
         t_start = task.get("start", "")
         t_end = task.get("end", "")
 
-        # Date display with overdue check
-        date_html = ""
+        # Date display with overdue check + inline editor toggle.
+        # The pencil emoji is the click affordance even when start/end are empty.
+        overdue_cls = ""
+        date_label = "—"
         if t_start and t_end:
-            overdue_cls = ""
             try:
                 if date.fromisoformat(t_end) < today and st != "done":
                     overdue_cls = " overdue"
             except ValueError:
                 pass
-            date_html = f'<span class="jira-date{overdue_cls}">{t_start[5:]} ~ {t_end[5:]}</span>'
+            date_label = f"{t_start[5:]} ~ {t_end[5:]}"
+        date_html = (
+            f'<span class="jira-date{overdue_cls}" data-start="{t_start}" data-end="{t_end}" '
+            f'onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">'
+            f'{date_label}</span>'
+        )
 
         actions = ""
         if st == "in_progress":
@@ -2902,6 +2914,23 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
             sst = sub.get("status", "pending")
             scls = status_cls.get(sst, "pending")
             slabel = status_label.get(sst, "To Do")
+            ss_start = sub.get("start", "")
+            ss_end = sub.get("end", "")
+
+            s_overdue = ""
+            s_label = "—"
+            if ss_start and ss_end:
+                try:
+                    if date.fromisoformat(ss_end) < today and sst != "done":
+                        s_overdue = " overdue"
+                except ValueError:
+                    pass
+                s_label = f"{ss_start[5:]} ~ {ss_end[5:]}"
+            sub_date_html = (
+                f'<span class="jira-date{s_overdue}" data-start="{ss_start}" data-end="{ss_end}" '
+                f'onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">'
+                f'{s_label}</span>'
+            )
 
             sub_actions = ""
             if sst == "in_progress":
@@ -2911,6 +2940,7 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
             rows.append(f'''<div class="jira-task subtask" data-key="{skey}">
   <span class="jira-key">{skey}</span>
   <span class="jira-summary">{stitle}</span>
+  {sub_date_html}
   <span class="jira-task-actions">
     <span class="jira-status {scls}">{slabel}</span>
     {sub_actions}
@@ -3139,17 +3169,17 @@ JIRA_BOARD_SCRIPT = """
         rows.forEach(r => r.remove());
         const footer = board.querySelector('.jira-board-footer');
 
+        const renderDate = (start, end, isDone) => {
+          const label = (start && end) ? `${start.slice(5)} ~ ${end.slice(5)}` : '—';
+          const overdue = (start && end && end < today && !isDone) ? ' overdue' : '';
+          return `<span class="jira-date${overdue}" data-start="${start||''}" data-end="${end||''}" onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">${label}</span>`;
+        };
+
         tasks.forEach(task => {
           const st = task.status || 'pending';
           const cls = statusCls[st] || 'pending';
           const label = statusLabel[st] || 'To Do';
-          const tStart = (task.start||'').slice(5);
-          const tEnd = (task.end||'').slice(5);
-          let dateHtml = '';
-          if (task.start && task.end) {
-            const overdue = task.end < today && st !== 'done' ? ' overdue' : '';
-            dateHtml = `<span class="jira-date${overdue}">${tStart} ~ ${tEnd}</span>`;
-          }
+          const dateHtml = renderDate(task.start || '', task.end || '', st === 'done');
           let actions = '';
           if (st === 'in_progress') actions += `<button class="jira-btn complete" onclick="jiraComplete('${task.key}')">Complete</button>`;
           actions += `<button class="jira-btn" onclick="jiraComment('${task.key}')">Comment</button>`;
@@ -3166,6 +3196,7 @@ JIRA_BOARD_SCRIPT = """
             const sst = sub.status || 'pending';
             const scls = statusCls[sst] || 'pending';
             const slabel = statusLabel[sst] || 'To Do';
+            const sDateHtml = renderDate(sub.start || '', sub.end || '', sst === 'done');
             let sActions = '';
             if (sst === 'in_progress') sActions += `<button class="jira-btn complete" onclick="jiraComplete('${sub.key}')">Complete</button>`;
             sActions += `<button class="jira-btn" onclick="jiraComment('${sub.key}')">Comment</button>`;
@@ -3173,11 +3204,37 @@ JIRA_BOARD_SCRIPT = """
             srow.className = 'jira-task subtask';
             srow.dataset.key = sub.key;
             srow.innerHTML = `<span class="jira-key">${sub.key}</span>` +
-              `<span class="jira-summary">${sub.title}</span>` +
+              `<span class="jira-summary">${sub.title}</span>${sDateHtml}` +
               `<span class="jira-task-actions"><span class="jira-status ${scls}">${slabel}</span>${sActions}</span>`;
             board.insertBefore(srow, footer);
           });
         });
+
+        // Refresh the Gantt chart in place. The server returns a freshly
+        // rendered SVG so date changes (made via the inline editor) are reflected.
+        if (typeof data.gantt_html === 'string') {
+          const ganttWrap = document.querySelector('.gantt-wrap');
+          if (data.gantt_html) {
+            if (ganttWrap) {
+              ganttWrap.outerHTML = data.gantt_html;
+            } else {
+              // Server has a chart but the page didn't render one — insert before board.
+              board.insertAdjacentHTML('beforebegin', data.gantt_html);
+            }
+            // Re-apply saved Today-line visibility — the page-load IIFE only
+            // runs once, so a fresh SVG would otherwise show Today regardless.
+            const saved = localStorage.getItem('gantt-today-visible');
+            if (saved === '0') {
+              const g = document.getElementById('gantt-today-group');
+              const tBtn = document.getElementById('gantt-today-toggle');
+              if (g) g.style.display = 'none';
+              if (tBtn) tBtn.textContent = 'Today ON';
+            }
+          } else if (ganttWrap) {
+            // No tasks with dates anymore — drop the chart.
+            ganttWrap.remove();
+          }
+        }
 
         if (btn) { btn.disabled = false; btn.textContent = 'Refresh'; }
         jiraToast('Sprint Board 갱신 완료');
@@ -3190,6 +3247,76 @@ JIRA_BOARD_SCRIPT = """
 
   // Auto-refresh board after complete/comment actions
   window._afterAction = function() { setTimeout(jiraRefresh, 1000); setTimeout(function(){ if(window.suggRefresh) suggRefresh(); }, 1500); };
+
+  // --- Inline date editor (.jira-date click → two date inputs + save/cancel)
+  window.jiraEditDates = function(span) {
+    if (!span || span.classList.contains('editing')) return;
+    const row = span.closest('.jira-task');
+    if (!row) return;
+    const key = row.dataset.key;
+    const start = span.dataset.start || '';
+    const end = span.dataset.end || '';
+    span._original = span.innerHTML;
+    span.classList.add('editing');
+    span.removeAttribute('onclick');
+    span.removeAttribute('title');
+    span.innerHTML =
+      `<input type="date" class="jira-date-input start" value="${start}" onclick="event.stopPropagation()">` +
+      `<span class="jira-date-dash">~</span>` +
+      `<input type="date" class="jira-date-input end" value="${end}" onclick="event.stopPropagation()">` +
+      `<button class="jira-btn jira-date-save" onclick="event.stopPropagation(); jiraSaveDates('${key}', this.parentElement)">저장</button>` +
+      `<button class="jira-btn jira-date-cancel" onclick="event.stopPropagation(); jiraCancelDates(this.parentElement)">취소</button>`;
+    const first = span.querySelector('.jira-date-input.start');
+    if (first) first.focus();
+  };
+
+  window.jiraCancelDates = function(span) {
+    span.innerHTML = span._original || '—';
+    span.classList.remove('editing');
+    span.setAttribute('onclick', 'jiraEditDates(this)');
+    span.setAttribute('title', '시작/종료 날짜 변경');
+  };
+
+  window.jiraSaveDates = function(key, span) {
+    const startInput = span.querySelector('.jira-date-input.start');
+    const endInput = span.querySelector('.jira-date-input.end');
+    if (!startInput || !endInput) return;
+    const start = startInput.value || '';
+    const end = endInput.value || '';
+    if (start && end && start > end) { jiraToast('시작일이 종료일보다 늦을 수 없습니다'); return; }
+    const saveBtn = span.querySelector('.jira-date-save');
+    if (saveBtn) { saveBtn.disabled = true; saveBtn.textContent = '저장 중…'; }
+    fetch(API + '/api/issue/' + key + '/dates', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({start, end})
+    }).then(r => r.json()).then(d => {
+      if (d.ok) {
+        const today = new Date().toISOString().slice(0, 10);
+        const row = span.closest('.jira-task');
+        const status = row && row.querySelector('.jira-status');
+        const isDone = !!(status && status.classList.contains('done'));
+        span.dataset.start = start;
+        span.dataset.end = end;
+        span.innerHTML = (start && end) ? `${start.slice(5)} ~ ${end.slice(5)}` : '—';
+        span.classList.remove('editing', 'overdue');
+        if (start && end && end < today && !isDone) span.classList.add('overdue');
+        span.setAttribute('onclick', 'jiraEditDates(this)');
+        span.setAttribute('title', '시작/종료 날짜 변경');
+        jiraToast(key + ' 날짜 저장 완료');
+        // Trigger board + gantt refresh so the chart visualises the new dates
+        // without the user having to click Refresh manually. Same pattern as
+        // jiraComplete / jiraDoComplete after a successful action.
+        if (typeof _afterAction === 'function') _afterAction();
+      } else {
+        jiraToast(key + ' 저장 실패: ' + (d.error || 'unknown'));
+        if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '저장'; }
+      }
+    }).catch(() => {
+      jiraToast('프록시 서버 미실행 (localhost:18923)');
+      if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = '저장'; }
+    });
+  };
 
   // Gantt Today line toggle
   window.toggleGanttToday = function() {
@@ -3246,6 +3373,23 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
         desc_label = "부작업 본문 (Description)" if stype == "add_subtask" else "설명 (Description)"
         desc_hint = "" if stype == "add_subtask" else '<span class="hint">— 비워두면 변경 안 함</span>'
         subtitle_html = f'<div class="suggestion-subtitle">{subtitle}</div>' if subtitle else ""
+        # add_subtask 일 때만 시작/종료일 입력 노출. 부모 일정을 미리 채워두므로
+        # 사용자는 변경하고 싶을 때만 입력하고 그대로 승인하면 된다. 직접 비워서
+        # 승인하면 백엔드 fallback이 부모 dates로 다시 채운다.
+        dates_html = ""
+        if stype == "add_subtask":
+            ps = escape(s.get("parent_start") or "")
+            pe = escape(s.get("parent_end") or "")
+            hint = "— 부모 작업 일정 미리 채움" if (ps or pe) else "— 비워두면 부모 작업 일정 상속"
+            dates_html = f'''
+  <div class="suggestion-dates">
+    <label class="suggestion-field-label">시작/종료일 <span class="hint">{hint}</span></label>
+    <div class="suggestion-date-row">
+      <input type="date" class="jira-date-input" id="start-{sid}" value="{ps}">
+      <span class="jira-date-dash">~</span>
+      <input type="date" class="jira-date-input" id="end-{sid}" value="{pe}">
+    </div>
+  </div>'''
 
         rows.append(f'''<div class="jira-suggestion{collapsed}" data-sid="{sid}" data-key="{key}" data-type="{stype}">
   <div class="suggestion-head">
@@ -3266,7 +3410,7 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
       <label class="suggestion-field-label" for="desc-{sid}">{desc_label}{desc_hint}</label>
       <textarea class="suggestion-description" id="desc-{sid}">{desc_text}</textarea>
     </div>
-  </div>
+  </div>{dates_html}
   <div class="suggestion-actions">
     <button class="jira-btn approve" onclick="suggApprove('{sid}')">승인</button>
     <button class="jira-btn reject" onclick="suggReject('{sid}')">거절</button>
@@ -3300,6 +3444,7 @@ REGENERATE_BAR_HTML = """
 <div class="regen-bar" id="regen-bar">
   <span class="regen-label">리포트 재생성</span>
   <span class="regen-help">멀티 프로젝트 리포트(대시보드/제안/Jira 상태)를 새로 만듭니다. 평소 5–15분 정도 걸려요.</span>
+  <button class="regen-btn ghost" id="proxy-restart-btn" onclick="proxyRestart()" title="jira_proxy 코드 변경을 새 프로세스로 반영">프록시 재시작</button>
   <button class="regen-btn" id="regen-btn" onclick="regenStart()">재생성 시작</button>
   <div class="regen-progress" id="regen-progress"><div class="regen-progress-fill"></div></div>
   <div class="regen-status" id="regen-status"></div>
@@ -3408,6 +3553,54 @@ REGENERATE_SCRIPT = """
       });
   };
 
+  window.proxyRestart = function() {
+    const btn = document.getElementById('proxy-restart-btn');
+    if (btn) { btn.disabled = true; btn.textContent = '재시작 중…'; }
+    if (typeof jiraToast === 'function') jiraToast('프록시 재시작 요청');
+
+    // Poll /status until it answers, then re-enable the button. Used both as
+    // the success path and as a fallback when the response was lost to the
+    // race between writing the body and closing the socket.
+    const startPoll = () => {
+      const deadline = Date.now() + 15000;
+      const check = () => {
+        fetch(API + '/api/regenerate/status', {cache: 'no-store'})
+          .then(r => r.ok ? r.json() : Promise.reject())
+          .then(() => {
+            if (btn) { btn.disabled = false; btn.textContent = '프록시 재시작'; }
+            if (typeof jiraToast === 'function') jiraToast('프록시 재시작 완료');
+          })
+          .catch(() => {
+            if (Date.now() < deadline) {
+              setTimeout(check, 500);
+            } else {
+              if (btn) { btn.disabled = false; btn.textContent = '프록시 재시작'; }
+              if (typeof jiraToast === 'function') jiraToast('프록시 응답 없음 — 수동 확인 필요');
+            }
+          });
+      };
+      setTimeout(check, 1000);
+    };
+
+    fetch(API + '/api/proxy/restart', {method: 'POST'})
+      .then(r => r.json())
+      .then(body => {
+        // Honest failure path: spawn explicitly failed in the parent — don't
+        // mislead the user with a "restart complete" toast a second later.
+        if (body && body.ok === false) {
+          if (btn) { btn.disabled = false; btn.textContent = '프록시 재시작'; }
+          if (typeof jiraToast === 'function') jiraToast('재시작 실패: ' + (body.error || '자식 프로세스 spawn 실패'));
+          return;
+        }
+        startPoll();
+      })
+      .catch(() => {
+        // Response lost to race (server closed socket mid-flight) — fall back
+        // to liveness polling; if the new process binds, this still succeeds.
+        startPoll();
+      });
+  };
+
   // On load, check whether a job is already running (e.g. user reopened the page)
   poll();
 })();
@@ -3436,6 +3629,19 @@ JIRA_SUGGESTIONS_SCRIPT = """
       jiraToast(key + ' 댓글 또는 설명을 입력하세요');
       return;
     }
+    // add_subtask 한정: 사용자가 명시한 시작/종료일이 있으면 함께 보낸다.
+    // 둘 다 비어있으면 백엔드가 부모 작업의 일정을 상속한다.
+    let start = '', end = '';
+    if (type === 'add_subtask') {
+      const sEl = document.getElementById('start-' + sid);
+      const eEl = document.getElementById('end-' + sid);
+      start = sEl ? (sEl.value || '') : '';
+      end = eEl ? (eEl.value || '') : '';
+      if (start && end && start > end) {
+        jiraToast(key + ' 시작일이 종료일보다 늦을 수 없습니다');
+        return;
+      }
+    }
     const btn = card.querySelector('.approve');
     btn.disabled = true;
     btn.textContent = '처리 중...';
@@ -3445,7 +3651,7 @@ JIRA_SUGGESTIONS_SCRIPT = """
     fetch(API + '/api/suggestions/' + sid + '/approve', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({task_key: key, type: type, text: text, comment: text, description: desc})
+      body: JSON.stringify({task_key: key, type: type, text: text, comment: text, description: desc, start: start, end: end})
     }).then(r => r.json()).then(d => {
       if (d.ok) {
         card.classList.add('applied');
@@ -3522,6 +3728,18 @@ JIRA_SUGGESTIONS_SCRIPT = """
           const descHint = isSub ? '' : '<span class="hint">— 비워두면 변경 안 함</span>';
           const descText = s.suggested_description || '';
           const subtitleHtml = s.subtitle ? `<div class="suggestion-subtitle">${s.subtitle}</div>` : '';
+          const psv = (s.parent_start || '');
+          const pev = (s.parent_end || '');
+          const dateHint = (psv || pev) ? '— 부모 작업 일정 미리 채움' : '— 비워두면 부모 작업 일정 상속';
+          const datesHtml = isSub ? `
+            <div class="suggestion-dates">
+              <label class="suggestion-field-label">시작/종료일 <span class="hint">${dateHint}</span></label>
+              <div class="suggestion-date-row">
+                <input type="date" class="jira-date-input" id="start-${s.id}" value="${psv}">
+                <span class="jira-date-dash">~</span>
+                <input type="date" class="jira-date-input" id="end-${s.id}" value="${pev}">
+              </div>
+            </div>` : '';
           card.innerHTML = `
             <div class="suggestion-head">
               <span class="jira-key">${s.task_key}</span>
@@ -3541,7 +3759,7 @@ JIRA_SUGGESTIONS_SCRIPT = """
                 <label class="suggestion-field-label" for="desc-${s.id}">${descLabel}${descHint}</label>
                 <textarea class="suggestion-description" id="desc-${s.id}">${descText}</textarea>
               </div>
-            </div>
+            </div>${datesHtml}
             <div class="suggestion-actions">
               <button class="jira-btn approve" onclick="suggApprove('${s.id}')">승인</button>
               <button class="jira-btn reject" onclick="suggReject('${s.id}')">거절</button>
