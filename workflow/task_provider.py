@@ -53,6 +53,19 @@ class TaskProvider(ABC):
         """Set Start/End date custom fields. Empty string clears. Returns True on success."""
         return False
 
+    def list_epics(self, project_key: str = "") -> list[dict]:
+        """Return [{key, summary}] of open Epics. project_key overrides default."""
+        return []
+
+    def create_issue(self, issuetype: str, summary: str, description: str = "",
+                     start: str = "", end: str = "", epic_key: str = "",
+                     project_key: str = "", report_required: str = "") -> str:
+        """Create a top-level issue (Epic or Task). project_key overrides default.
+
+        Returns new issue key, or '' on failure.
+        """
+        return ""
+
 
 class JsonFileTaskProvider(TaskProvider):
     """Reads/writes sprint tasks from a local JSON file."""
@@ -109,6 +122,9 @@ class JiraApiTaskProvider(TaskProvider):
         self._ssl_ctx.check_hostname = False
         self._ssl_ctx.verify_mode = ssl.CERT_NONE
         self.last_error: str = ""  # last write-operation error message (for diagnostics)
+        self._epic_link_field: str | None = None  # lazy-detected customfield ID for Epic Link
+        self._epic_name_field: str | None = None  # lazy-detected customfield ID for Epic Name
+        self._issuetype_names: dict[str, str] | None = None  # lazy {"epic": "에픽"|"Epic", "task": "작업"|"Task"}
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict:
         """Make an authenticated request to Jira REST API.
@@ -292,6 +308,241 @@ class JiraApiTaskProvider(TaskProvider):
         except Exception as e:
             self.last_error = str(e)
             return False
+
+    def _scan_fields(self) -> list[dict]:
+        """Fetch /rest/api/2/field once and cache via instance for both helpers.
+
+        Only caches non-empty results — a transient Jira failure on the first
+        call would otherwise pin the cache to [] permanently, leaving all
+        Epic-related field detection on the dumb fallback path forever.
+        """
+        cache_attr = "_field_scan_cache"
+        cached = getattr(self, cache_attr, None)
+        if cached:
+            return cached
+        try:
+            data = self._request("GET", "/rest/api/2/field")
+            scanned = data if isinstance(data, list) else []
+        except Exception:
+            scanned = []
+        if scanned:
+            setattr(self, cache_attr, scanned)
+        return scanned
+
+    def _detect_epic_link_field(self) -> str:
+        """Lazy-detect the 'Epic Link' customfield ID.
+
+        Prefers the Greenhopper schema marker (instance-name agnostic) and
+        falls back to localised name matching, finally to customfield_10008.
+        """
+        if self._epic_link_field is not None:
+            return self._epic_link_field
+        cand = "customfield_10008"
+        for f in self._scan_fields():
+            schema = (f.get("schema") or {}).get("custom") or ""
+            if schema == "com.pyxis.greenhopper.jira:gh-epic-link":
+                cand = f.get("id", cand)
+                break
+        else:
+            for f in self._scan_fields():
+                name = (f.get("name") or "").strip().lower()
+                if name in ("epic link", "에픽 링크", "큰틀 링크"):
+                    cand = f.get("id", cand)
+                    break
+        self._epic_link_field = cand
+        return cand
+
+    def _detect_epic_name_field(self) -> str:
+        """Lazy-detect the 'Epic Name' customfield ID.
+
+        Some Jira instances localise the Epic Name field (e.g. "큰틀의 이름")
+        so name-only matching is fragile. Prefer the Greenhopper schema
+        marker `gh-epic-label`, falling back to localised name matching.
+        Returns '' if the field doesn't exist in this instance.
+        """
+        if self._epic_name_field is not None:
+            return self._epic_name_field
+        cand = ""
+        for f in self._scan_fields():
+            schema = (f.get("schema") or {}).get("custom") or ""
+            if schema == "com.pyxis.greenhopper.jira:gh-epic-label":
+                cand = f.get("id", "")
+                break
+        else:
+            for f in self._scan_fields():
+                name = (f.get("name") or "").strip().lower()
+                if name in ("epic name", "에픽 이름", "큰틀 이름", "큰틀의 이름"):
+                    cand = f.get("id", "")
+                    break
+        self._epic_name_field = cand
+        return cand
+
+    def _detect_issuetype_names(self) -> dict[str, str]:
+        """Lazy-detect Korean/English names of Epic and Task issue types.
+
+        The instance may use Korean names (에픽/작업) or English (Epic/Task);
+        we ask Jira once and cache the result. Falls back to English defaults.
+        """
+        if self._issuetype_names is not None:
+            return self._issuetype_names
+        out = {"epic": "Epic", "task": "Task"}
+        try:
+            data = self._request("GET", "/rest/api/2/issuetype")
+            for it in data if isinstance(data, list) else []:
+                name = (it.get("name") or "").strip()
+                lname = name.lower()
+                if it.get("subtask"):
+                    continue
+                # This Jira instance uses "큰틀" as the Epic-equivalent issuetype
+                # (project APPL, id=10000). We accept the canonical English/Korean
+                # names plus that instance-specific Korean alias.
+                if lname in ("epic", "에픽", "큰틀"):
+                    out["epic"] = name
+                elif lname in ("task", "작업"):
+                    out["task"] = name
+        except Exception:
+            pass
+        self._issuetype_names = out
+        return out
+
+    def list_epics(self, project_key: str = "") -> list[dict]:
+        """Return open Epics for the given project as [{key, summary}].
+
+        Filters out Done/Closed so the user doesn't get a long stale list.
+        Uses the detected issuetype name (Epic / 에픽) so JQL matches even on
+        Korean-only Jira instances. `project_key` overrides the default.
+        """
+        self.last_error = ""
+        pk = (project_key or self.project_key).strip()
+        if not pk:
+            self.last_error = "project_key 누락"
+            return []
+        # Defensive sanitisation: JQL identifiers are alphanumeric + dash/underscore
+        # in practice. Reject anything else rather than escape — the project_key
+        # comes from server-rendered config so a stray character indicates a bug.
+        if not all(c.isalnum() or c in "-_" for c in pk):
+            self.last_error = f"invalid project key: {pk!r}"
+            return []
+        try:
+            from urllib.parse import quote
+            epic_name = self._detect_issuetype_names().get("epic", "Epic")
+            # epic_name may contain Korean characters; double-quote it in JQL.
+            # Escape any literal double-quotes that could break the JQL string.
+            epic_name_safe = epic_name.replace('"', '\\"')
+            jql = (
+                f'project={pk} AND issuetype="{epic_name_safe}" '
+                f"AND statusCategory != Done ORDER BY created DESC"
+            )
+            data = self._request("GET",
+                f"/rest/api/2/search?jql={quote(jql)}&fields=summary&maxResults=100")
+            out: list[dict] = []
+            for issue in data.get("issues", []):
+                out.append({
+                    "key": issue.get("key", ""),
+                    "summary": (issue.get("fields") or {}).get("summary", ""),
+                })
+            return out
+        except Exception as e:
+            self.last_error = str(e)
+            return []
+
+    def create_issue(self, issuetype: str, summary: str, description: str = "",
+                     start: str = "", end: str = "", epic_key: str = "",
+                     project_key: str = "", report_required: str = "") -> str:
+        """Create an Epic or Task at the project root.
+
+        - issuetype: case-insensitive 'epic' or 'task' (Korean 에픽/작업/큰틀 also accepted).
+        - project_key: overrides the provider's default project (multi-board support).
+        - report_required: 'yes' / 'no' / '' — fills customfield_11100 (주간보고 사항)
+          which this Jira instance marks required for Task. Explicit user value
+          wins over parent-Epic inheritance.
+        Returns the new issue key, or '' on failure (self.last_error is set).
+        """
+        self.last_error = ""
+        kind = issuetype.strip().lower()
+        if kind in ("에픽", "큰틀"):
+            kind = "epic"
+        elif kind in ("작업",):
+            kind = "task"
+        if kind not in ("epic", "task"):
+            self.last_error = f"unsupported issuetype '{issuetype}'"
+            return ""
+        pk = (project_key or self.project_key).strip()
+        if not pk:
+            self.last_error = "project_key 누락"
+            return ""
+        try:
+            names = self._detect_issuetype_names()
+            fields: dict[str, Any] = {
+                "project": {"key": pk},
+                "summary": summary,
+                "issuetype": {"name": names[kind]},
+            }
+            if description:
+                fields["description"] = description
+            # Start/End custom fields are configured on Task/Sub-task screens
+            # only in this Jira instance. Sending them on the Epic (큰틀)
+            # creation screen returns "Field 'customfield_10230' cannot be set".
+            if kind != "epic":
+                if start:
+                    fields["customfield_10230"] = start
+                if end:
+                    fields["customfield_10900"] = end
+                # 주간보고 사항 is a required select on Task creation in this
+                # instance. Option IDs: 11100=Yes, 11101=No. Sent only when
+                # the user picked a value — falls through to parent inheritance
+                # otherwise, and if neither sets it, Jira's 400 surfaces.
+                rr = (report_required or "").strip().lower()
+                if rr in ("yes", "y", "true", "1"):
+                    fields["customfield_11100"] = {"id": "11100"}
+                elif rr in ("no", "n", "false", "0"):
+                    fields["customfield_11100"] = {"id": "11101"}
+            if kind == "epic":
+                # Many Jira Server projects require a separate "Epic Name"
+                # customfield. Auto-populate it with the summary so the user
+                # isn't asked to type the same string twice.
+                enf = self._detect_epic_name_field()
+                if enf:
+                    fields[enf] = summary
+            elif kind == "task" and epic_key:
+                elf = self._detect_epic_link_field()
+                if elf:
+                    fields[elf] = epic_key
+                # Inherit required customfields from the parent Epic, mirroring
+                # the subtask flow. The instance's required field 11100
+                # (주간보고 사항) is a select-list — without inheritance, Task
+                # creation under an Epic 400s with "주간보고 사항 항목은 필수".
+                # User-supplied start/end already populated above take precedence.
+                try:
+                    inheritable = ("customfield_10230", "customfield_10900", "customfield_11100")
+                    parent = self._request(
+                        "GET",
+                        f"/rest/api/2/issue/{epic_key}?fields={','.join(inheritable)}",
+                    )
+                    pfields = (parent or {}).get("fields", {}) or {}
+                    for cf in inheritable:
+                        if cf in fields:
+                            continue
+                        val = pfields.get(cf)
+                        if val is None:
+                            continue
+                        if isinstance(val, dict) and "id" in val:
+                            fields[cf] = {"id": val["id"]}
+                        elif isinstance(val, list):
+                            fields[cf] = [
+                                {"id": v["id"]} if isinstance(v, dict) and "id" in v else v
+                                for v in val
+                            ]
+                        else:
+                            fields[cf] = val
+                except Exception:
+                    # Parent fetch failed — let Jira's own 400 surface the missing field.
+                    pass
+            result = self._request("POST", "/rest/api/2/issue", {"fields": fields})
+            return result.get("key", "")
+        except Exception as e:
+            self.last_error = str(e)
+            return ""
 
     def _convert_jira_response(self, data: dict, sprint_info: dict | None = None) -> dict[str, Any]:
         """Convert Jira REST API response to sprint_tasks.json format."""

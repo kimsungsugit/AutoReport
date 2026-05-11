@@ -30,7 +30,15 @@
       "Read(//tmp/**)",
       "Bash(tasklist /fi \"imagename eq python.exe\" /v)",
       "PowerShell(Start-Process \"http://localhost:18923/portfolio\")",
-      "PowerShell(try { \\(Invoke-WebRequest -UseBasicParsing -Uri \"http://localhost:18923/api/regenerate/status\" -TimeoutSec 3\\).Content } catch { \"ERR: $_\" })"
+      "PowerShell(try { \\(Invoke-WebRequest -UseBasicParsing -Uri \"http://localhost:18923/api/regenerate/status\" -TimeoutSec 3\\).Content } catch { \"ERR: $_\" })",
+      "PowerShell(try { $r = Invoke-WebRequest -UseBasicParsing -Uri \"http://localhost:18923/api/regenerate/status\" -TimeoutSec 2; \"alive: \" + $r.StatusCode } catch { \"down: \" + $_.Exception.Message })",
+      "Bash(break)",
+      "Bash([ -s \"$f\" ])",
+      "PowerShell(try { \\(Invoke-WebRequest -UseBasicParsing -Uri \"http://localhost:18923/api/regenerate/status\" -TimeoutSec 5\\).StatusCode } catch { \"ERR: \" + $_.Exception.Message })",
+      "Bash(ls .env)",
+      "Bash(head -20 .env)",
+      "Bash(find . -maxdepth 2 -name \"*.env*\" -type f)",
+      "Bash(rm *)"
     ]
   },
   "mcpServers": {

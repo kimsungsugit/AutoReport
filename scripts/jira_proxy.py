@@ -286,6 +286,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 tasks["gantt_html"] = ""
             _json_response(self, tasks)
 
+        elif parsed.path == "/api/jira/epics":
+            # Populates the Epic dropdown when creating a Task at project root.
+            # ?project=<KEY> overrides the proxy's default project so dashboards
+            # rendering multiple boards (APPL, etc.) hit the right project.
+            qs = parse_qs(parsed.query)
+            project_key = qs.get("project", [""])[0]
+            try:
+                epics = (
+                    provider.list_epics(project_key) if hasattr(provider, "list_epics") else []
+                )
+            except Exception as e:
+                _json_response(self, {"epics": [], "error": str(e)}, 500)
+                return
+            _json_response(self, {"epics": epics})
+
         elif parsed.path == "/api/regenerate/status":
             _json_response(self, _regen_read_state())
 
@@ -409,6 +424,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                   "comment_error": err_trans, "description_error": err_desc})
 
         # POST /api/issue/create
+        # Used by the Sprint Board "+ Sub" button. The suggestion-approve flow
+        # has its own subtask path that already inherits required customfields
+        # from the parent — this endpoint missed that, so the +Sub button 400'd
+        # on tasks with required cf_10230/10900/11100.
         elif path == "/api/issue/create":
             parent_key = body.get("parent_key", "")
             summary = body.get("summary", "")
@@ -417,7 +436,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "parent_key and summary required"}, 400)
                 return
             try:
-                fields = {
+                fields: dict = {
                     "project": {"key": parent_key.split("-")[0]},
                     "parent": {"key": parent_key},
                     "summary": summary,
@@ -425,10 +444,77 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 }
                 if description:
                     fields["description"] = description
+                # Inherit required customfields from parent (mirrors the
+                # suggestion-approve add_subtask branch). If the parent fetch
+                # fails or the fields are unset on the parent, Jira's 400
+                # surfaces the missing-field message to the caller as before.
+                try:
+                    required_cfs = ("customfield_10230", "customfield_10900", "customfield_11100")
+                    parent = provider._request(
+                        "GET",
+                        f"/rest/api/2/issue/{parent_key}?fields={','.join(required_cfs)}",
+                    )
+                    pfields = (parent or {}).get("fields", {}) or {}
+                    for cf in required_cfs:
+                        val = pfields.get(cf)
+                        if val is None:
+                            continue
+                        if isinstance(val, dict) and "id" in val:
+                            fields[cf] = {"id": val["id"]}
+                        elif isinstance(val, list):
+                            fields[cf] = [
+                                {"id": v["id"]} if isinstance(v, dict) and "id" in v else v
+                                for v in val
+                            ]
+                        else:
+                            fields[cf] = val
+                except Exception:
+                    pass
                 result = provider._request("POST", "/rest/api/2/issue", {"fields": fields})
                 _json_response(self, {"ok": True, "key": result.get("key", "")})
             except Exception as e:
                 _json_response(self, {"ok": False, "error": str(e)}, 500)
+
+        # POST /api/jira/issue/create  (creates Epic or Task at project root)
+        # body: {type: "epic"|"task", summary, description, start, end, epic_key?}
+        elif path == "/api/jira/issue/create":
+            issuetype = (body.get("type") or "").strip()
+            summary = (body.get("summary") or "").strip()
+            description = body.get("description") or ""
+            start = (body.get("start") or "").strip()
+            end = (body.get("end") or "").strip()
+            epic_key = (body.get("epic_key") or "").strip()
+            if not summary:
+                _json_response(self, {"ok": False, "error": "제목은 필수입니다"}, 400)
+                return
+            if issuetype.lower() not in ("epic", "task", "에픽", "작업"):
+                _json_response(self, {"ok": False, "error": "type은 epic 또는 task여야 합니다"}, 400)
+                return
+            if not _is_valid_date(start) or not _is_valid_date(end):
+                _json_response(self, {"ok": False, "error": "날짜 형식은 YYYY-MM-DD 여야 합니다"}, 400)
+                return
+            if start and end and start > end:
+                _json_response(self, {"ok": False, "error": "시작일이 종료일보다 늦을 수 없습니다"}, 400)
+                return
+            project_key = (body.get("project_key") or "").strip()
+            report_required = (body.get("report_required") or "").strip()
+            try:
+                new_key = (
+                    provider.create_issue(
+                        issuetype, summary, description, start, end, epic_key,
+                        project_key=project_key,
+                        report_required=report_required,
+                    )
+                    if hasattr(provider, "create_issue") else ""
+                )
+            except Exception as e:
+                _json_response(self, {"ok": False, "error": str(e)}, 500)
+                return
+            if new_key:
+                _json_response(self, {"ok": True, "key": new_key})
+            else:
+                err = _last_error() or "이슈 생성 실패"
+                _json_response(self, {"ok": False, "error": err}, 500)
 
         # POST /api/suggestions/{id}/approve
         elif "/api/suggestions/" in path and path.endswith("/approve"):

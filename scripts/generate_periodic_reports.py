@@ -2958,9 +2958,17 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
 
     gantt_html = svg_sprint_gantt(tasks, sprint, today)
 
+    # project_key drives /api/jira/issue/create routing — without this, every
+    # board on the multi-project portfolio would create into the proxy's
+    # default project (APPL).
+    project_key = ""
+    if project_config and isinstance(project_config.get("jira"), dict):
+        project_key = (project_config["jira"].get("project_key") or "").strip()
+    pk_attr = escape(project_key)
+
     return f'''
 {gantt_html}
-<div class="jira-board" id="jira-live-board">
+<div class="jira-board" id="jira-live-board" data-project-key="{pk_attr}">
   <div class="jira-board-header">
     <div>
       <h3>Jira Sprint Board</h3>
@@ -2970,6 +2978,8 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
       <span class="jira-status done">{done_count} Done</span>
       <span class="jira-status in-progress">{in_prog} In Progress</span>
       <span class="jira-status pending">{pending} To Do</span>
+      <button class="jira-btn new-issue" onclick="jiraNewEpic('{pk_attr}')" title="새 에픽(큰틀) 생성">+ 새 에픽</button>
+      <button class="jira-btn new-issue" onclick="jiraNewTask('{pk_attr}')" title="새 작업 생성">+ 새 작업</button>
     </div>
   </div>
   {"".join(rows)}
@@ -3134,6 +3144,190 @@ JIRA_BOARD_SCRIPT = """
         _afterAction();
       } else { jiraToast('실패: ' + (d.error || 'unknown')); }
     }).catch(() => { btn.closest('.jira-modal-overlay').remove(); jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
+  };
+
+  // --- Epic / Task creation at project root ---------------------------
+  // The +Sub flow above creates a subtask under an existing parent. These
+  // two flows create top-level issues: 'Epic' (큰틀) and 'Task' (작업).
+  // Tasks can optionally roll up under an Epic via the Epic Link customfield,
+  // which the backend auto-detects on first use. Task creation under an Epic
+  // inherits required customfields (주간보고 사항 etc.) from the parent Epic.
+
+  function _datesFieldHtml() {
+    // data-field attributes (not IDs) so multiple create modals can coexist
+    // without colliding on document-level getElementById lookups.
+    return `
+        <div class="field-group">
+          <label class="field-label">시작일 ~ 종료일 (선택)</label>
+          <div class="field-row">
+            <input type="date" data-field="start" placeholder="YYYY-MM-DD">
+            <span class="field-dash">~</span>
+            <input type="date" data-field="end" placeholder="YYYY-MM-DD">
+          </div>
+        </div>`;
+  }
+
+  // Attach overlay-click and Escape to close. We only close when the click
+  // target IS the overlay itself (not bubbled from inside the modal) so that
+  // clicking inputs/buttons doesn't dismiss user input.
+  function _wireModalDismiss(overlay) {
+    const escHandler = function(ev) {
+      if (ev.key === 'Escape') overlay.remove();
+    };
+    document.addEventListener('keydown', escHandler);
+    // Replace remove() so every dismiss path (overlay click, Cancel button,
+    // successful create, programmatic close) unhooks the listener. Avoids
+    // accumulating dangling keydown handlers across many open/close cycles.
+    const origRemove = overlay.remove.bind(overlay);
+    overlay.remove = function() {
+      document.removeEventListener('keydown', escHandler);
+      origRemove();
+    };
+    overlay.addEventListener('click', function(ev) {
+      if (ev.target === overlay) overlay.remove();
+    });
+  }
+
+  // Surface backend errors inline (modal stays open, inputs preserved) instead
+  // of via the auto-dismissing toast — Jira's 400 messages are long and the
+  // user otherwise loses both the reason and the typed values.
+  function _setCreateError(overlay, msg) {
+    let box = overlay.querySelector('.jira-create-error');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'jira-create-error';
+      box.style.cssText = 'margin: 0 0 10px; padding: 8px 10px; background: var(--err-bg,#fee); color: var(--err-ink,#900); border: 1px solid var(--err-ink,#900); border-radius: 6px; font-size: 12px; white-space: pre-wrap; word-break: break-word;';
+      const actions = overlay.querySelector('.modal-actions');
+      if (actions) actions.parentElement.insertBefore(box, actions);
+    }
+    box.textContent = msg;
+  }
+
+  // Scope-aware field reader. Multiple create modals can coexist (e.g. user
+  // opens "+ 새 에픽" then "+ 새 작업" without closing the first), so we must
+  // not use document.getElementById which returns whichever instance was
+  // mounted first. Always query within the overlay that hosts the button.
+  function _field(overlay, name) {
+    return overlay.querySelector('[data-field="' + name + '"]');
+  }
+  function _val(overlay, name) {
+    const el = _field(overlay, name);
+    return el ? (el.value || '') : '';
+  }
+
+  window.jiraNewEpic = function(projectKey) {
+    const overlay = document.createElement('div');
+    overlay.className = 'jira-modal-overlay';
+    overlay.dataset.projectKey = projectKey || '';
+    overlay.innerHTML = `
+      <div class="jira-modal">
+        <h4>새 에픽 (큰틀) 생성${projectKey ? ' — ' + projectKey : ''}</h4>
+        <div class="field-group">
+          <label class="field-label">제목 (Summary)</label>
+          <input type="text" data-field="summary" placeholder="에픽 제목을 입력하세요...">
+        </div>
+        <div class="field-group">
+          <label class="field-label">설명 (Description) — 선택</label>
+          <textarea rows="3" data-field="desc" placeholder="에픽 본문 설명 (선택)"></textarea>
+        </div>
+        ${_datesFieldHtml()}
+        <div class="modal-actions">
+          <button class="jira-btn" onclick="this.closest('.jira-modal-overlay').remove()">취소</button>
+          <button class="jira-btn add" onclick="jiraDoCreate('epic', this)">생성</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    _wireModalDismiss(overlay);
+    _field(overlay, 'summary').focus();
+  };
+
+  window.jiraNewTask = function(projectKey) {
+    const overlay = document.createElement('div');
+    overlay.className = 'jira-modal-overlay';
+    overlay.dataset.projectKey = projectKey || '';
+    overlay.innerHTML = `
+      <div class="jira-modal">
+        <h4>새 작업 생성${projectKey ? ' — ' + projectKey : ''}</h4>
+        <div class="field-group">
+          <label class="field-label">상위 큰틀 (Epic) <span class="hint" style="font-weight:500;text-transform:none;color:var(--muted);">— 선택 시 일정·주간보고 사항 자동 상속</span></label>
+          <select data-field="epic"><option value="">(큰틀 없음)</option></select>
+        </div>
+        <div class="field-group">
+          <label class="field-label">제목 (Summary)</label>
+          <input type="text" data-field="summary" placeholder="작업 제목을 입력하세요...">
+        </div>
+        <div class="field-group">
+          <label class="field-label">설명 (Description) — 선택</label>
+          <textarea rows="3" data-field="desc" placeholder="작업 본문 설명 (선택)"></textarea>
+        </div>
+        <div class="field-group">
+          <label class="field-label">주간보고 사항 <span class="hint" style="font-weight:500;text-transform:none;color:var(--muted);">— Yes/No 필수. 비우면 부모 큰틀에서 상속</span></label>
+          <select data-field="report">
+            <option value="">(부모 큰틀에서 상속)</option>
+            <option value="yes">Yes — 주간보고에 포함</option>
+            <option value="no">No — 주간보고 제외</option>
+          </select>
+        </div>
+        ${_datesFieldHtml()}
+        <div class="modal-actions">
+          <button class="jira-btn" onclick="this.closest('.jira-modal-overlay').remove()">취소</button>
+          <button class="jira-btn add" onclick="jiraDoCreate('task', this)">생성</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    _wireModalDismiss(overlay);
+    // Populate the Epic dropdown for THIS overlay's project, asynchronously.
+    const url = API + '/api/jira/epics' + (projectKey ? ('?project=' + encodeURIComponent(projectKey)) : '');
+    fetch(url).then(r => r.json()).then(d => {
+      const sel = _field(overlay, 'epic');
+      if (!sel) return;
+      (d.epics || []).forEach(e => {
+        const opt = document.createElement('option');
+        opt.value = e.key;
+        opt.textContent = e.key + ' — ' + (e.summary || '');
+        sel.appendChild(opt);
+      });
+    }).catch(() => { /* silent — dropdown stays as "(에픽 없음)" */ });
+    _field(overlay, 'summary').focus();
+  };
+
+  window.jiraDoCreate = function(kind, btn) {
+    const overlay = btn.closest('.jira-modal-overlay');
+    const projectKey = overlay.dataset.projectKey || '';
+    const summary = _val(overlay, 'summary');
+    const desc = _val(overlay, 'desc');
+    const start = _val(overlay, 'start');
+    const end = _val(overlay, 'end');
+    const epicKey = (kind === 'task') ? _val(overlay, 'epic') : '';
+    const reportRequired = (kind === 'task') ? _val(overlay, 'report') : '';
+    if (!summary.trim()) { _setCreateError(overlay, '제목은 필수입니다.'); return; }
+    if (start && end && start > end) { _setCreateError(overlay, '시작일이 종료일보다 늦을 수 없습니다.'); return; }
+    btn.disabled = true;
+    btn.textContent = '생성 중...';
+    fetch(API + '/api/jira/issue/create', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({type: kind, summary, description: desc, start, end, epic_key: epicKey, project_key: projectKey, report_required: reportRequired})
+    }).then(r => r.json()).then(d => {
+      if (d.ok) {
+        overlay.remove();
+        const kindLabel = kind === 'epic' ? '에픽' : '작업';
+        const epicSuffix = (kind === 'task' && epicKey) ? ' (' + epicKey + ' 하위)' : '';
+        const pkSuffix = projectKey ? (' [' + projectKey + ']') : '';
+        jiraToast(d.key + ' ' + kindLabel + ' 생성 완료' + epicSuffix + pkSuffix);
+        _afterAction();
+      } else {
+        // Keep modal open so user can fix the issue (typically a missing
+        // required customfield like 주간보고 사항) without re-typing.
+        _setCreateError(overlay, '생성 실패 — ' + (d.error || 'unknown'));
+        btn.disabled = false;
+        btn.textContent = '생성';
+      }
+    }).catch(() => {
+      _setCreateError(overlay, '프록시 서버 미실행 (python scripts/jira_proxy.py)');
+      btn.disabled = false;
+      btn.textContent = '생성';
+    });
   };
 
   window.jiraRefresh = function() {

@@ -1017,6 +1017,13 @@ code {
 .jira-modal .field-group:last-of-type { margin-bottom: 16px; }
 .jira-modal .field-label { display: block; font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
 .jira-modal .field-group textarea, .jira-modal .field-group input { margin-bottom: 0; }
+.jira-modal .field-group select { width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; background: var(--paper); color: var(--ink); box-sizing: border-box; }
+.jira-modal .field-group select:focus { outline: none; border-color: var(--accent); }
+.jira-modal .field-row { display: flex; gap: 8px; align-items: center; }
+.jira-modal .field-row input { margin-bottom: 0; }
+.jira-modal .field-row .field-dash { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+.jira-board-actions .jira-btn.new-issue { background: var(--paper); color: var(--accent); border-color: var(--accent); }
+.jira-board-actions .jira-btn.new-issue:hover { background: var(--accent); color: #fff; }
 
 /* --- Regenerate banner ------------------------------------------------ */
 .regen-bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 0 0 14px; padding: 12px 16px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--paper-alt); }
