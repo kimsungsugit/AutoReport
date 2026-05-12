@@ -1231,6 +1231,58 @@ code { overflow-wrap: anywhere; word-break: break-word; }
   .tab-nav { display: none; }
   .tab-panel { display: block !important; page-break-inside: avoid; }
 }
+
+/* === Epic(큰틀) grouping for Jira board === */
+.epic-group {
+  margin: 14px 0 18px;
+  padding: 14px 16px 6px;
+  background: var(--paper-alt);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: 12px;
+}
+.epic-header {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  margin-bottom: 10px;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+.epic-key {
+  font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+  background: var(--accent);
+  color: #fff;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  flex-shrink: 0;
+}
+.epic-summary {
+  flex: 1 1 auto;
+  font-weight: 700;
+  color: var(--ink);
+  font-size: 14px;
+  min-width: 0;
+}
+.epic-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.epic-group.no-epic {
+  border-left-color: var(--muted);
+}
+.epic-group.no-epic .epic-key {
+  background: var(--muted);
+}
+.epic-group.no-epic .epic-summary {
+  color: var(--muted);
+  font-style: italic;
+}
 """
 
 # ---------------------------------------------------------------------------

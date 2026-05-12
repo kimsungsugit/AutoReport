@@ -153,20 +153,22 @@ class JiraApiTaskProvider(TaskProvider):
 
     def get_tasks(self) -> dict[str, Any]:
         try:
+            # epic_link customfield (보통 customfield_10008, 인스턴스마다 다를 수 있음)
+            elf = self._detect_epic_link_field() or "customfield_10008"
             if self.sprint_id:
                 data = self._request("GET",
                     f"/rest/agile/1.0/sprint/{self.sprint_id}/issue"
                     f"?maxResults=100&fields=summary,status,issuetype,subtasks,"
-                    f"customfield_10230,customfield_10900")
+                    f"customfield_10230,customfield_10900,{elf}")
                 sprint_info = self._request("GET",
                     f"/rest/agile/1.0/sprint/{self.sprint_id}")
-                return self._convert_jira_response(data, sprint_info)
+                return self._convert_jira_response(data, sprint_info, epic_link_field=elf)
             else:
                 data = self._request("GET",
                     f"/rest/api/2/search?jql=project={self.project_key}"
                     f"+AND+type=Task&fields=summary,subtasks,status,"
-                    f"customfield_10230,customfield_10900")
-                return self._convert_jira_response(data)
+                    f"customfield_10230,customfield_10900,{elf}")
+                return self._convert_jira_response(data, epic_link_field=elf)
         except Exception:
             return self._fallback.get_tasks()
 
@@ -544,8 +546,13 @@ class JiraApiTaskProvider(TaskProvider):
             self.last_error = str(e)
             return ""
 
-    def _convert_jira_response(self, data: dict, sprint_info: dict | None = None) -> dict[str, Any]:
-        """Convert Jira REST API response to sprint_tasks.json format."""
+    def _convert_jira_response(self, data: dict, sprint_info: dict | None = None,
+                                epic_link_field: str = "customfield_10008") -> dict[str, Any]:
+        """Convert Jira REST API response to sprint_tasks.json format.
+
+        Includes Epic link info (epic_key + epic_summary) so reports can group
+        tasks by 큰틀(Epic).
+        """
         tasks = []
         seen_keys = set()
         # Collect parent + subtask keys so we can batch-fetch descriptions
@@ -578,6 +585,7 @@ class JiraApiTaskProvider(TaskProvider):
                 "status": status_map.get(status_name, "pending"),
                 "start": str(fields.get("customfield_10230", "") or "")[:10],
                 "end": str(fields.get("customfield_10900", "") or "")[:10],
+                "epic_key": str(fields.get(epic_link_field, "") or ""),
                 "subtasks": [
                     {
                         "title": st["fields"]["summary"],
@@ -596,6 +604,13 @@ class JiraApiTaskProvider(TaskProvider):
                 "keywords": [],
             })
 
+        # Batch-fetch epic summaries so the UI can show "APPL-401 소프트웨어 추가, 진단기능 개선"
+        # instead of bare keys.
+        epic_keys = sorted({t["epic_key"] for t in tasks if t.get("epic_key")})
+        epic_summaries = self._fetch_epic_summaries(epic_keys)
+        for t in tasks:
+            t["epic_summary"] = epic_summaries.get(t.get("epic_key", ""), "")
+
         sprint = {"name": "", "start": "", "end": ""}
         if sprint_info:
             sprint = {
@@ -604,6 +619,27 @@ class JiraApiTaskProvider(TaskProvider):
                 "end": str(sprint_info.get("endDate", ""))[:10],
             }
         return {"sprint": sprint, "tasks": tasks}
+
+    def _fetch_epic_summaries(self, epic_keys: list[str]) -> dict[str, str]:
+        """Batch-fetch summaries for the given Epic keys. Returns {key: summary}.
+
+        Missing keys / failures silently default to empty so callers can still render.
+        """
+        if not epic_keys:
+            return {}
+        out: dict[str, str] = {}
+        chunk = 50
+        for i in range(0, len(epic_keys), chunk):
+            keys_csv = ",".join(epic_keys[i:i + chunk])
+            try:
+                data = self._request("GET",
+                    f"/rest/api/2/search?jql=key+in+({keys_csv})"
+                    f"&fields=summary&maxResults={chunk}")
+                for issue in data.get("issues", []):
+                    out[issue["key"]] = issue.get("fields", {}).get("summary", "")
+            except Exception:
+                pass
+        return out
 
 
 def get_task_provider(project_config: dict | None = None) -> TaskProvider:

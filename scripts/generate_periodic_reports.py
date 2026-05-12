@@ -2930,40 +2930,80 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
     status_label = {"done": "Done", "in_progress": "In Progress", "pending": "To Do"}
 
     today = date.today()
-    rows = []
+
+    # Group sprint tasks by Epic (큰틀) so the board renders "Epic → its tasks"
+    # structure instead of a flat list. Tasks without an Epic Link fall into a
+    # "No Epic" bucket so they're still visible.
+    raw_groups: dict[str, dict[str, Any]] = {}
     for task in tasks:
-        key = escape(task.get("key", ""))
-        title = escape(task.get("title", ""))
-        st = task.get("status", "pending")
-        cls = status_cls.get(st, "pending")
-        label = status_label.get(st, "To Do")
-        t_start = task.get("start", "")
-        t_end = task.get("end", "")
+        ek = task.get("epic_key") or "_no_epic"
+        if ek not in raw_groups:
+            raw_groups[ek] = {"epic_summary": task.get("epic_summary", ""), "tasks": []}
+        raw_groups[ek]["tasks"].append(task)
 
-        # Date display with overdue check + inline editor toggle.
-        # The pencil emoji is the click affordance even when start/end are empty.
-        overdue_cls = ""
-        date_label = "—"
-        if t_start and t_end:
-            try:
-                if date.fromisoformat(t_end) < today and st != "done":
-                    overdue_cls = " overdue"
-            except ValueError:
-                pass
-            date_label = f"{t_start[5:]} ~ {t_end[5:]}"
-        date_html = (
-            f'<span class="jira-date{overdue_cls}" data-start="{t_start}" data-end="{t_end}" '
-            f'onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">'
-            f'{date_label}</span>'
-        )
+    # Sort: epics with more sprint tasks first (활성 영역 우선), then epic_key asc.
+    # "No Epic" always last so attached work stays visually grouped.
+    def _epic_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, int, str]:
+        ek, g = item
+        is_no_epic = 1 if ek == "_no_epic" else 0
+        return (is_no_epic, -len(g["tasks"]), ek)
 
-        actions = ""
-        if st == "in_progress":
-            actions = f'''<button class="jira-btn complete" onclick="jiraComplete('{key}')">Complete</button>'''
-        actions += f'''<button class="jira-btn" onclick="jiraComment('{key}')">Comment</button>'''
-        actions += f'''<button class="jira-btn add" onclick="jiraAddSub('{key}')">+ Sub</button>'''
+    sorted_groups = sorted(raw_groups.items(), key=_epic_sort_key)
 
-        rows.append(f'''<div class="jira-task" data-key="{key}">
+    rows: list[str] = []
+    for epic_key, group in sorted_groups:
+        group_tasks = group["tasks"]
+        if epic_key == "_no_epic":
+            rows.append(
+                '<div class="epic-group no-epic"><div class="epic-header">'
+                '<span class="epic-key">No Epic</span>'
+                '<span class="epic-summary">큰틀(Epic) 미연결</span>'
+                f'<span class="epic-count">{len(group_tasks)}개</span>'
+                '</div>'
+            )
+        else:
+            es_html = escape(group["epic_summary"]) if group["epic_summary"] else escape(epic_key)
+            rows.append(
+                '<div class="epic-group"><div class="epic-header">'
+                f'<span class="epic-key">{escape(epic_key)}</span>'
+                f'<span class="epic-summary">{es_html}</span>'
+                f'<span class="epic-count">{len(group_tasks)}개</span>'
+                '</div>'
+            )
+
+        for task in group_tasks:
+            key = escape(task.get("key", ""))
+            title = escape(task.get("title", ""))
+            st = task.get("status", "pending")
+            cls = status_cls.get(st, "pending")
+            label = status_label.get(st, "To Do")
+            t_start = task.get("start", "")
+            t_end = task.get("end", "")
+
+            # Date display with overdue check + inline editor toggle.
+            # The pencil emoji is the click affordance even when start/end are empty.
+            overdue_cls = ""
+            date_label = "—"
+            if t_start and t_end:
+                try:
+                    if date.fromisoformat(t_end) < today and st != "done":
+                        overdue_cls = " overdue"
+                except ValueError:
+                    pass
+                date_label = f"{t_start[5:]} ~ {t_end[5:]}"
+            date_html = (
+                f'<span class="jira-date{overdue_cls}" data-start="{t_start}" data-end="{t_end}" '
+                f'onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">'
+                f'{date_label}</span>'
+            )
+
+            actions = ""
+            if st == "in_progress":
+                actions = f'''<button class="jira-btn complete" onclick="jiraComplete('{key}')">Complete</button>'''
+            actions += f'''<button class="jira-btn" onclick="jiraComment('{key}')">Comment</button>'''
+            actions += f'''<button class="jira-btn add" onclick="jiraAddSub('{key}')">+ Sub</button>'''
+
+            rows.append(f'''<div class="jira-task" data-key="{key}">
   <span class="jira-key">{key}</span>
   <span class="jira-summary">{title}</span>
   {date_html}
@@ -2973,36 +3013,36 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
   </span>
 </div>''')
 
-        for sub in task.get("subtasks", []):
-            skey = escape(sub.get("key", ""))
-            stitle = escape(sub.get("title", ""))
-            sst = sub.get("status", "pending")
-            scls = status_cls.get(sst, "pending")
-            slabel = status_label.get(sst, "To Do")
-            ss_start = sub.get("start", "")
-            ss_end = sub.get("end", "")
+            for sub in task.get("subtasks", []):
+                skey = escape(sub.get("key", ""))
+                stitle = escape(sub.get("title", ""))
+                sst = sub.get("status", "pending")
+                scls = status_cls.get(sst, "pending")
+                slabel = status_label.get(sst, "To Do")
+                ss_start = sub.get("start", "")
+                ss_end = sub.get("end", "")
 
-            s_overdue = ""
-            s_label = "—"
-            if ss_start and ss_end:
-                try:
-                    if date.fromisoformat(ss_end) < today and sst != "done":
-                        s_overdue = " overdue"
-                except ValueError:
-                    pass
-                s_label = f"{ss_start[5:]} ~ {ss_end[5:]}"
-            sub_date_html = (
-                f'<span class="jira-date{s_overdue}" data-start="{ss_start}" data-end="{ss_end}" '
-                f'onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">'
-                f'{s_label}</span>'
-            )
+                s_overdue = ""
+                s_label = "—"
+                if ss_start and ss_end:
+                    try:
+                        if date.fromisoformat(ss_end) < today and sst != "done":
+                            s_overdue = " overdue"
+                    except ValueError:
+                        pass
+                    s_label = f"{ss_start[5:]} ~ {ss_end[5:]}"
+                sub_date_html = (
+                    f'<span class="jira-date{s_overdue}" data-start="{ss_start}" data-end="{ss_end}" '
+                    f'onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">'
+                    f'{s_label}</span>'
+                )
 
-            sub_actions = ""
-            if sst == "in_progress":
-                sub_actions = f'''<button class="jira-btn complete" onclick="jiraComplete('{skey}')">Complete</button>'''
-            sub_actions += f'''<button class="jira-btn" onclick="jiraComment('{skey}')">Comment</button>'''
+                sub_actions = ""
+                if sst == "in_progress":
+                    sub_actions = f'''<button class="jira-btn complete" onclick="jiraComplete('{skey}')">Complete</button>'''
+                sub_actions += f'''<button class="jira-btn" onclick="jiraComment('{skey}')">Comment</button>'''
 
-            rows.append(f'''<div class="jira-task subtask" data-key="{skey}">
+                rows.append(f'''<div class="jira-task subtask" data-key="{skey}">
   <span class="jira-key">{skey}</span>
   <span class="jira-summary">{stitle}</span>
   {sub_date_html}
@@ -3011,6 +3051,8 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
     {sub_actions}
   </span>
 </div>''')
+
+        rows.append('</div>')  # close .epic-group
 
     # Count all items including subtasks
     all_items = []
