@@ -11,7 +11,7 @@
 ## 실행 방법
 PowerShell:
 ```
-cd d:\Project\devops\260105\scripts\mcp
+cd D:\Project\Program\AutoReport\scripts\mcp
 .\run_backend_checks.ps1
 .\run_backend_checks.ps1 -BaseUrl http://127.0.0.1:8002
 .\run_backend_checks.ps1 -EnableTestGen

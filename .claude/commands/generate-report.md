@@ -8,7 +8,7 @@ AutoReport 리포트를 생성합니다.
 
 프로젝트 이름 또는 "all"을 지정하세요:
 - `/generate-report` — 모든 프로젝트 리포트 생성
-- `/generate-report 260105` — 특정 프로젝트만 생성
+- `/generate-report AutoReport` — 특정 프로젝트만 생성
 - `/generate-report all 2026-03-20` — 특정 날짜로 전체 생성
 
 ## 실행 절차

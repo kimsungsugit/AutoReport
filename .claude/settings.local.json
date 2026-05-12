@@ -38,7 +38,13 @@
       "Bash(ls .env)",
       "Bash(head -20 .env)",
       "Bash(find . -maxdepth 2 -name \"*.env*\" -type f)",
-      "Bash(rm *)"
+      "Bash(rm *)",
+      "Bash(gh repo *)",
+      "Bash(powershell *)",
+      "PowerShell(Unregister-ScheduledTask *)",
+      "PowerShell(& \"D:\\\\Project\\\\Program\\\\AutoReport\\\\scripts\\\\install_evening_auto_commit_task.ps1\")",
+      "PowerShell(& \"D:\\\\Project\\\\Program\\\\AutoReport\\\\scripts\\\\install_morning_report_startup.ps1\")",
+      "PowerShell(Get-ScheduledTask *)"
     ]
   },
   "mcpServers": {

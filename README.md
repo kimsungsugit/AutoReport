@@ -1,212 +1,146 @@
-# DevOps Analysis Toolkit
+# AutoReport
 
-SRS/SDS 문서와 C 소스 코드로부터 **UDS(Unit Design Specification)**, **STS(Software Test Specification)**, **SUTS(Software Unit Test Specification)** 문서를 자동 생성하는 통합 분석 플랫폼입니다.
-
-## 아키텍처
-
-```
-┌─────────────────────────────────────────────┐
-│              React Frontend (Vite)          │
-│  Views: JenkinsWorkflow / LocalWorkflow     │
-│         LocalEditor / LocalDashboard        │
-│  Context: Chat / UDS / JenkinsConfig        │
-└────────────────┬────────────────────────────┘
-                 │ REST API + SSE
-┌────────────────▼────────────────────────────┐
-│           FastAPI Backend (:7000)            │
-│  Routers: chat / excel / jenkins / local    │
-│           vcast / qac / test_gen / impact   │
-│           sessions / profiles / exports     │
-└────────────────┬────────────────────────────┘
-                 │
-    ┌────────────┼────────────────┐
-    ▼            ▼                ▼
-┌────────┐ ┌──────────┐ ┌──────────────┐
-│report_gen│ │generators│ │  workflow/    │
-│(UDS 생성)│ │(STS/SUTS)│ │(AI·빌드·분석)│
-└────────┘ └──────────┘ └──────────────┘
-                 │
-                 ▼
-         Gemini 3 Pro / 2.5 Flash
-```
+여러 Git 프로젝트의 활동을 자동 수집하여 **일일/주간/월간 리포트**, **Jira 상태 문서**, **HTML 대시보드**, **포트폴리오 대시보드**를 자동 생성하는 도구입니다.
 
 ## 주요 기능
 
-- **UDS 자동 생성**: C 소스 → 함수 분석 → AI 설명 강화 → DOCX 문서 생성
-- **STS 자동 생성**: SRS 요구사항 → 테스트 케이스 → XLSM 문서 생성
-- **SUTS 자동 생성**: UDS 함수 정보 → 단위 테스트 시퀀스 → XLSM 문서 생성
-- **Jenkins CI/CD 연동**: 빌드 로그 수집, 정적 분석(QAC), 커버리지 리포트
-- **C 테스트 생성**: 단위 테스트 코드 자동 생성 (CMake/CTest/gcovr)
-- **VectorCAST 리포트 파싱**: 테스트 커버리지 추적
-- **AI 챗봇**: 프로젝트 맥락 기반 질의응답 (RAG)
-- **문서 품질 검증**: Quality Gate, 추적성 매트릭스, 신뢰도 리포트
-
-## 설치 및 실행
-
-### 사전 요구사항
-
-- Python 3.10+
-- Node.js 18+
-- (선택) Docker
-
-### Backend 설정
-
-```bash
-# 가상환경 생성 및 활성화
-python -m venv venv
-venv\Scripts\activate      # Windows
-# source venv/bin/activate # Linux/Mac
-
-# 의존성 설치
-pip install -r requirements.txt
-
-# 환경변수 설정
-copy .env.example .env
-# .env 파일을 편집하여 GOOGLE_API_KEY 등을 설정하세요
-
-# 서버 실행
-uvicorn backend.main:app --host 0.0.0.0 --port 7000 --reload
-```
-
-### Frontend 설정
-
-```bash
-cd frontend
-npm install
-npm run dev    # 개발 서버 (http://localhost:5173)
-npm run build  # 프로덕션 빌드
-```
-
-### Docker 실행
-
-```bash
-docker build -t devops-toolkit .
-docker run -p 7000:7000 -e GOOGLE_API_KEY=your-key devops-toolkit
-```
-
-## 환경변수
-
-`.env.example` 파일을 참조하여 `.env` 파일을 생성하세요.
-
-| 변수 | 설명 | 기본값 |
-|---|---|---|
-| `GOOGLE_API_KEY` | Google AI (Gemini) API 키 | (필수) |
-| `DEVOPS_PROJECT_ROOT` | 분석 대상 C 프로젝트 루트 경로 | `/app/my_lin_gateway` |
-| `DEVOPS_JENKINS_BASE_URL` | Jenkins 서버 URL | `http://localhost:8080` |
-| `DEVOPS_JENKINS_USERNAME` | Jenkins 사용자명 | `admin` |
-| `DEVOPS_JENKINS_API_TOKEN` | Jenkins API 토큰 | (필수 - Jenkins 사용 시) |
-| `LLM_GEMINI_ONLY` | Gemini 전용 모드 | `1` |
-| `KB_STORAGE` | RAG 저장소 (sqlite/pgvector) | `sqlite` |
+- **멀티 프로젝트 분석**: `scripts/startup_projects.json`에 등록된 프로젝트들의 git 활동을 자동 분석
+- **AI 기반 인사이트**: Gemini로 일일 진행 요약, 다음 작업 계획, 변경 영향 분석 생성
+- **Jira 연동**: APPL 보드의 스프린트/이슈/큰틀(Epic)/작업(Task) 라이브 표시, 인라인 큰틀·작업 생성
+- **자동 커밋/푸시**: 매일 17:00에 등록된 repo들의 변경 사항 자동 커밋·푸시 (Windows Scheduled Task)
+- **모닝 리포트**: Windows 로그인 시 자동 생성·대시보드 오픈
+- **포트폴리오 대시보드**: 모든 프로젝트를 한 화면에서 비교
 
 ## 디렉토리 구조
 
 ```
-260105/
-├── backend/              # FastAPI 백엔드
-│   ├── main.py           # 앱 진입점 + 미들웨어
-│   ├── schemas.py        # Pydantic 요청/응답 모델
-│   ├── helpers.py        # 공통 헬퍼 함수
-│   └── routers/          # API 라우터 (chat, excel, jenkins, ...)
-├── frontend/             # React + Vite 프론트엔드
-│   └── src/
-│       ├── App.jsx       # 메인 앱 컴포넌트
-│       ├── views/        # 페이지 뷰 (JenkinsWorkflow, LocalWorkflow, ...)
-│       ├── components/   # 재사용 컴포넌트
-│       └── contexts/     # React Context (Chat, UDS, JenkinsConfig)
-├── report_gen/           # UDS 생성 엔진 (8 모듈)
-│   ├── source_parser.py  # C 소스 파싱
-│   ├── function_analyzer.py  # 함수 분석
-│   ├── requirements.py   # 요구사항 매핑
-│   ├── uds_text.py       # UDS 텍스트 처리
-│   ├── uds_generator.py  # UDS 미리보기/섹션 생성
-│   ├── docx_builder.py   # DOCX 문서 조립
-│   ├── validation.py     # 품질 검증
-│   └── utils.py          # 유틸리티
-├── generators/           # 문서 생성기
-│   ├── sts.py            # STS (Software Test Specification)
-│   └── suts.py           # SUTS (Software Unit Test Specification)
-├── workflow/             # 핵심 워크플로우 엔진
-│   ├── ai.py             # LLM 호출 (Gemini)
-│   ├── uds_ai.py         # UDS AI 강화
-│   ├── build.py          # C 빌드/테스트
-│   ├── common.py         # 공통 유틸리티
-│   └── gui_utils.py      # GUI 워크플로우 오케스트레이터
-├── report/               # 리포트 상수/파싱
-├── templates/            # DOCX/XLSM 템플릿
-├── tests/                # 테스트
-├── config.py             # 중앙 설정
-├── Dockerfile            # Docker 빌드
-├── Jenkinsfile           # CI/CD 파이프라인
-└── OAI_CONFIG_LIST       # LLM 설정 (API 키는 환경변수 참조)
+AutoReport/
+├── scripts/
+│   ├── generate_periodic_reports.py    # 핵심 엔진 (단일 프로젝트)
+│   ├── generate_multi_project_reports.py  # 멀티 프로젝트 오케스트레이터
+│   ├── generate_morning_report.py      # 모닝 리포트
+│   ├── auto_commit_push.py             # 자동 커밋/푸시
+│   ├── generate_history_dashboard.py   # 히스토리 대시보드
+│   ├── design_system.py                # 공유 CSS/JS (Single Source of Truth)
+│   ├── jira_proxy.py                   # Jira 라이브 API 프록시 (port 18923)
+│   ├── startup_projects.json           # 모니터링 대상 프로젝트 설정
+│   └── mcp/
+│       └── autoreport_mcp_server.py    # MCP 서버 (Claude Code 연동)
+├── workflow/
+│   ├── llm_adapters.py                 # Gemini/OpenAI/Anthropic 어댑터
+│   └── task_provider.py                # Jira/내부 task provider
+├── reports/                            # 생성된 리포트 (gitignored)
+│   ├── projects/<name>/                # 프로젝트별 리포트
+│   ├── portfolio/                      # 멀티 프로젝트 대시보드
+│   ├── automation_status/              # 자동 커밋 상태
+│   ├── jira/                           # Jira 상태 문서
+│   └── history/                        # 히스토리 대시보드
+├── .claude/
+│   ├── agents/                         # PM / Design Reviewer / Frontend Dev / QA
+│   └── commands/                       # 슬래시 커맨드
+└── project_docs/                       # 프로젝트 문서
 ```
 
-## API 엔드포인트 요약
+## 사전 요구사항
 
-| 경로 | 설명 |
+- Python 3.10+ (MCP 서버는 Python 3.12)
+- Git (각 모니터링 대상 프로젝트는 git repo여야 함)
+- (선택) Jira Server / Cloud 인스턴스 + PAT
+
+## 환경변수
+
+`.env` 파일을 프로젝트 루트에 생성하세요:
+
+| 변수 | 설명 |
 |---|---|
-| `GET /api/health` | 서버 상태 확인 |
-| `POST /api/chat` | AI 챗봇 질의 |
-| `POST /api/run/stop` | 실행 중인 작업 중단 |
-| `/api/jenkins/*` | Jenkins 빌드/리포트 관련 |
-| `/api/local/*` | 로컬 프로젝트 분석/리포트 |
-| `/api/excel/*` | Excel 비교/변환 |
-| `/api/vcast/*` | VectorCAST 리포트 파싱 |
-| `/api/qac/*` | QAC 정적 분석 리포트 |
-| `/api/test-gen/*` | C 테스트 코드 생성 |
-| `/api/impact/*` | 변경 영향 분석 |
-| `/api/sessions/*` | 세션 관리 |
-| `/api/profiles/*` | 프로젝트 프로파일 관리 |
-| `/api/exports/*` | 문서 내보내기 |
+| `GOOGLE_API_KEY` | Gemini API 키 (AI 분석에 사용) |
+| `JIRA_URL` | Jira 인스턴스 URL (예: `https://jira.example.com`) |
+| `JIRA_TOKEN` | Jira PAT (Bearer Token) |
+
+## 사용법
+
+### 단일 프로젝트 리포트 생성
+
+```bash
+python scripts/generate_periodic_reports.py \
+  --repo "D:/Project/Program/AutoReport" \
+  --output-root "D:/Project/Program/AutoReport/reports/projects/AutoReport" \
+  --profile reporting_automation
+```
+
+### 멀티 프로젝트 (모든 등록 프로젝트)
+
+```bash
+python scripts/generate_multi_project_reports.py
+```
+
+생성 결과: `reports/portfolio/YYYY-MM-DD-multi-project-dashboard.html`
+
+### 자동 커밋 점검 (dry-run)
+
+```bash
+python scripts/auto_commit_push.py --dry-run
+```
+
+### 프로젝트 추가
+
+`scripts/startup_projects.json`에 항목 추가:
+
+```json
+{
+  "name": "MyProject",
+  "path": "D:/Project/MyProject",
+  "profile": "general_software",
+  "enabled": true
+}
+```
+
+지원 프로파일: `reporting_automation`, `desktop_app`, `general_software`, `uds_quality`
+
+## Windows 자동화
+
+### 매일 17:00 자동 커밋
+
+```powershell
+.\scripts\install_evening_auto_commit_task.ps1
+```
+
+→ `AutoReport_AutoCommitPush_1700` 작업이 Task Scheduler에 등록됨.
+
+### 로그인 시 모닝 리포트
+
+```powershell
+.\scripts\install_morning_report_startup.ps1
+```
+
+→ `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\AutoReport_morning_report.cmd` 생성.
+
+## Jira 라이브 보드
+
+`scripts/jira_proxy.py`가 18923 포트로 실행되면 portfolio dashboard에서:
+
+- 스프린트 보드 인라인 표시
+- **큰틀(Epic)** / **작업(Task)** 인라인 생성
+- 작업 → 큰틀 부모 선택, 일정·주간보고 필드 자동 상속
+- 상태 전환 (진행 중 / 종료 요청)
+
+```bash
+python scripts/jira_proxy.py
+```
+
+## 슬래시 커맨드 (Claude Code)
+
+| 커맨드 | 설명 |
+|---|---|
+| `/generate-report [project] [date]` | 리포트 생성 |
+| `/dashboard` | 최신 대시보드 정보 |
+| `/report-status [date]` | 리포트 상태 확인 |
+| `/auto-commit` | 자동 커밋/푸시 (dry-run 기본) |
+| `/add-project <name> <path> [profile]` | 프로젝트 추가 |
+| `/design-review [file]` | 디자인 리뷰 실행 |
+| `/qa [full]` | QA 검증 실행 |
+| `/improve-design [scope]` | 전체 개선 사이클 (PM 조율) |
 
 ## 라이선스
 
-내부 프로젝트 - 비공개
-"# devops" 
-
-## GitHub Project Documents
-
-Trackable project documents for GitHub are stored in [`project_docs/`](/D:/Project/devops/260105/project_docs/README.md).
-
-Recommended locations:
-
-- Daily reports: [`project_docs/daily_reports/`](/D:/Project/devops/260105/project_docs/daily_reports/README.md)
-- Weekly reports: [`project_docs/weekly_reports/`](/D:/Project/devops/260105/project_docs/weekly_reports/README.md)
-- Change history: [`project_docs/change_history/`](/D:/Project/devops/260105/project_docs/change_history/README.md)
-- Design docs: [`project_docs/design/`](/D:/Project/devops/260105/project_docs/design/README.md)
-- Change requests: [`project_docs/change_requests/`](/D:/Project/devops/260105/project_docs/change_requests/README.md)
-
-## Startup Reports
-
-To generate startup reports manually:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_startup_reports.ps1
-```
-
-To generate and open the daily report automatically in Notepad:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\run_startup_reports.ps1 -OpenAfter
-```
-
-To install it into Windows Startup:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install_morning_report_startup.ps1
-```
-
-Generated output:
-
-- `reports/daily_brief/YYYY-MM-DD-daily-report.md`
-- `reports/plans/YYYY-MM-DD-next-plan.md`
-- `reports/jira/YYYY-MM-DD-jira-plan.md`
-- `reports/jira/YYYY-MM-DD-jira-result.md`
-- `reports/dashboard/YYYY-MM-DD-startup-dashboard.html`
-- `reports/weekly_brief/YYYY-MM-DD-weekly-report.md` on Friday mornings
-- `reports/monthly_brief/YYYY-MM-monthly-report.md` on the first Monday after month end
-
-Optional integrations:
-
-- `GITHUB_TOKEN`: enrich reports with GitHub API commit / PR metadata
-- `GOOGLE_API_KEY` or `OAI_CONFIG_LIST`: generate higher-quality Korean summaries with Gemini
-- Jira-ready documents are generated under `reports/jira/` for upload or copy/paste into Jira issues
+내부 프로젝트 — 비공개.
