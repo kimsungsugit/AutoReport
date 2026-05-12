@@ -1,12 +1,6 @@
 {
   "projects": [
     {
-      "name": "260105",
-      "path": "D:/Project/devops/260105",
-      "profile": "uds_quality",
-      "enabled": true
-    },
-    {
       "name": "GreencoreMaster",
       "path": "D:/Project/Program/GreencoreMaster",
       "profile": "desktop_app",
@@ -16,12 +10,6 @@
       "name": "AutoReport",
       "path": "D:/Project/Program/AutoReport",
       "profile": "reporting_automation",
-      "enabled": true
-    },
-    {
-      "name": "Release",
-      "path": "D:/Project/devops/Release",
-      "profile": "uds_quality",
       "enabled": true
     },
     {
@@ -36,9 +24,9 @@
       }
     },
     {
-      "name": "AutoDoc",
-      "path": "D:/Project/Program/AutoDoc",
-      "profile": "general_software",
+      "name": "CyberSecurity",
+      "path": "C:/Project/CyberSecurity",
+      "profile": "desktop_app",
       "enabled": true
     }
   ]

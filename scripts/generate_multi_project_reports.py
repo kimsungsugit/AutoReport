@@ -15,7 +15,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_ROOT = SCRIPT_DIR.parent
 
 sys.path.insert(0, str(WORKSPACE_ROOT))
-from scripts.design_system import DESIGN_CSS, CHECKLIST_JS
+from scripts.design_system import DESIGN_CSS, CHECKLIST_JS, TABS_JS
 from scripts.generate_periodic_reports import REGENERATE_BAR_HTML, REGENERATE_SCRIPT
 
 
@@ -385,6 +385,7 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
 </section>
 """
             )
+    project_count = sum(1 for it in items if it.get("status") == "generated")
     return f"""<!doctype html>
 <html lang="ko">
 <head>
@@ -406,22 +407,34 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
   <div class="wrap" id="main-content">
     <section class="hero">
       <h1>Multi Project Startup Dashboard</h1>
-      <p>{escape(run_date)} portfolio summary for configured repositories.</p>
+      <p>{escape(run_date)} portfolio summary for {project_count} repositories.</p>
       {f'<div class="hero-links"><a href="{escape(history_link)}">Open History Dashboard</a></div>' if history_link else ''}
     </section>
     {REGENERATE_BAR_HTML}
-    {jira_html}
-    <h2 class="section-title">Portfolio Task Boards</h2>
-    <p class="section-copy">Use each parent task as the Jira task draft, then create the listed subtasks and close them against the shown completion criteria.</p>
-    <div class="portfolio-grid">
-      {"".join(board_sections)}
-    </div>
-    <h2 class="section-title">Project Status Cards</h2>
-    <div class="grid">
-      {"".join(cards)}
-    </div>
+    <nav class="tab-nav" role="tablist" aria-label="Portfolio sections" data-tab-group="portfolio">
+      <button class="tab-button" role="tab" data-tab-group="portfolio" data-tab="overview" id="tab-btn-overview" aria-selected="true" aria-controls="tab-panel-overview" tabindex="0">Overview</button>
+      <button class="tab-button" role="tab" data-tab-group="portfolio" data-tab="jira"     id="tab-btn-jira"     aria-selected="false" aria-controls="tab-panel-jira"     tabindex="-1">Jira &amp; Gantt</button>
+      <button class="tab-button" role="tab" data-tab-group="portfolio" data-tab="plans"    id="tab-btn-plans"    aria-selected="false" aria-controls="tab-panel-plans"    tabindex="-1">Task Plans</button>
+    </nav>
+    <section class="tab-panel is-active" data-tab-group="portfolio" data-tab="overview" role="tabpanel" id="tab-panel-overview" aria-labelledby="tab-btn-overview">
+      <h2 class="section-title">Project Status Cards</h2>
+      <div class="grid">
+        {"".join(cards)}
+      </div>
+    </section>
+    <section class="tab-panel" data-tab-group="portfolio" data-tab="jira" role="tabpanel" id="tab-panel-jira" aria-labelledby="tab-btn-jira" hidden>
+      {jira_html or '<p class="section-copy">연결된 Jira 보드가 없습니다.</p>'}
+    </section>
+    <section class="tab-panel" data-tab-group="portfolio" data-tab="plans" role="tabpanel" id="tab-panel-plans" aria-labelledby="tab-btn-plans" hidden>
+      <h2 class="section-title">Portfolio Task Boards</h2>
+      <p class="section-copy">Use each parent task as the Jira task draft, then create the listed subtasks and close them against the shown completion criteria.</p>
+      <div class="portfolio-grid">
+        {"".join(board_sections)}
+      </div>
+    </section>
   </div>
 {CHECKLIST_JS}
+{TABS_JS}
 {jira_scripts}
 {REGENERATE_SCRIPT}
 <script>

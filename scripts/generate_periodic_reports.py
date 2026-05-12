@@ -45,11 +45,28 @@ def load_get_adapter():
 get_adapter = load_get_adapter()
 
 
+def _drop_if_expired(data: dict[str, Any]) -> dict[str, Any]:
+    """Return {} if the sprint window already ended — avoids leaking stale Jira data
+    into reports when the next sprint hasn't been opened on the server side yet."""
+    if not data:
+        return data
+    sprint = data.get("sprint") or {}
+    end = sprint.get("end")
+    if not end:
+        return data
+    try:
+        if date.fromisoformat(end) < date.today():
+            return {}
+    except (ValueError, TypeError):
+        pass
+    return data
+
+
 def load_sprint_tasks() -> dict[str, Any]:
     """Load sprint task definitions via TaskProvider.
 
     Uses JiraApiTaskProvider if JIRA_URL/JIRA_TOKEN are set,
-    otherwise falls back to sprint_tasks.json.
+    otherwise falls back to sprint_tasks.json. Expired sprints are dropped.
     """
     try:
         task_provider_path = REPO_ROOT / "workflow" / "task_provider.py"
@@ -57,7 +74,7 @@ def load_sprint_tasks() -> dict[str, Any]:
         if spec and spec.loader:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            return mod.get_task_provider().get_tasks()
+            return _drop_if_expired(mod.get_task_provider().get_tasks())
     except Exception:
         pass
     # Direct fallback
@@ -66,9 +83,40 @@ def load_sprint_tasks() -> dict[str, Any]:
         return {}
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            return _drop_if_expired(json.load(f))
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def _project_jira_for_repo(repo_root: Path) -> dict[str, Any] | None:
+    """Find the jira config for `repo_root` in startup_projects.json.
+
+    Why: load_sprint_tasks() returns global fallback data (Release_claude의 APPL sprint),
+    which previously leaked into every project's report regardless of jira configuration.
+    Returns the project's `jira` dict if configured, else None — None means "this repo
+    has no Jira and should not have sprint_tasks injected".
+    """
+    try:
+        cfg_path = Path(__file__).resolve().parent / "startup_projects.json"
+        if not cfg_path.exists():
+            return None
+        target = str(repo_root.resolve()).replace("\\", "/").lower()
+        with open(cfg_path, encoding="utf-8") as f:
+            data = json.load(f)
+        for proj in data.get("projects", []) or []:
+            proj_path_raw = str(proj.get("path") or "").strip()
+            if not proj_path_raw:
+                continue
+            try:
+                proj_path = str(Path(proj_path_raw).resolve()).replace("\\", "/").lower()
+            except OSError:
+                continue
+            if proj_path == target:
+                jira = proj.get("jira")
+                return jira if isinstance(jira, dict) else None
+    except Exception:
+        return None
+    return None
 
 
 def _keyword_pattern(keyword: str) -> re.Pattern[str]:
@@ -503,7 +551,12 @@ def fetch_github_metadata(remote_url: str, branch: str, window: ReportWindow, lo
         commit_items = github_request(f"{base}/commits", token=token, params={"sha": branch, "since": start_iso, "until": end_iso, "per_page": 30})
         pulls = github_request(f"{base}/pulls", token=token, params={"state": "all", "sort": "updated", "direction": "desc", "per_page": 20})
     except Exception as exc:
-        return {"enabled": False, "reason": "api_failed", "error": str(exc)}
+        msg = str(exc)
+        # 404 is the normal case for new private repos accessed without a token —
+        # don't leak it as an "api_failed" risk into the AI prompt.
+        if "404" in msg:
+            return {"enabled": False, "reason": "private_or_empty"}
+        return {"enabled": False, "reason": "api_failed", "error": msg}
 
     local_map = {commit.short_hash: commit for commit in local_commits}
     github_commits = []
@@ -782,6 +835,7 @@ def build_context_payload(
     uncommitted: list[str],
     github_meta: dict[str, Any],
     profile_name: str,
+    jira_enabled: bool = True,
 ) -> dict[str, Any]:
     diff_summary = summarize_diff_stats(
         get_diff_numstat(repo_root, branch, window.start, window.end)
@@ -825,11 +879,15 @@ def build_context_payload(
         "changed_docs": changed_markdown_docs(changed_files)[:20],
         "uncommitted": uncommitted[:30],
         "github": github_meta,
-        "sprint_tasks": match_commits_to_tasks(
-            [{"hash": c.short_hash, "time": c.authored_at, "author": c.author, "subject": c.subject} for c in commits[:20]],
-            changed_files,
-            load_sprint_tasks(),
-            today,
+        "jira_enabled": jira_enabled,
+        "sprint_tasks": (
+            match_commits_to_tasks(
+                [{"hash": c.short_hash, "time": c.authored_at, "author": c.author, "subject": c.subject} for c in commits[:20]],
+                changed_files,
+                load_sprint_tasks(),
+                today,
+            )
+            if jira_enabled else []
         ),
     }
 
@@ -869,25 +927,32 @@ def generate_jira_suggestions(
     Returns a list of suggestion dicts with id, task_key, type, title,
     suggested_text, reason, confidence, status fields.
     """
-    # Always prefer Jira live data for suggestions (match_commits_to_tasks
-    # overrides status based on dates, which diverges from actual Jira state)
+    # Suggestions only make sense for repos whose jira is configured in
+    # startup_projects.json. Previously we grabbed the *first* jira-enabled
+    # project's live data unconditionally, which leaked Release_claude's APPL
+    # sprint into every other project's reports. Match by repo_root instead.
     sprint_tasks = []
-    try:
-        from workflow.task_provider import get_task_provider
-        _sp_path = Path(__file__).resolve().parent / "startup_projects.json"
-        _pcs = []
-        if _sp_path.exists():
-            with open(_sp_path, encoding="utf-8") as _f:
-                _pcs = json.load(_f).get("projects", [])
-        for _pc in _pcs:
-            if isinstance(_pc.get("jira"), dict):
-                provider = get_task_provider(_pc)
-                live_data = provider.get_tasks()
-                sprint_tasks = live_data.get("tasks", [])
-                break
-    except Exception:
-        pass
-    # Fallback to payload data if Jira unavailable
+    if payload.get("jira_enabled"):
+        try:
+            from workflow.task_provider import get_task_provider
+            repo_root_str = str(payload.get("repo_root") or "")
+            if repo_root_str:
+                matched_pc = _project_jira_for_repo(Path(repo_root_str))
+                if matched_pc:
+                    # Need the full project dict (with name/path) for the provider
+                    _sp_path = Path(__file__).resolve().parent / "startup_projects.json"
+                    target = str(Path(repo_root_str).resolve()).replace("\\", "/").lower()
+                    with open(_sp_path, encoding="utf-8") as _f:
+                        for _pc in json.load(_f).get("projects", []) or []:
+                            _pp = str(Path(str(_pc.get("path") or "")).resolve()).replace("\\", "/").lower()
+                            if _pp == target and isinstance(_pc.get("jira"), dict):
+                                provider = get_task_provider(_pc)
+                                live_data = provider.get_tasks()
+                                sprint_tasks = live_data.get("tasks", [])
+                                break
+        except Exception:
+            pass
+    # Fallback to payload data if Jira unavailable (also empty when jira_enabled=False)
     if not sprint_tasks:
         sprint_tasks = list(payload.get("sprint_tasks") or [])
     if not sprint_tasks:
@@ -4236,6 +4301,7 @@ def make_payload(
     profile_name: str,
 ) -> dict[str, Any]:
     github_meta = fetch_github_metadata(remote_url, branch, window, commits)
+    jira_enabled = _project_jira_for_repo(repo_root) is not None
     return build_context_payload(
         today=today,
         report_type=report_type,
@@ -4250,6 +4316,7 @@ def make_payload(
         uncommitted=uncommitted,
         github_meta=github_meta,
         profile_name=profile_name,
+        jira_enabled=jira_enabled,
     )
 
 
@@ -4269,8 +4336,6 @@ def build_previous_month_window(today: date) -> ReportWindow:
 
 def default_domain_profile(repo_name: str) -> str:
     name = repo_name.lower()
-    if name == "260105":
-        return "uds_quality"
     if "greencore" in name:
         return "desktop_app"
     if "autoreport" in name:

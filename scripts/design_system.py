@@ -1171,6 +1171,66 @@ code { overflow-wrap: anywhere; word-break: break-word; }
   }
   .actions a, .btn { border-color: #bbb; }
 }
+
+/* === Tab navigation (portfolio sectioning) === */
+.tab-nav {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  margin: 24px 0 28px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  box-shadow: var(--shadow-sm);
+  flex-wrap: wrap;
+}
+.tab-button {
+  flex: 1 1 auto;
+  min-width: 140px;
+  padding: 10px 20px;
+  background: transparent;
+  border: none;
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease);
+  letter-spacing: .02em;
+  font-family: inherit;
+}
+.tab-button:hover:not([aria-selected="true"]) {
+  background: var(--paper-alt);
+  color: var(--ink);
+}
+.tab-button[aria-selected="true"] {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: var(--shadow-sm);
+}
+.tab-button:focus-visible {
+  outline: 2px solid var(--accent-2);
+  outline-offset: 2px;
+}
+.tab-panel {
+  display: none;
+  animation: tabFadeIn .25s var(--ease);
+}
+.tab-panel.is-active {
+  display: block;
+}
+@keyframes tabFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@media (max-width: 720px) {
+  .tab-nav { flex-direction: column; padding: 4px; }
+  .tab-button { min-width: 0; }
+}
+@media print {
+  .tab-nav { display: none; }
+  .tab-panel { display: block !important; page-break-inside: avoid; }
+}
 """
 
 # ---------------------------------------------------------------------------
@@ -1186,6 +1246,55 @@ CHECKLIST_JS = r"""
     el.addEventListener("change", function () {
       try { window.localStorage.setItem(key, el.checked ? "1" : "0"); } catch (e) {}
     });
+  });
+})();
+</script>
+"""
+
+# ---------------------------------------------------------------------------
+# Tab navigation JS (sessionStorage based active-tab persistence + keyboard nav)
+# ---------------------------------------------------------------------------
+TABS_JS = r"""
+<script>
+(function () {
+  function activate(group, tab) {
+    var buttons = document.querySelectorAll('.tab-button[data-tab-group="' + group + '"]');
+    var panels  = document.querySelectorAll('.tab-panel[data-tab-group="' + group + '"]');
+    buttons.forEach(function (btn) {
+      var on = btn.dataset.tab === tab;
+      btn.setAttribute('aria-selected', on ? 'true' : 'false');
+      btn.tabIndex = on ? 0 : -1;
+    });
+    panels.forEach(function (panel) {
+      var on = panel.dataset.tab === tab;
+      panel.classList.toggle('is-active', on);
+      if (on) { panel.removeAttribute('hidden'); } else { panel.setAttribute('hidden', ''); }
+    });
+    try { sessionStorage.setItem('autoreport-tab:' + group, tab); } catch (e) {}
+  }
+
+  document.querySelectorAll('.tab-nav').forEach(function (nav) {
+    var group = nav.dataset.tabGroup || 'default';
+    var buttons = Array.from(nav.querySelectorAll('.tab-button'));
+    buttons.forEach(function (btn, idx) {
+      btn.addEventListener('click', function () { activate(group, btn.dataset.tab); });
+      btn.addEventListener('keydown', function (e) {
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight' && e.key !== 'Home' && e.key !== 'End') return;
+        e.preventDefault();
+        var next = idx;
+        if (e.key === 'ArrowLeft')  next = (idx - 1 + buttons.length) % buttons.length;
+        if (e.key === 'ArrowRight') next = (idx + 1) % buttons.length;
+        if (e.key === 'Home')       next = 0;
+        if (e.key === 'End')        next = buttons.length - 1;
+        buttons[next].focus();
+        activate(group, buttons[next].dataset.tab);
+      });
+    });
+    var saved = null;
+    try { saved = sessionStorage.getItem('autoreport-tab:' + group); } catch (e) {}
+    if (saved && nav.querySelector('.tab-button[data-tab="' + saved + '"]')) {
+      activate(group, saved);
+    }
   });
 })();
 </script>
