@@ -971,6 +971,11 @@ code {
 .gantt-label { font-size: 12px; fill: var(--ink); font-weight: 600; }
 .gantt-date { font-size: 10px; fill: var(--muted); }
 .gantt-header { font-size: 11px; fill: var(--muted); font-weight: 700; }
+.gantt-epic-band { fill: var(--paper-alt); stroke: var(--line); stroke-width: 0.5; }
+.gantt-epic-band.no-epic { fill: var(--bg-deep); }
+.gantt-epic-key { font-size: 11px; fill: var(--accent); font-weight: 800; }
+.gantt-epic-summary { font-size: 12px; fill: var(--ink); font-weight: 600; }
+.gantt-epic-count { font-size: 10px; fill: var(--muted); font-weight: 700; }
 
 /* --- Jira live board (interactive) ------------------------------------ */
 .jira-board { margin: 0 0 18px; border: 1px solid var(--line); border-radius: var(--r-lg); overflow: hidden; background: var(--paper); box-shadow: var(--shadow-md); }
@@ -1282,6 +1287,26 @@ code { overflow-wrap: anywhere; word-break: break-word; }
 .epic-group.no-epic .epic-summary {
   color: var(--muted);
   font-style: italic;
+}
+.epic-low-pill {
+  display: inline-block;
+  background: var(--bg-deep);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  margin-left: 6px;
+  flex-shrink: 0;
+}
+.epic-group.epic-group-done {
+  opacity: 0.55;
+}
+.epic-group.epic-group-done .epic-key::after {
+  content: " ✓";
+  color: var(--ok);
+  font-weight: 800;
 }
 """
 

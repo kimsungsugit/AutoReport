@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -667,7 +668,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         # -u: unbuffered stdout/stderr so the child's startup
                         # banner reaches .proxy.log immediately rather than
                         # sitting in Python's block buffer.
-                        [sys.executable, "-u", str(Path(__file__).resolve())],
+                        # --allow-takeover: bypass duplicate-instance guard
+                        # because the parent is still listening for ~0.4s.
+                        [sys.executable, "-u", str(Path(__file__).resolve()), "--allow-takeover"],
                         cwd=str(REPO_ROOT),
                         creationflags=flags,
                         stdin=subprocess.DEVNULL,
@@ -717,8 +720,31 @@ class _ReusableHTTPServer(HTTPServer):
     allow_reuse_address = True
 
 
+def _port_in_use(host: str, port: int, timeout: float = 0.6) -> bool:
+    """True if another listener is already accepting connections on host:port.
+
+    With `allow_reuse_address=True` on Windows, the OS happily lets a second
+    `bind()` succeed, so two proxy instances can end up both LISTENING and
+    splitting incoming requests. This pre-bind probe makes a startup-time
+    decision instead of relying on the kernel to reject.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        return False
+
+
 if __name__ == "__main__":
     import os
+    # Duplicate-instance guard. The `--allow-takeover` flag is set by the
+    # /api/proxy/restart endpoint when it spawns a successor: that flow
+    # legitimately needs to bind while the parent is still listening, and
+    # the parent then closes its socket on a short delay.
+    if "--allow-takeover" not in sys.argv and _port_in_use("127.0.0.1", PORT):
+        # Plain ASCII — running this manually on Korean cp949 console must not crash.
+        print(f"jira_proxy: port {PORT} already in use by another instance -- exiting.")
+        sys.exit(0)
     server = _ReusableHTTPServer(("127.0.0.1", PORT), ProxyHandler)
     print(f"Jira proxy server running at http://localhost:{PORT} (pid={os.getpid()})")
     print(f"Endpoints:")

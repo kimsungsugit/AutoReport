@@ -44,7 +44,13 @@
       "PowerShell(Unregister-ScheduledTask *)",
       "PowerShell(& \"D:\\\\Project\\\\Program\\\\AutoReport\\\\scripts\\\\install_evening_auto_commit_task.ps1\")",
       "PowerShell(& \"D:\\\\Project\\\\Program\\\\AutoReport\\\\scripts\\\\install_morning_report_startup.ps1\")",
-      "PowerShell(Get-ScheduledTask *)"
+      "PowerShell(Get-ScheduledTask *)",
+      "Bash(netstat -ano)",
+      "Bash(findstr :18923)",
+      "Bash(tasklist /FI \"PID eq 24448\" /FO LIST)",
+      "Bash(tasklist /FI \"PID eq 18632\" /FO LIST)",
+      "Bash(wmic process *)",
+      "Bash(findstr -i run_daily)"
     ]
   },
   "mcpServers": {

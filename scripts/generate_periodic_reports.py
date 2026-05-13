@@ -24,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import config
 from scripts.design_system import (
-    DESIGN_CSS, CHECKLIST_JS,
+    DESIGN_CSS,
     SVG_PALETTE, SVG_BG_DARK, SVG_STROKE, SVG_TEXT_DARK, SVG_TEXT_DARKER,
     SVG_TEXT_LIGHT, SVG_TEXT_MUTED, SVG_TEXT_ACCENT, SVG_IMPACT_STROKE,
     SVG_SUBTITLE_TINTS, svg_text_color_for,
@@ -1106,14 +1106,6 @@ def generate_jira_suggestions(
                 matched.append(subj)
         return matched[:5]
 
-    def _summarize_commits(commits: list[str]) -> str:
-        """Create a short summary from commit messages."""
-        if not commits:
-            return ""
-        # Deduplicate and trim
-        unique = list(dict.fromkeys(commits))[:3]
-        return "; ".join(c[:60] for c in unique)
-
     for task in sprint_tasks:
         key = task.get("key", "")
         if not key:
@@ -1123,8 +1115,6 @@ def generate_jira_suggestions(
         status = task.get("status", "")
         subtasks = task.get("subtasks", [])
         done_subs = [s for s in subtasks if s.get("status") == "done"]
-        in_prog_subs = [s for s in subtasks if s.get("status") == "in_progress"]
-        pending_subs = [s for s in subtasks if s.get("status") == "pending"]
         is_in_progress = status in ("진행 중", "in_progress")
         is_pending = status in ("예정", "pending")
         is_done = status in ("완료", "done")
@@ -1145,8 +1135,6 @@ def generate_jira_suggestions(
             # 진행 중 부작업 → 완료 처리 제안 (커밋 + description 기반 구체적 결과)
             if sst == "in_progress":
                 sid += 1
-                related = _match_commits_for(stitle, key)
-                summary = _summarize_commits(related)
                 # Description: prefer Jira live, fall back to local sprint_tasks.json
                 desc = sub.get("description", "")
                 if not desc:
@@ -1400,11 +1388,30 @@ def generate_jira_suggestions(
                 })
                 break
 
+    # Attach epic_key / epic_summary so the suggestion review panel can group
+    # cards by 큰틀 (Epic). Subtask suggestions inherit their parent's Epic.
+    task_epic_map: dict[str, tuple[str, str]] = {}
+    for _t in sprint_tasks:
+        _ek = _t.get("epic_key") or ""
+        _es = _t.get("epic_summary") or ""
+        if _t.get("key"):
+            task_epic_map[_t["key"]] = (_ek, _es)
+        for _sub in _t.get("subtasks") or []:
+            if _sub.get("key"):
+                task_epic_map[_sub["key"]] = (_ek, _es)
+    for _s in suggestions:
+        _k = _s.get("task_key", "")
+        _ek, _es = task_epic_map.get(_k, ("", ""))
+        _s["epic_key"] = _ek
+        _s["epic_summary"] = _es
+
     return suggestions[:max_suggestions]
 
 
 def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-    areas = payload["top_areas"]
+    # NOTE: doc_type is kept for API stability — callers (tests + main) pass it
+    # positionally even though the fallback shape is doc-type-agnostic today.
+    del doc_type
     commits = payload["recent_commits"]
     work_type = work_type_label(payload["work_type"])
     source_insights = list(payload.get("source_insights") or [])
@@ -2809,7 +2816,12 @@ def svg_change_impact_map(areas: list[dict[str, Any]], top_files: list[dict[str,
     return ''.join(parts)
 
 def svg_sprint_gantt(tasks: list[dict[str, Any]], sprint: dict[str, Any], today: date | None = None) -> str:
-    """Render a Gantt chart SVG for sprint tasks."""
+    """Render a Gantt chart SVG for sprint tasks, grouped by Epic (큰틀).
+
+    Each Epic gets a horizontal swimlane (band header + its tasks) so the
+    Gantt mirrors the Jira Live Board grouping. Epic order matches the
+    Live Board: task count desc → epic_key asc → "No Epic" last.
+    """
     if today is None:
         today = date.today()
 
@@ -2818,8 +2830,24 @@ def svg_sprint_gantt(tasks: list[dict[str, Any]], sprint: dict[str, Any], today:
     if not gantt_tasks:
         return ""
 
-    # Sort by start date
-    gantt_tasks.sort(key=lambda t: t.get("start", ""))
+    # Group by Epic
+    epic_groups: dict[str, dict[str, Any]] = {}
+    for t in gantt_tasks:
+        ek = t.get("epic_key") or "_no_epic"
+        if ek not in epic_groups:
+            epic_groups[ek] = {"epic_summary": t.get("epic_summary", ""), "tasks": []}
+        epic_groups[ek]["tasks"].append(t)
+
+    # Within each Epic, sort by start date asc
+    for g in epic_groups.values():
+        g["tasks"].sort(key=lambda t: t.get("start", ""))
+
+    def _epic_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, int, str]:
+        ek, g = item
+        is_no_epic = 1 if ek == "_no_epic" else 0
+        return (is_no_epic, -len(g["tasks"]), ek)
+
+    sorted_groups = sorted(epic_groups.items(), key=_epic_sort_key)
 
     # Determine time range from actual task dates (tighter than full sprint)
     task_dates = []
@@ -2839,12 +2867,18 @@ def svg_sprint_gantt(tasks: list[dict[str, Any]], sprint: dict[str, Any], today:
     total_days = max((range_end - range_start).days, 1)
 
     row_h = 32
+    epic_h = 28       # Epic header band height
+    gap_h = 6         # gap after each Epic group
     header_h = 40
     left_margin = 320
     right_margin = 20
     chart_w = 1000
     bar_area = chart_w - left_margin - right_margin
-    svg_h = header_h + len(gantt_tasks) * row_h + 20
+
+    body_h = 0
+    for _, g in sorted_groups:
+        body_h += epic_h + len(g["tasks"]) * row_h + gap_h
+    svg_h = header_h + body_h + 14
 
     parts = [f'<div class="gantt-wrap"><svg viewBox="0 0 {chart_w} {svg_h}" role="img" aria-label="Sprint Gantt Chart">']
     parts.append(f'<title>Sprint Gantt Chart</title>')
@@ -2864,34 +2898,50 @@ def svg_sprint_gantt(tasks: list[dict[str, Any]], sprint: dict[str, Any], today:
         parts.append(f'<g id="gantt-today-group"><line x1="{today_x}" y1="22" x2="{today_x}" y2="{svg_h - 10}" class="gantt-today"/>')
         parts.append(f'<text x="{today_x}" y="{svg_h - 2}" class="gantt-date" text-anchor="middle">Today</text></g>')
 
-    # Task bars
+    # Epic swimlanes + task bars
     status_cls_map = {"done": "done", "in_progress": "in-progress", "pending": "pending"}
-    for idx, task in enumerate(gantt_tasks):
-        y = header_h + idx * row_h
-        key = escape(task.get("key", ""))
-        title = escape(task.get("title", ""))[:28]
+    y_cursor = header_h
+    for epic_key, group in sorted_groups:
+        # Epic header band — full chart width
+        if epic_key == "_no_epic":
+            badge = "No Epic"
+            summary_text = "큰틀(Epic) 미연결"
+            band_cls = "gantt-epic-band no-epic"
+        else:
+            badge = escape(epic_key)
+            summary_text = escape(group["epic_summary"]) if group["epic_summary"] else badge
+            band_cls = "gantt-epic-band"
+        count = len(group["tasks"])
+        parts.append(f'<rect x="0" y="{y_cursor}" width="{chart_w}" height="{epic_h}" class="{band_cls}"/>')
+        parts.append(f'<text x="10" y="{y_cursor + 19}" class="gantt-epic-key">{badge}</text>')
+        parts.append(f'<text x="92" y="{y_cursor + 19}" class="gantt-epic-summary">{summary_text[:70]}</text>')
+        parts.append(f'<text x="{chart_w - right_margin}" y="{y_cursor + 19}" class="gantt-epic-count" text-anchor="end">{count}개</text>')
+        y_cursor += epic_h
 
-        try:
-            t_start = date.fromisoformat(task["start"])
-            t_end = date.fromisoformat(task["end"])
-        except (ValueError, TypeError):
-            continue
+        for task in group["tasks"]:
+            key = escape(task.get("key", ""))
+            title = escape(task.get("title", ""))[:28]
+            try:
+                t_start = date.fromisoformat(task["start"])
+                t_end = date.fromisoformat(task["end"])
+            except (ValueError, TypeError):
+                y_cursor += row_h
+                continue
 
-        st = task.get("status", "pending")
-        cls = status_cls_map.get(st, "pending")
-        # Overdue check
-        if t_end < today and st != "done":
-            cls = "overdue"
+            st = task.get("status", "pending")
+            cls = status_cls_map.get(st, "pending")
+            if t_end < today and st != "done":
+                cls = "overdue"
 
-        bar_x = left_margin + max(0, int(((t_start - range_start).days / total_days) * bar_area))
-        bar_w = max(8, int(((t_end - t_start).days / total_days) * bar_area))
+            bar_x = left_margin + max(0, int(((t_start - range_start).days / total_days) * bar_area))
+            bar_w = max(8, int(((t_end - t_start).days / total_days) * bar_area))
 
-        # Label
-        parts.append(f'<text x="{left_margin - 8}" y="{y + 18}" class="gantt-label" text-anchor="end">{key} {title}</text>')
-        # Bar
-        parts.append(f'<rect x="{bar_x}" y="{y + 6}" width="{bar_w}" height="{row_h - 12}" class="gantt-bar {cls}"/>')
-        # Date text on bar
-        parts.append(f'<text x="{bar_x + 4}" y="{y + 20}" class="gantt-date">{task["start"][5:]} ~ {task["end"][5:]}</text>')
+            parts.append(f'<text x="{left_margin - 8}" y="{y_cursor + 18}" class="gantt-label" text-anchor="end">{key} {title}</text>')
+            parts.append(f'<rect x="{bar_x}" y="{y_cursor + 6}" width="{bar_w}" height="{row_h - 12}" class="gantt-bar {cls}"/>')
+            parts.append(f'<text x="{bar_x + 4}" y="{y_cursor + 20}" class="gantt-date">{task["start"][5:]} ~ {task["end"][5:]}</text>')
+            y_cursor += row_h
+
+        y_cursor += gap_h
 
     parts.append('</svg>')
     parts.append('<div style="text-align:right;padding:6px 12px;">')
@@ -3102,6 +3152,11 @@ JIRA_BOARD_SCRIPT = """
 <script>
 (function() {
   const API = 'http://localhost:18923';
+
+  // HTML escape for safe interpolation into innerHTML / attributes / onclick().
+  // Matches Python's html.escape(..., quote=True).
+  const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
   window.jiraToast = function(msg) {
     const el = document.getElementById('jira-toast');
@@ -3465,50 +3520,76 @@ JIRA_BOARD_SCRIPT = """
           `<span class="jira-status in-progress">${progC} In Progress</span>` +
           `<span class="jira-status pending">${todoC} To Do</span>`;
 
-        // Rebuild rows
-        const rows = board.querySelectorAll('.jira-task');
-        rows.forEach(r => r.remove());
+        // Drop both old task rows AND old epic-group wrappers — we rebuild
+        // both so the swimlanes stay in sync with current data.
+        board.querySelectorAll('.jira-task').forEach(r => r.remove());
+        board.querySelectorAll('.epic-group').forEach(g => g.remove());
         const footer = board.querySelector('.jira-board-footer');
 
         const renderDate = (start, end, isDone) => {
-          const label = (start && end) ? `${start.slice(5)} ~ ${end.slice(5)}` : '—';
+          const sEsc = escHtml(start || '');
+          const eEsc = escHtml(end || '');
+          const label = (start && end) ? `${escHtml(start.slice(5))} ~ ${escHtml(end.slice(5))}` : '—';
           const overdue = (start && end && end < today && !isDone) ? ' overdue' : '';
-          return `<span class="jira-date${overdue}" data-start="${start||''}" data-end="${end||''}" onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">${label}</span>`;
+          return `<span class="jira-date${overdue}" data-start="${sEsc}" data-end="${eEsc}" onclick="jiraEditDates(this)" title="시작/종료 날짜 변경">${label}</span>`;
         };
 
-        tasks.forEach(task => {
+        const renderTaskRow = (task, isSubtask) => {
           const st = task.status || 'pending';
           const cls = statusCls[st] || 'pending';
           const label = statusLabel[st] || 'To Do';
+          const keyEsc = escHtml(task.key || '');
+          const titleEsc = escHtml(task.title || '');
           const dateHtml = renderDate(task.start || '', task.end || '', st === 'done');
           let actions = '';
-          if (st === 'in_progress') actions += `<button class="jira-btn complete" onclick="jiraComplete('${task.key}')">Complete</button>`;
-          actions += `<button class="jira-btn" onclick="jiraComment('${task.key}')">Comment</button>`;
-          actions += `<button class="jira-btn add" onclick="jiraAddSub('${task.key}')">+ Sub</button>`;
+          if (st === 'in_progress') actions += `<button class="jira-btn complete" onclick="jiraComplete('${keyEsc}')">Complete</button>`;
+          actions += `<button class="jira-btn" onclick="jiraComment('${keyEsc}')">Comment</button>`;
+          if (!isSubtask) actions += `<button class="jira-btn add" onclick="jiraAddSub('${keyEsc}')">+ Sub</button>`;
           const row = document.createElement('div');
-          row.className = 'jira-task';
-          row.dataset.key = task.key;
-          row.innerHTML = `<span class="jira-key">${task.key}</span>` +
-            `<span class="jira-summary">${task.title}</span>${dateHtml}` +
+          row.className = isSubtask ? 'jira-task subtask' : 'jira-task';
+          row.dataset.key = task.key || '';
+          row.innerHTML = `<span class="jira-key">${keyEsc}</span>` +
+            `<span class="jira-summary">${titleEsc}</span>${dateHtml}` +
             `<span class="jira-task-actions"><span class="jira-status ${cls}">${label}</span>${actions}</span>`;
-          board.insertBefore(row, footer);
+          return row;
+        };
 
-          (task.subtasks||[]).forEach(sub => {
-            const sst = sub.status || 'pending';
-            const scls = statusCls[sst] || 'pending';
-            const slabel = statusLabel[sst] || 'To Do';
-            const sDateHtml = renderDate(sub.start || '', sub.end || '', sst === 'done');
-            let sActions = '';
-            if (sst === 'in_progress') sActions += `<button class="jira-btn complete" onclick="jiraComplete('${sub.key}')">Complete</button>`;
-            sActions += `<button class="jira-btn" onclick="jiraComment('${sub.key}')">Comment</button>`;
-            const srow = document.createElement('div');
-            srow.className = 'jira-task subtask';
-            srow.dataset.key = sub.key;
-            srow.innerHTML = `<span class="jira-key">${sub.key}</span>` +
-              `<span class="jira-summary">${sub.title}</span>${sDateHtml}` +
-              `<span class="jira-task-actions"><span class="jira-status ${scls}">${slabel}</span>${sActions}</span>`;
-            board.insertBefore(srow, footer);
+        // Group tasks by Epic (큰틀) — mirrors the server-side render so the
+        // swimlane layout survives refresh.
+        const epicGroups = {};
+        tasks.forEach(t => {
+          const ek = t.epic_key || '_no_epic';
+          if (!epicGroups[ek]) epicGroups[ek] = {epic_summary: t.epic_summary || '', tasks: []};
+          epicGroups[ek].tasks.push(t);
+        });
+        const sortedEpics = Object.keys(epicGroups).sort((a, b) => {
+          const aNo = a === '_no_epic' ? 1 : 0;
+          const bNo = b === '_no_epic' ? 1 : 0;
+          if (aNo !== bNo) return aNo - bNo;
+          const ac = epicGroups[a].tasks.length;
+          const bc = epicGroups[b].tasks.length;
+          if (ac !== bc) return bc - ac;
+          return a.localeCompare(b);
+        });
+
+        sortedEpics.forEach(ek => {
+          const g = epicGroups[ek];
+          const isNoEpic = ek === '_no_epic';
+          const wrap = document.createElement('div');
+          wrap.className = 'epic-group' + (isNoEpic ? ' no-epic' : '');
+          const summaryText = isNoEpic ? '큰틀(Epic) 미연결' : (g.epic_summary || ek);
+          const keyLabel = isNoEpic ? 'No Epic' : ek;
+          const hdr = document.createElement('div');
+          hdr.className = 'epic-header';
+          hdr.innerHTML = `<span class="epic-key">${escHtml(keyLabel)}</span>` +
+            `<span class="epic-summary">${escHtml(summaryText)}</span>` +
+            `<span class="epic-count">${g.tasks.length}개</span>`;
+          wrap.appendChild(hdr);
+          g.tasks.forEach(task => {
+            wrap.appendChild(renderTaskRow(task, false));
+            (task.subtasks || []).forEach(sub => wrap.appendChild(renderTaskRow(sub, true)));
           });
+          board.insertBefore(wrap, footer);
         });
 
         // Refresh the Gantt chart in place. The server returns a freshly
@@ -3656,8 +3737,23 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
     high_count = sum(1 for s in pending if s.get("confidence") == "high")
     type_icons = {"comment": "Comment", "complete": "Complete", "add_subtask": "+ Sub", "transition": "Start"}
 
-    rows = []
+    # Group pending by Epic (큰틀) so the review panel mirrors the Gantt/Live
+    # board layout. Suggestions without an epic_key fall into a "No Epic" bucket.
+    raw_groups: dict[str, dict[str, Any]] = {}
     for s in pending:
+        ek = s.get("epic_key") or "_no_epic"
+        if ek not in raw_groups:
+            raw_groups[ek] = {"epic_summary": s.get("epic_summary", ""), "items": []}
+        raw_groups[ek]["items"].append(s)
+
+    def _epic_sort_key(item: tuple[str, dict[str, Any]]) -> tuple[int, int, str]:
+        ek, g = item
+        is_no_epic = 1 if ek == "_no_epic" else 0
+        return (is_no_epic, -len(g["items"]), ek)
+
+    sorted_groups = sorted(raw_groups.items(), key=_epic_sort_key)
+
+    def _render_card(s: dict[str, Any]) -> str:
         sid = escape(s.get("id", ""))
         key = escape(s.get("task_key", ""))
         stype = s.get("type", "comment")
@@ -3669,14 +3765,10 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
         conf = s.get("confidence", "medium")
         icon_label = type_icons.get(stype, "Action")
         collapsed = ' suggestion-collapsed' if conf == "low" else ""
-        # add_subtask 타입은 댓글 필드를 "부작업 제목"으로 사용 → 설명 필드도 본문 description으로 매핑됨
         comment_label = "부작업 제목" if stype == "add_subtask" else "댓글 (Comment)"
         desc_label = "부작업 본문 (Description)" if stype == "add_subtask" else "설명 (Description)"
         desc_hint = "" if stype == "add_subtask" else '<span class="hint">— 비워두면 변경 안 함</span>'
         subtitle_html = f'<div class="suggestion-subtitle">{subtitle}</div>' if subtitle else ""
-        # add_subtask 일 때만 시작/종료일 입력 노출. 부모 일정을 미리 채워두므로
-        # 사용자는 변경하고 싶을 때만 입력하고 그대로 승인하면 된다. 직접 비워서
-        # 승인하면 백엔드 fallback이 부모 dates로 다시 채운다.
         dates_html = ""
         if stype == "add_subtask":
             ps = escape(s.get("parent_start") or "")
@@ -3692,7 +3784,7 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
     </div>
   </div>'''
 
-        rows.append(f'''<div class="jira-suggestion{collapsed}" data-sid="{sid}" data-key="{key}" data-type="{stype}">
+        return f'''<div class="jira-suggestion{collapsed}" data-sid="{sid}" data-key="{key}" data-type="{stype}">
   <div class="suggestion-head">
     <span class="jira-key">{key}</span>
     <span class="suggestion-type {stype}">{icon_label}</span>
@@ -3716,7 +3808,33 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
     <button class="jira-btn approve" onclick="suggApprove('{sid}')">승인</button>
     <button class="jira-btn reject" onclick="suggReject('{sid}')">거절</button>
   </div>
-</div>''')
+</div>'''
+
+    rows: list[str] = []
+    for epic_key, group in sorted_groups:
+        items = group["items"]
+        low_in_group = sum(1 for s in items if s.get("confidence") == "low")
+        low_pill = f'<span class="epic-low-pill">{low_in_group} 낮음</span>' if low_in_group else ''
+        if epic_key == "_no_epic":
+            rows.append(
+                '<div class="epic-group no-epic suggestion-epic"><div class="epic-header">'
+                '<span class="epic-key">No Epic</span>'
+                '<span class="epic-summary">큰틀(Epic) 미연결</span>'
+                f'<span class="epic-count">{len(items)}건</span>{low_pill}'
+                '</div>'
+            )
+        else:
+            es_html = escape(group["epic_summary"]) if group["epic_summary"] else escape(epic_key)
+            rows.append(
+                '<div class="epic-group suggestion-epic"><div class="epic-header">'
+                f'<span class="epic-key">{escape(epic_key)}</span>'
+                f'<span class="epic-summary">{es_html}</span>'
+                f'<span class="epic-count">{len(items)}건</span>{low_pill}'
+                '</div>'
+            )
+        for s in items:
+            rows.append(_render_card(s))
+        rows.append('</div>')
 
     low_count = sum(1 for s in pending if s.get("confidence") == "low")
     toggle = ""
@@ -3914,6 +4032,39 @@ JIRA_SUGGESTIONS_SCRIPT = """
 (function() {
   const API = 'http://localhost:18923';
 
+  // HTML escape for safe interpolation into innerHTML / attributes / onclick().
+  // Matches Python's html.escape(..., quote=True) behavior including single quote.
+  const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  // Recompute the Epic header (count + 낮음 pill) and "done" class after
+  // approve / reject. Keeps the swimlane status truthful without waiting
+  // for the auto-refresh (which can take ~1.5s).
+  window._suggUpdateEpicState = function(card) {
+    const wrap = card && card.closest ? card.closest('.epic-group') : null;
+    if (!wrap) return;
+    const all = wrap.querySelectorAll('.jira-suggestion');
+    const remaining = Array.from(all).filter(c => !c.classList.contains('applied'));
+    const countEl = wrap.querySelector('.epic-count');
+    if (countEl) countEl.textContent = remaining.length + '건';
+    const remainingLow = remaining.filter(c => {
+      const conf = c.querySelector('.confidence');
+      return conf && conf.classList.contains('low');
+    });
+    let pill = wrap.querySelector('.epic-low-pill');
+    if (remainingLow.length > 0) {
+      if (!pill && countEl) {
+        pill = document.createElement('span');
+        pill.className = 'epic-low-pill';
+        countEl.insertAdjacentElement('afterend', pill);
+      }
+      if (pill) pill.textContent = remainingLow.length + ' 낮음';
+    } else if (pill) {
+      pill.remove();
+    }
+    if (remaining.length === 0) wrap.classList.add('epic-group-done');
+  };
+
   window.suggApprove = function(sid) {
     const card = document.querySelector('[data-sid="' + sid + '"]');
     if (!card) return;
@@ -3957,6 +4108,7 @@ JIRA_SUGGESTIONS_SCRIPT = """
       if (d.ok) {
         card.classList.add('applied');
         btn.textContent = '완료';
+        _suggUpdateEpicState(card);
         const parts = [];
         if (text.trim()) parts.push(actionLabel);
         if (desc.trim()) parts.push('설명');
@@ -3986,6 +4138,7 @@ JIRA_SUGGESTIONS_SCRIPT = """
     }).then(r => r.json()).then(d => {
       card.classList.add('applied');
       card.querySelector('.reject').textContent = '거절됨';
+      _suggUpdateEpicState(card);
       jiraToast(card.dataset.key + ' 제안 거절');
     }).catch(() => { jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
   };
@@ -4014,58 +4167,98 @@ JIRA_SUGGESTIONS_SCRIPT = """
         const highCount = suggestions.filter(s => s.confidence === 'high').length;
         if (meta) meta.textContent = suggestions.length + '건 대기 · ' + highCount + '건 높은 확신';
 
-        // Rebuild suggestion cards
-        body.innerHTML = '';
+        // Group by Epic (큰틀): mirror the server-side render so refresh keeps swimlanes.
+        const groups = {};
         suggestions.forEach(s => {
+          const ek = s.epic_key || '_no_epic';
+          if (!groups[ek]) groups[ek] = {epic_summary: s.epic_summary || '', items: []};
+          groups[ek].items.push(s);
+        });
+        const sortedEpics = Object.keys(groups).sort((a, b) => {
+          const aNo = a === '_no_epic' ? 1 : 0;
+          const bNo = b === '_no_epic' ? 1 : 0;
+          if (aNo !== bNo) return aNo - bNo;
+          const ac = groups[a].items.length;
+          const bc = groups[b].items.length;
+          if (ac !== bc) return bc - ac;
+          return a.localeCompare(b);
+        });
+
+        const renderCard = (s) => {
           const collapsed = s.confidence === 'low' ? ' suggestion-collapsed' : '';
           const card = document.createElement('div');
           card.className = 'jira-suggestion' + collapsed;
-          card.dataset.sid = s.id;
-          card.dataset.key = s.task_key;
-          card.dataset.type = s.type;
+          // dataset uses textContent semantics under the hood — safe from XSS.
+          card.dataset.sid = s.id || '';
+          card.dataset.key = s.task_key || '';
+          card.dataset.type = s.type || '';
           const isSub = s.type === 'add_subtask';
           const commentLabel = isSub ? '부작업 제목' : '댓글 (Comment)';
           const descLabel = isSub ? '부작업 본문 (Description)' : '설명 (Description)';
           const descHint = isSub ? '' : '<span class="hint">— 비워두면 변경 안 함</span>';
-          const descText = s.suggested_description || '';
-          const subtitleHtml = s.subtitle ? `<div class="suggestion-subtitle">${s.subtitle}</div>` : '';
-          const psv = (s.parent_start || '');
-          const pev = (s.parent_end || '');
-          const dateHint = (psv || pev) ? '— 부모 작업 일정 미리 채움' : '— 비워두면 부모 작업 일정 상속';
+          const subtitleHtml = s.subtitle ? `<div class="suggestion-subtitle">${escHtml(s.subtitle)}</div>` : '';
+          const psv = escHtml(s.parent_start || '');
+          const pev = escHtml(s.parent_end || '');
+          const dateHint = (s.parent_start || s.parent_end) ? '— 부모 작업 일정 미리 채움' : '— 비워두면 부모 작업 일정 상속';
+          const sidEsc = escHtml(s.id || '');
           const datesHtml = isSub ? `
             <div class="suggestion-dates">
               <label class="suggestion-field-label">시작/종료일 <span class="hint">${dateHint}</span></label>
               <div class="suggestion-date-row">
-                <input type="date" class="jira-date-input" id="start-${s.id}" value="${psv}">
+                <input type="date" class="jira-date-input" id="start-${sidEsc}" value="${psv}">
                 <span class="jira-date-dash">~</span>
-                <input type="date" class="jira-date-input" id="end-${s.id}" value="${pev}">
+                <input type="date" class="jira-date-input" id="end-${sidEsc}" value="${pev}">
               </div>
             </div>` : '';
+          const typeEsc = escHtml(s.type || '');
+          const confEsc = escHtml(s.confidence || '');
           card.innerHTML = `
             <div class="suggestion-head">
-              <span class="jira-key">${s.task_key}</span>
-              <span class="suggestion-type ${s.type}">${typeIcons[s.type]||'Action'}</span>
-              <span class="confidence ${s.confidence}">${s.confidence}</span>
+              <span class="jira-key">${escHtml(s.task_key)}</span>
+              <span class="suggestion-type ${typeEsc}">${escHtml(typeIcons[s.type]||'Action')}</span>
+              <span class="confidence ${confEsc}">${confEsc}</span>
               <span class="suggestion-spacer"></span>
-              <strong class="suggestion-title">${s.title}</strong>
+              <strong class="suggestion-title">${escHtml(s.title)}</strong>
             </div>
             ${subtitleHtml}
-            <div class="suggestion-reason">${s.reason}</div>
+            <div class="suggestion-reason">${escHtml(s.reason)}</div>
             <div class="suggestion-fields">
               <div>
-                <label class="suggestion-field-label" for="text-${s.id}">${commentLabel}</label>
-                <textarea class="suggestion-text" id="text-${s.id}">${s.suggested_text||''}</textarea>
+                <label class="suggestion-field-label" for="text-${sidEsc}">${commentLabel}</label>
+                <textarea class="suggestion-text" id="text-${sidEsc}">${escHtml(s.suggested_text||'')}</textarea>
               </div>
               <div>
-                <label class="suggestion-field-label" for="desc-${s.id}">${descLabel}${descHint}</label>
-                <textarea class="suggestion-description" id="desc-${s.id}">${descText}</textarea>
+                <label class="suggestion-field-label" for="desc-${sidEsc}">${descLabel}${descHint}</label>
+                <textarea class="suggestion-description" id="desc-${sidEsc}">${escHtml(s.suggested_description||'')}</textarea>
               </div>
             </div>${datesHtml}
             <div class="suggestion-actions">
-              <button class="jira-btn approve" onclick="suggApprove('${s.id}')">승인</button>
-              <button class="jira-btn reject" onclick="suggReject('${s.id}')">거절</button>
+              <button class="jira-btn approve" onclick="suggApprove('${sidEsc}')">승인</button>
+              <button class="jira-btn reject" onclick="suggReject('${sidEsc}')">거절</button>
             </div>`;
-          body.appendChild(card);
+          return card;
+        };
+
+        // Rebuild Epic groups + cards
+        body.innerHTML = '';
+        sortedEpics.forEach(ek => {
+          const g = groups[ek];
+          const wrap = document.createElement('div');
+          wrap.className = 'epic-group suggestion-epic' + (ek === '_no_epic' ? ' no-epic' : '');
+          const hdr = document.createElement('div');
+          hdr.className = 'epic-header';
+          const isNoEpic = ek === '_no_epic';
+          const summaryText = isNoEpic ? '큰틀(Epic) 미연결' : (g.epic_summary || ek);
+          const keyLabel = isNoEpic ? 'No Epic' : ek;
+          const lowCount = g.items.filter(s => s.confidence === 'low').length;
+          const lowPillHtml = lowCount ? `<span class="epic-low-pill">${lowCount} 낮음</span>` : '';
+          hdr.innerHTML = `<span class="epic-key">${escHtml(keyLabel)}</span>`
+            + `<span class="epic-summary">${escHtml(summaryText)}</span>`
+            + `<span class="epic-count">${g.items.length}건</span>`
+            + lowPillHtml;
+          wrap.appendChild(hdr);
+          g.items.forEach(s => wrap.appendChild(renderCard(s)));
+          body.appendChild(wrap);
         });
 
         jiraToast('제안 리뷰 갱신 완료 (' + suggestions.length + '건)');
@@ -4217,7 +4410,6 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]], project_conf
             "monthly": "tone-monthly",
         }.get(card["report_type"], "tone-default")
         is_jira_plan = card["report_type"] == "jira"
-        is_jira_result = False
         board_html = ""
         if is_jira_plan:
             board_html = html_task_board(sections, sections)
