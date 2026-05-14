@@ -642,6 +642,26 @@ class JiraApiTaskProvider(TaskProvider):
         return out
 
 
+_DOTENV_LOADED = False
+
+
+def _ensure_dotenv_loaded() -> None:
+    """Load .env once per process so ad-hoc callers (REPL, partial pipelines)
+    pick up JIRA_URL/JIRA_TOKEN without having to remember `load_dotenv()`.
+    The main entry points already load it; this is a defense-in-depth fallback
+    that prevents silent JsonFileTaskProvider fallback in re-render scripts.
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    try:
+        from dotenv import load_dotenv  # type: ignore[import-not-found]
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    except Exception:
+        pass
+
+
 def get_task_provider(project_config: dict | None = None) -> TaskProvider:
     """Factory: returns JiraApiTaskProvider if configured, else JsonFileTaskProvider.
 
@@ -650,6 +670,7 @@ def get_task_provider(project_config: dict | None = None) -> TaskProvider:
                         with jira.project_key, jira.sprint_id fields.
     """
     import os
+    _ensure_dotenv_loaded()
     jira_url = os.environ.get("JIRA_URL", "")
     jira_token = os.environ.get("JIRA_TOKEN", "")
     if jira_url and jira_token:
