@@ -137,46 +137,60 @@ def parse_jira_plan(path: Path) -> dict[str, object]:
     }
 
 
+_DAILY_SECTION_ALIASES: dict[str, str] = {
+    # Primary facets (### subsection)
+    "### \uC8FC\uC694 \uBCC0\uACBD \uC131\uACA9": "primary",
+    "### Primary Change Facets": "primary",
+    # Supporting facets (### subsection)
+    "### \uBCF4\uC870 \uBCC0\uACBD \uC131\uACA9": "supporting",
+    "### Supporting Change Facets": "supporting",
+    # Executive summary (## section)
+    "## \uD575\uC2EC \uC694\uC57D": "summary",
+    "## Summary": "summary",
+    # Source-based key changes (## section)
+    "## \uC18C\uC2A4 \uAE30\uBC18 \uD575\uC2EC \uBCC0\uACBD": "source_changes",
+    "## Key Source Changes": "source_changes",
+}
+
+_WORK_TYPE_PATTERNS: tuple[str, ...] = (
+    r"-\s*\uC791\uC5C5 \uC720\uD615:\s*`([^`]+)`",
+    r"-\s*Work Type:\s*`([^`]+)`",
+)
+
+
 def parse_daily_facets(path: Path) -> dict[str, object]:
     if not path.exists():
         return {"work_type": "", "primary_facets": [], "supporting_facets": [], "summary": [], "source_changes": []}
 
     text = path.read_text(encoding="utf-8", errors="replace")
-    work_type_match = re.search(r"-\s*\uC791\uC5C5 \uC720\uD615:\s*`([^`]+)`", text)
-    work_type = work_type_match.group(1).strip() if work_type_match else ""
+    work_type = ""
+    for pattern in _WORK_TYPE_PATTERNS:
+        m = re.search(pattern, text)
+        if m:
+            work_type = m.group(1).strip()
+            break
 
     primary: list[str] = []
     supporting: list[str] = []
     summary: list[str] = []
     source_changes: list[str] = []
+    buckets = {
+        "primary": primary,
+        "supporting": supporting,
+        "summary": summary,
+        "source_changes": source_changes,
+    }
     current: str | None = None
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if line == "### \uC8FC\uC694 \uBCC0\uACBD \uC131\uACA9":
-            current = "primary"
-            continue
-        if line == "### \uBCF4\uC870 \uBCC0\uACBD \uC131\uACA9":
-            current = "supporting"
-            continue
-        if line == "## \uD575\uC2EC \uC694\uC57D":
-            current = "summary"
-            continue
-        if line == "## \uC18C\uC2A4 \uAE30\uBC18 \uD575\uC2EC \uBCC0\uACBD":
-            current = "source_changes"
+        if line in _DAILY_SECTION_ALIASES:
+            current = _DAILY_SECTION_ALIASES[line]
             continue
         if line.startswith("## "):
             current = None
             continue
         if current and line.startswith("- "):
-            body = line[2:].strip()
-            if current == "primary":
-                primary.append(body)
-            elif current == "supporting":
-                supporting.append(body)
-            elif current == "summary":
-                summary.append(body)
-            elif current == "source_changes":
-                source_changes.append(body)
+            buckets[current].append(line[2:].strip())
 
     return {
         "work_type": work_type,
@@ -302,7 +316,7 @@ def _build_jira_sections(run_date: str) -> tuple[str, str]:
     try:
         from scripts.generate_periodic_reports import (
             html_jira_live_board, html_jira_suggestions_panel,
-            generate_jira_suggestions, JIRA_BOARD_SCRIPT, JIRA_SUGGESTIONS_SCRIPT,
+            JIRA_BOARD_SCRIPT, JIRA_SUGGESTIONS_SCRIPT,
         )
         config_path = SCRIPT_DIR / "startup_projects.json"
         if not config_path.exists():
@@ -328,7 +342,14 @@ def _build_jira_sections(run_date: str) -> tuple[str, str]:
         if suggestions_html:
             scripts += JIRA_SUGGESTIONS_SCRIPT
         return boards_html + suggestions_html, scripts
-    except Exception:
+    except Exception as exc:
+        # Silent fail used to swallow real bugs (missing imports, malformed
+        # JSON, etc.) and leave the Jira panels empty without explanation.
+        # Surface the cause to stderr so daily-run logs capture it; the
+        # caller still gets safe empty defaults so the dashboard renders.
+        import traceback
+        print(f"[_build_jira_sections] {exc!r}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return "", ""
 
 

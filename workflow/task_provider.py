@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import ssl
 from abc import ABC, abstractmethod
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -80,9 +81,20 @@ class JsonFileTaskProvider(TaskProvider):
             return {}
         try:
             with open(self.path, encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
         except (json.JSONDecodeError, OSError):
             return {}
+        # Treat already-ended sprints as no-data so stale cache doesn't
+        # surface in the dashboard when live Jira fetch isn't available.
+        # (Matches _drop_if_expired in generate_periodic_reports.py.)
+        end = (data.get("sprint") or {}).get("end") or ""
+        if end:
+            try:
+                if date.fromisoformat(end) < date.today():
+                    return {}
+            except (ValueError, TypeError):
+                pass
+        return data
 
     def update_subtask_status(self, task_key: str, subtask_title: str, status: str) -> bool:
         data = self.get_tasks()
