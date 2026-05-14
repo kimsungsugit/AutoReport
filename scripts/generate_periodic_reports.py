@@ -2963,7 +2963,14 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
         if not hasattr(provider, 'add_comment'):
             return ""
         data = provider.get_tasks()
-    except Exception:
+    except Exception as exc:
+        # Silent fail used to hide ImportError, JIRA_TOKEN expiry, network
+        # errors, etc. — board just vanished from the portfolio. Log to stderr
+        # so scheduler.log captures the cause; caller still gets safe empty.
+        import sys, traceback
+        proj_name = (project_config or {}).get("name", "?")
+        print(f"[html_jira_live_board:{proj_name}] {exc!r}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return ""
 
     tasks = data.get("tasks", [])
