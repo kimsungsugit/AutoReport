@@ -86,22 +86,43 @@ def parse_markdown_sections(path: Path) -> dict[str, list[str]]:
     return sections
 
 
+_PLACEHOLDER_TOKENS = {"none", "없음", "n/a", "-", "(none)"}
+
+
+def _strip_placeholders(items: list[str]) -> list[str]:
+    return [x for x in items if x.strip().lower() not in _PLACEHOLDER_TOKENS]
+
+
 def parse_jira_plan(path: Path) -> dict[str, object]:
     sections = parse_markdown_sections(path)
-    task_lines = [line[2:].strip() for line in sections.get("Task", []) if line.startswith("- ")]
-    completed = [line[2:].strip() for line in sections.get("Completed", []) if line.startswith("- ")]
-    in_progress = [line[2:].strip() for line in sections.get("In Progress", []) if line.startswith("- ")]
-    remaining = [line[2:].strip() for line in sections.get("Remaining", []) if line.startswith("- ")]
-    validation = [line[2:].strip() for line in sections.get("Validation", []) if line.startswith("- ")]
-    sprint_status = [line[2:].strip() for line in sections.get("Sprint Status", []) if line.startswith("- ")]
+
+    def pick(*aliases: str) -> list[str]:
+        for name in aliases:
+            raw = sections.get(name)
+            if not raw:
+                continue
+            items = [line[2:].strip() for line in raw if line.startswith("- ")]
+            if items:
+                return items
+        return []
+
+    task_lines = pick("Task", "상위 작업")
+    completed = _strip_placeholders(pick("Completed", "완료된 작업"))
+    in_progress = _strip_placeholders(pick("In Progress", "진행 중인 작업"))
+    remaining = _strip_placeholders(pick("Remaining", "남은 작업", "Subtasks", "하위 작업"))
+    validation = _strip_placeholders(pick("Validation", "완료 조건"))
+    sprint_status = _strip_placeholders(pick("Sprint Status", "스프린트 현황"))
+
     task_name = ""
     task_goal = ""
     task_scope: list[str] = []
     for line in task_lines:
-        if line.startswith("Name:"):
-            task_name = line.split(":", 1)[1].strip()
-        elif line.startswith("Goal:"):
-            task_goal = line.split(":", 1)[1].strip()
+        # Handle both ASCII (:) and full-width (：) colons, EN/KO prefix.
+        normalized = line.replace("：", ":", 1)
+        if normalized.startswith(("Name:", "이름:")):
+            task_name = normalized.split(":", 1)[1].strip()
+        elif normalized.startswith(("Goal:", "목표:")):
+            task_goal = normalized.split(":", 1)[1].strip()
         else:
             task_scope.append(line)
     return {
