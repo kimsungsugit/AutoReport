@@ -20,6 +20,7 @@ from scripts.generate_periodic_reports import (
     _build_sprint_summary,
     _render_sprint_summary,
     _keyword_pattern,
+    generate_jira_suggestions,
 )
 
 
@@ -569,3 +570,247 @@ class TestBuildFallbackSectionsSprintSummary:
     def test_daily_no_sprint_summary(self):
         result = build_fallback_sections("daily", self._make_payload())
         assert "sprint_summary" not in result
+
+
+# ---------------------------------------------------------------------------
+# generate_jira_suggestions — Iteration 1-4 회귀 방지
+# ---------------------------------------------------------------------------
+
+def _suggestion_payload(sprint_tasks, commits=None):
+    """Minimal payload for generate_jira_suggestions / generate_document tests."""
+    return {
+        "today": "2026-05-22",
+        "report_type": "jira",
+        "window_start": "2026-05-22",
+        "window_end": "2026-05-22",
+        "repository": "test",
+        "repo_root": "C:/nonexistent",  # so subprocess git log fails silently
+        "domain_profile": "desktop_app",
+        "domain_profile_name": "데스크톱",
+        "domain_focus": [],
+        "jira_enabled": True,
+        "sprint_tasks": sprint_tasks,
+        "recent_commits": [{"hash": "h", "subject": s, "author": "", "time": ""}
+                           for s in (commits or [])],
+        "changed_files": [], "uncommitted": [], "uncommitted_count": 0,
+        # Fields render_jira_markdown / render_report_markdown read directly
+        "branch": "main", "remote_url": "", "upstream": "",
+        "sync_status": {"ahead": 0, "behind": 0},
+        "commit_count": 0, "changed_file_count": 0,
+        "work_type": "feature", "source_insights": [],
+        "diff_summary": {}, "github": {}, "top_areas": [],
+        "primary_change_facets": [], "supporting_change_facets": [],
+        "change_facets": [], "auto_commit_status": {},
+        "changed_docs": [],
+    }
+
+
+class TestGenerateJiraSuggestions:
+    def test_empty_sprint_tasks_returns_empty(self):
+        payload = _suggestion_payload([])
+        # jira_enabled=False to skip live fetch fallback (which would also empty)
+        payload["jira_enabled"] = False
+        assert generate_jira_suggestions(payload, None) == []
+
+    def test_rule2_end_date_today_message(self):
+        """end_date == today → "종료일 도래" (days_over=0 분기)."""
+        sprint = [{
+            "key": "T-1", "title": "Wraps today",
+            "start": "2026-05-01", "end": "2026-05-22",
+            "status": "in_progress", "subtasks": [],
+        }]
+        result = generate_jira_suggestions(_suggestion_payload(sprint), None)
+        complete_for_t1 = [s for s in result if s["task_key"] == "T-1" and s["type"] == "complete"]
+        assert complete_for_t1, "Rule 2 종료일 도래 제안이 발동해야 함"
+        s = complete_for_t1[0]
+        assert "종료일 도래" in s["title"]
+        assert "0일" not in s["title"]
+        assert s["confidence"] == "high"
+
+    def test_rule2_overdue_message(self):
+        """end_date < today → "기한 초과 N일" 분기."""
+        sprint = [{
+            "key": "T-2", "title": "Overdue",
+            "start": "2026-05-01", "end": "2026-05-15",
+            "status": "in_progress", "subtasks": [],
+        }]
+        result = generate_jira_suggestions(_suggestion_payload(sprint), None)
+        complete_for_t2 = [s for s in result if s["task_key"] == "T-2" and s["type"] == "complete"]
+        assert complete_for_t2
+        assert "기한 초과" in complete_for_t2[0]["title"]
+        assert "7일" in complete_for_t2[0]["title"]  # 2026-05-22 - 2026-05-15
+
+    def test_rule2_skipped_for_pending(self):
+        """pending 상태 task 는 end_date 와 무관하게 Rule 2 안 탐."""
+        sprint = [{
+            "key": "T-3", "title": "Not started",
+            "start": "2026-05-01", "end": "2026-05-15",
+            "status": "pending", "subtasks": [],
+        }]
+        result = generate_jira_suggestions(_suggestion_payload(sprint), None)
+        completes = [s for s in result if s["task_key"] == "T-3" and s["type"] == "complete"]
+        assert completes == []
+
+    def test_noise_chore_auto_filtered(self):
+        """chore(auto): snapshot 은 noise → add_subtask 제안 후보 아님."""
+        sprint = [{
+            "key": "T-4", "title": "Active work",
+            "start": "2026-05-25", "end": "2026-05-30",  # future to skip Rule 2/3
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = [
+            "chore(auto): end-of-day snapshot 2026-05-21",
+            "chore(auto): end-of-day snapshot 2026-05-20",
+        ]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert adds == [], "chore(auto) 는 noise 로 모두 차단되어야 함"
+
+    def test_noise_chore_refinement_present(self):
+        """_NOISE_PREFIXES 의 chore: 광범위 차단을 _NOISE_CHORE_BODY 로 정교화한 fix 가
+        살아 있는지 source-level 회귀 표식 검증.
+        """
+        src = (Path(__file__).resolve().parents[1] / "scripts" / "generate_periodic_reports.py").read_text(encoding="utf-8")
+        # Iteration 4 의 핵심: _NOISE_CHORE_BODY 변수가 정의되어 있어야 한다
+        assert "_NOISE_CHORE_BODY" in src, "chore noise 정교화 변수가 존재해야 함"
+        # 그 안의 noise 변종 키워드 확인
+        assert '"bump "' in src and '"deps"' in src, \
+            "_NOISE_CHORE_BODY 의 bump/deps 차단이 살아 있어야 함"
+
+    def test_noise_chore_bump_filtered(self):
+        """chore: bump version 은 _NOISE_CHORE_BODY 로 차단."""
+        sprint = [{
+            "key": "T-6", "title": "Active work",
+            "start": "2026-05-25", "end": "2026-05-30",
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = ["chore: bump version to 1.2.0"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert adds == [], "chore: bump 은 noise 변종으로 차단되어야 함"
+
+    def test_best_parent_word_overlap(self):
+        """unmatched commit 의 부모 선택은 commit subject 와 task title 단어 overlap 기반."""
+        sprint = [
+            {"key": "T-A", "title": "documentation cleanup",
+             "start": "2026-05-25", "end": "2026-05-30",
+             "status": "in_progress", "subtasks": []},
+            {"key": "T-B", "title": "replay analysis system",
+             "start": "2026-05-25", "end": "2026-05-30",
+             "status": "in_progress", "subtasks": []},
+        ]
+        # "replay" 가 T-B 의 title 과 겹친다 → T-B 가 best_parent 여야 함
+        commits = ["feat: replay analysis panel"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert adds, "add_subtask 제안이 있어야 함"
+        # 첫 add_subtask 가 T-B 로 향해야 함 (단어 overlap: replay/analysis)
+        assert adds[0]["task_key"] == "T-B"
+
+
+# ---------------------------------------------------------------------------
+# generate_document 의 jira fact_field 후처리 (환각 차단) — Iteration 1/2
+# ---------------------------------------------------------------------------
+
+class TestGenerateDocumentFactOverride:
+    def test_jira_gemini_overrides_hallucinated_task_board(self):
+        """jira+gemini 모드에서 LLM 환각 task_board 가 sprint_tasks 기반으로 덮어쓰여야 한다."""
+        from unittest.mock import patch as _patch
+        from scripts import generate_periodic_reports as g
+
+        # 실제 sprint_tasks 는 APPL-373
+        sprint = [{
+            "key": "APPL-373", "title": "Real epic task",
+            "start": "2026-05-01", "end": "2026-05-30",
+            "status": "in_progress", "subtasks": [],
+        }]
+        payload = _suggestion_payload(sprint, [])
+        payload["report_type"] = "jira"
+
+        # Gemini 가 환각 task_board (APPL-101) 를 반환한다고 가정
+        hallucinated = {
+            "title": "Test", "summary": "x", "task_name": "n", "task_goal": "g",
+            "scope": ["[APPL-101] hallucinated"],
+            "completed": [], "in_progress": [], "remaining": [],
+            "task_board": [{"key": "APPL-101", "title": "FAKE", "status": "진행 중",
+                            "period": "2026-05-01 ~ 2026-05-30", "subtasks": [],
+                            "related_commits": []}],
+            "validation": [], "risks": [], "links": [],
+            "status_summary": {"completed_count": 0, "in_progress_count": 1, "remaining_count": 0},
+        }
+        with _patch.object(g, "ask_gemini_for_sections", return_value=hallucinated), \
+             _patch.object(g, "ask_gemini_for_team_analysis", return_value={}):
+            _md, mode, sections = g.generate_document("jira", payload)
+
+        assert mode == "gemini"
+        # 환각 키 APPL-101 이 task_board 에서 제거되고 실제 APPL-373 으로 덮어써져야 함
+        keys = [t.get("key") for t in sections.get("task_board") or []]
+        assert "APPL-101" not in keys, "환각 키는 차단되어야 함"
+        assert "APPL-373" in keys, "실제 sprint_tasks 의 키로 덮어써져야 함"
+
+    def test_jira_gemini_empty_sprint_forces_placeholder(self):
+        """sprint_tasks 비어 있고 mode=gemini 면 task_board/scope 가 placeholder 로 강제됨."""
+        from unittest.mock import patch as _patch
+        from scripts import generate_periodic_reports as g
+
+        payload = _suggestion_payload([], [])
+        payload["report_type"] = "jira"
+        payload["jira_enabled"] = False  # sprint_tasks 빈 경로 강제
+
+        hallucinated = {
+            "title": "Test", "summary": "x", "task_name": "n", "task_goal": "g",
+            "scope": ["[APPL-001] invented"],
+            "completed": ["[APPL-001] invented complete"],
+            "in_progress": [], "remaining": [],
+            "task_board": [{"key": "APPL-001", "title": "FAKE", "status": "진행 중",
+                            "period": "2026-05-01 ~ 2026-05-30", "subtasks": [],
+                            "related_commits": []}],
+            "validation": [], "risks": [], "links": [],
+            "status_summary": {"completed_count": 1, "in_progress_count": 0, "remaining_count": 0},
+        }
+        with _patch.object(g, "ask_gemini_for_sections", return_value=hallucinated), \
+             _patch.object(g, "ask_gemini_for_team_analysis", return_value={}):
+            _md, mode, sections = g.generate_document("jira", payload)
+
+        assert mode == "gemini"
+        assert sections.get("task_board") == []
+        assert "Jira 스프린트 미연동" in (sections.get("scope") or [""])[0]
+        assert "Jira 스프린트 미연동" in (sections.get("completed") or [""])[0]
+        # status_summary 도 0 으로 강제
+        assert sections["status_summary"]["completed_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Multi-project dashboard dedup — source-level 회귀 표식 (Iteration 2/3)
+# ---------------------------------------------------------------------------
+
+class TestDashboardDedupRegression:
+    """렌더링 결과를 직접 만들지 않고 dedup 로직이 코드에 살아 있는지 검증."""
+
+    def test_render_html_dashboard_has_seen_boards(self):
+        src = (Path(__file__).resolve().parents[1] / "scripts" / "generate_periodic_reports.py").read_text(encoding="utf-8")
+        # render_html_dashboard 안에 (project_key, sprint_id, board_id) seen set 이 있어야 함
+        assert "seen_boards" in src
+        assert "board_key in seen_boards" in src
+
+    def test_multi_project_has_dedup_and_merged_suggestions(self):
+        src = (Path(__file__).resolve().parents[1] / "scripts" / "generate_multi_project_reports.py").read_text(encoding="utf-8")
+        # 보드 dedup + suggestion 통합 둘 다 살아 있어야 함
+        assert "seen_boards" in src, "보드 dedup set 이 있어야 함"
+        assert "merged_suggestions" in src, "suggestion 통합 변수가 있어야 함"
+
+
+# ---------------------------------------------------------------------------
+# GeminiAdapter timeout wiring (Iteration 5)
+# ---------------------------------------------------------------------------
+
+class TestGeminiAdapterTimeoutWiring:
+    """GeminiAdapter.generate 의 timeout 인자가 SDK Client 로 전파되는지."""
+
+    def test_timeout_passed_via_http_options(self):
+        src = (Path(__file__).resolve().parents[1] / "workflow" / "llm_adapters.py").read_text(encoding="utf-8")
+        # HttpOptions(timeout=...) 가 Client(...) 에 전달되어야 함
+        assert "HttpOptions" in src
+        assert "http_options=" in src
+        # 초→ms 변환 코멘트 표식
+        assert "timeout * 1000" in src or "int(timeout * 1000)" in src
