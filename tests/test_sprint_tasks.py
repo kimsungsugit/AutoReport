@@ -814,3 +814,67 @@ class TestGeminiAdapterTimeoutWiring:
         assert "http_options=" in src
         # 초→ms 변환 코멘트 표식
         assert "timeout * 1000" in src or "int(timeout * 1000)" in src
+
+
+# ---------------------------------------------------------------------------
+# JiraApiTaskProvider keyword 자동 추출 (Iteration 3)
+# ---------------------------------------------------------------------------
+
+class TestDefaultKeywordsFromTitle:
+    """workflow/task_provider.py 의 _default_keywords_from_title 회귀 방지."""
+
+    def _kws(self, title):
+        from workflow.task_provider import _default_keywords_from_title
+        return [k["word"] for k in _default_keywords_from_title(title)]
+
+    def test_empty_title_returns_empty(self):
+        assert self._kws("") == []
+
+    def test_korean_short_words_filtered(self):
+        """한국어 2자 이하는 제외 (UI/연동 등도 짧으면 빠짐)."""
+        kws = self._kws("UI 연동 분석")
+        # UI 영문 2자 제외, 연동 한글 2자 제외, 분석 skip-list 에 있음
+        assert kws == []
+
+    def test_korean_long_words_extracted(self):
+        kws = self._kws("대시보드 컴포넌트 구현")
+        assert "대시보드" in kws
+        assert "컴포넌트" in kws
+        # "구현" skip list 로 제외
+        assert "구현" not in kws
+
+    def test_english_short_words_filtered(self):
+        """영문 3자 이하 + ci/qa 류 제외."""
+        kws = self._kws("ci qa for the app")
+        # ci, qa, for, the 모두 영문 4자 미만 / skip list → 제외
+        assert kws == []
+
+    def test_english_long_words_extracted(self):
+        kws = self._kws("GitLab pipeline orchestration")
+        # 모두 영문 4자 이상이고 skip list 에 없음
+        assert "gitlab" in kws
+        assert "pipeline" in kws
+        assert "orchestration" in kws
+
+    def test_skip_list_filters_generic(self):
+        kws = self._kws("프로젝트 시스템 기능 관리")
+        # 모두 _DEFAULT_KEYWORD_SKIP 에 등재된 generic 한국어 → 모두 제외
+        assert kws == []
+
+    def test_dedup_within_title(self):
+        kws = self._kws("대시보드 대시보드 컴포넌트")
+        # 동일 단어 한 번만 등장
+        assert kws.count("대시보드") == 1
+
+    def test_cap_at_eight(self):
+        """최대 8개로 cap — title 이 길어도 제안 spam 방지."""
+        title = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu"
+        kws = self._kws(title)
+        assert len(kws) <= 8
+
+    def test_split_on_punctuation(self):
+        """슬래시/콤마/하이픈/괄호 등 구분자로 split."""
+        kws = self._kws("정적,동적/분석-결과(자동)")
+        # 한국어 2자 단어들이 다 제외되더라도 split 자체는 동작해야 함
+        # → 결과는 [] 일 수 있지만 예외 발생하면 안 됨
+        assert isinstance(kws, list)
