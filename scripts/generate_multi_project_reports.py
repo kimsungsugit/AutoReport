@@ -7,6 +7,7 @@ import sys
 from datetime import date, timedelta
 from html import escape
 from pathlib import Path
+from typing import Any
 import re
 from hashlib import sha1
 
@@ -325,16 +326,40 @@ def _build_jira_sections(run_date: str) -> tuple[str, str]:
             projects = json.load(f).get("projects", [])
 
         boards_html = ""
-        suggestions_html = ""
+        # Dedup boards by (project_key, sprint_id, board_id): 여러 프로젝트가 같은
+        # 사내 Jira sprint 를 공유할 때 보드가 중복 렌더링 되는 것을 방지.
+        seen_boards: set[tuple[str, int, int]] = set()
+        # Collect suggestions from all projects into ONE panel so the Epic
+        # grouping shows each Epic exactly once (previously each project
+        # emitted its own panel, doubling the APPL-373/APPL-418 headers).
+        # Suggestion IDs are namespaced with project prefix to keep them
+        # unique inside the merged list.
+        merged_suggestions: list[dict[str, Any]] = []
         for pc in projects:
-            if isinstance(pc.get("jira"), dict):
+            jcfg = pc.get("jira") if isinstance(pc.get("jira"), dict) else None
+            if not jcfg:
+                continue
+            board_key = (
+                str(jcfg.get("project_key", "")),
+                int(jcfg.get("sprint_id") or 0),
+                int(jcfg.get("board_id") or 0),
+            )
+            if board_key not in seen_boards:
+                seen_boards.add(board_key)
                 boards_html += html_jira_live_board(pc)
-                # Load suggestions from file
-                sugg_path = WORKSPACE_ROOT / "reports" / "projects" / pc["name"] / "reports" / "jira" / f"{run_date}-jira-suggestions.json"
-                if sugg_path.exists():
-                    with open(sugg_path, encoding="utf-8") as sf:
-                        sugg_data = json.load(sf)
-                    suggestions_html += html_jira_suggestions_panel(sugg_data.get("suggestions", []))
+            # Load suggestions from file
+            sugg_path = WORKSPACE_ROOT / "reports" / "projects" / pc["name"] / "reports" / "jira" / f"{run_date}-jira-suggestions.json"
+            if sugg_path.exists():
+                with open(sugg_path, encoding="utf-8") as sf:
+                    sugg_data = json.load(sf)
+                proj_prefix = pc.get("name", "p")
+                for s in sugg_data.get("suggestions", []) or []:
+                    if isinstance(s, dict):
+                        s = dict(s)  # don't mutate the on-disk copy
+                        s["id"] = f"{proj_prefix}-{s.get('id', '')}"
+                        s["_project"] = proj_prefix
+                        merged_suggestions.append(s)
+        suggestions_html = html_jira_suggestions_panel(merged_suggestions) if merged_suggestions else ""
 
         scripts = ""
         if boards_html:
