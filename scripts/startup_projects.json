@@ -27,7 +27,12 @@
       "name": "CyberSecurity",
       "path": "C:/Project/CyberSecurity",
       "profile": "desktop_app",
-      "enabled": true
+      "enabled": true,
+      "jira": {
+        "project_key": "APPL",
+        "sprint_id": 152,
+        "board_id": 239
+      }
     }
   ]
 }

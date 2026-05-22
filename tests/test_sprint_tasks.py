@@ -260,6 +260,56 @@ class TestMatchCommitsToTasks:
         assert ci_task["hit_count"] == 0
         assert ci_task["related_commits"] == []
 
+    # Regression: Iteration-1 fix — Jira 실제 status 우선 사용. 이전 동작은
+    # 날짜만으로 재할당해서 end_date < today 인 in_progress 작업이 강제 "완료"
+    # 가 되어 Rule 2 (기한 초과 완료 제안) 가 사실상 미발동.
+    def test_jira_status_overrides_date_when_overdue(self):
+        """task['status']='in_progress' + end_date < today → 진행 중 유지 (날짜 fallback 무시)."""
+        data = {
+            "tasks": [
+                {
+                    "key": "APPL-300",
+                    "title": "Overdue WIP",
+                    "start": "2026-04-01",
+                    "end": "2026-04-05",
+                    "status": "in_progress",
+                    "subtasks": [],
+                    "keywords": [],
+                },
+            ],
+        }
+        result = match_commits_to_tasks([], [], data, date(2026, 4, 22))
+        assert result[0]["status"] == "진행 중"
+
+    def test_jira_status_korean_mapping(self):
+        """task['status'] 영문 값이 한국어로 매핑되는지."""
+        data = {
+            "tasks": [
+                {"key": "K-1", "title": "T1", "start": "2026-04-01", "end": "2026-04-30",
+                 "status": "done", "subtasks": [], "keywords": []},
+                {"key": "K-2", "title": "T2", "start": "2026-04-01", "end": "2026-04-30",
+                 "status": "in_progress", "subtasks": [], "keywords": []},
+                {"key": "K-3", "title": "T3", "start": "2026-04-01", "end": "2026-04-30",
+                 "status": "pending", "subtasks": [], "keywords": []},
+            ],
+        }
+        result = match_commits_to_tasks([], [], data, date(2026, 4, 15))
+        by_key = {t["key"]: t for t in result}
+        assert by_key["K-1"]["status"] == "완료"
+        assert by_key["K-2"]["status"] == "진행 중"
+        assert by_key["K-3"]["status"] == "예정"
+
+    def test_no_status_falls_back_to_date_logic(self):
+        """status 필드 없으면 기존 날짜 기반 fallback 그대로 동작."""
+        data = {
+            "tasks": [
+                {"key": "F-1", "title": "Future", "start": "2026-05-01", "end": "2026-05-30",
+                 "subtasks": [], "keywords": []},
+            ],
+        }
+        result = match_commits_to_tasks([], [], data, date(2026, 4, 15))
+        assert result[0]["status"] == "예정"
+
 
 # ---------------------------------------------------------------------------
 # build_fallback_jira_doc

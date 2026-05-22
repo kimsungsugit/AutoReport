@@ -62,19 +62,44 @@ def _drop_if_expired(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def load_sprint_tasks() -> dict[str, Any]:
+def load_sprint_tasks(repo_root: Path | None = None) -> dict[str, Any]:
     """Load sprint task definitions via TaskProvider.
 
     Uses JiraApiTaskProvider if JIRA_URL/JIRA_TOKEN are set,
     otherwise falls back to sprint_tasks.json. Expired sprints are dropped.
+
+    When repo_root is given, looks up that repo's project entry in
+    startup_projects.json and passes its `jira` config (project_key, sprint_id)
+    to the provider. Without this, get_task_provider() falls back to
+    sprint_id=None and returns an empty sprint.
     """
+    project_config: dict[str, Any] | None = None
+    if repo_root is not None:
+        try:
+            cfg_path = Path(__file__).resolve().parent / "startup_projects.json"
+            if cfg_path.exists():
+                target = str(repo_root.resolve()).replace("\\", "/").lower()
+                with open(cfg_path, encoding="utf-8") as _f:
+                    for _proj in json.load(_f).get("projects", []) or []:
+                        _pp_raw = str(_proj.get("path") or "").strip()
+                        if not _pp_raw:
+                            continue
+                        try:
+                            _pp = str(Path(_pp_raw).resolve()).replace("\\", "/").lower()
+                        except OSError:
+                            continue
+                        if _pp == target and isinstance(_proj.get("jira"), dict):
+                            project_config = _proj
+                            break
+        except Exception:
+            project_config = None
     try:
         task_provider_path = REPO_ROOT / "workflow" / "task_provider.py"
         spec = importlib.util.spec_from_file_location("task_provider", task_provider_path)
         if spec and spec.loader:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            return _drop_if_expired(mod.get_task_provider().get_tasks())
+            return _drop_if_expired(mod.get_task_provider(project_config).get_tasks())
     except Exception:
         pass
     # Direct fallback
@@ -178,15 +203,24 @@ def match_commits_to_tasks(
         subtasks = task.get("subtasks", [])
         subtask_done = sum(1 for s in subtasks if s.get("status") == "done")
         subtask_total = len(subtasks)
-        # 날짜 + subtask 기반 상태 결정
-        if report_date < task_start:
-            status = "예정"
-        elif report_date > task_end:
-            status = "완료"
-        elif subtask_total > 0 and subtask_done == subtask_total:
-            status = "완료"
+        # Status 결정: Jira 의 실제 상태(`task['status']`)가 있으면 그것을 우선.
+        # Why: 이전엔 날짜만으로 재할당해서 end_date < today 인 in_progress 작업이
+        # 강제로 "완료" 가 되어 Rule 2 (기한 초과 완료 제안) 가 종료일 다음날부터
+        # 절대 발동 안 되는 구조 버그가 있었다. Jira 상태를 신뢰하고, 그 정보가
+        # 없을 때만 날짜 기반 fallback.
+        jira_status = (task.get("status") or "").strip().lower()
+        _jira_kor = {"done": "완료", "in_progress": "진행 중", "pending": "예정"}
+        if jira_status in _jira_kor:
+            status = _jira_kor[jira_status]
         else:
-            status = "진행 중"
+            if report_date < task_start:
+                status = "예정"
+            elif report_date > task_end:
+                status = "완료"
+            elif subtask_total > 0 and subtask_done == subtask_total:
+                status = "완료"
+            else:
+                status = "진행 중"
         kw_entries = _parse_keywords(task.get("keywords", []))
         weighted_score = sum(
             entry["weight"] for entry in kw_entries
@@ -884,7 +918,7 @@ def build_context_payload(
             match_commits_to_tasks(
                 [{"hash": c.short_hash, "time": c.authored_at, "author": c.author, "subject": c.subject} for c in commits[:20]],
                 changed_files,
-                load_sprint_tasks(),
+                load_sprint_tasks(repo_root),
                 today,
             )
             if jira_enabled else []
@@ -927,6 +961,9 @@ def generate_jira_suggestions(
     Returns a list of suggestion dicts with id, task_key, type, title,
     suggested_text, reason, confidence, status fields.
     """
+    # ai_sections is part of the public API but currently unused — silence Pyright
+    # without breaking callers in generate_document that pass it positionally.
+    del ai_sections
     # Suggestions only make sense for repos whose jira is configured in
     # startup_projects.json. Previously we grabbed the *first* jira-enabled
     # project's live data unconditionally, which leaked Release_claude's APPL
@@ -1004,9 +1041,18 @@ def generate_jira_suggestions(
     except Exception:
         pass
 
-    # Noise patterns — skip these commits in suggestions
-    _NOISE_PREFIXES = ("chore(auto)", "chore:", "merge", "fix gitlab ci", "fix ci", "skip hanging")
+    # Noise patterns — skip these commits in suggestions.
+    # NOTE: previously `"chore:"` (단독) 가 prefix 였으나 모든 chore commit 을 차단해서
+    # `chore: requirements.txt 추가` 같은 의미 있는 변경도 unmatched_commits 에서 빠졌다.
+    # 이제 진짜 noise 인 자동 스냅샷·머지·CI 만 prefix 로 차단하고, chore: 의 noise
+    # 변종(bump/deps/lockfile 등)은 _is_noise_commit 의 보조 체크로 처리.
+    _NOISE_PREFIXES = ("chore(auto)", "merge ", "merge:", "fix gitlab ci", "fix ci", "skip hanging")
     _NOISE_KEYWORDS = {"ci", "build", "fix", "merge", "snapshot", "chore"}
+    _NOISE_CHORE_BODY = (
+        "bump ", "bump:", "deps", "lockfile", "lock file",
+        "regenerate", "regen ", "update package", "update deps",
+        "ignore ", ".gitignore", "gitignore",
+    )
 
     _CC_PREFIXES = ("feat: ", "fix: ", "refactor: ", "test: ", "chore: ", "docs: ",
                     "feat(", "fix(", "refactor(", "test(", "chore(", "docs(")
@@ -1084,7 +1130,14 @@ def generate_jira_suggestions(
 
     def _is_noise_commit(subj: str) -> bool:
         sl = subj.lower().strip()
-        return any(sl.startswith(p) for p in _NOISE_PREFIXES)
+        if any(sl.startswith(p) for p in _NOISE_PREFIXES):
+            return True
+        # chore: 의 진짜 noise 변종만 추가 차단. 일반 chore: 는 의미 있는 변경
+        # (e.g. "chore: requirements.txt 추가") 일 수 있어 통과시킨다.
+        if sl.startswith("chore:"):
+            rest = sl[6:].strip()
+            return any(rest.startswith(k) for k in _NOISE_CHORE_BODY)
+        return False
 
     def _match_commits_for(task_title: str, task_key: str) -> list[str]:
         """Find commits relevant to a task by keyword matching."""
@@ -1218,11 +1271,13 @@ def generate_jira_suggestions(
             })
             continue
 
-        # Rule 2: 기한 초과 → 완료 처리 제안
+        # Rule 2: 종료일 도래/초과 → 완료 처리 제안
+        # Why: 종료일 당일에도 활성화해야 사용자가 "오늘 마감" 인 작업을
+        # 미리 인지하고 완료 처리할 수 있다. (이전: <today, 누락 1일)
         if t_end and is_in_progress:
             try:
                 end_date = date.fromisoformat(t_end)
-                if end_date < today:
+                if end_date <= today:
                     sid += 1
                     days_over = (today - end_date).days
                     sub_status_lines = []
@@ -1241,15 +1296,25 @@ def generate_jira_suggestions(
                         sub_status_lines.append(f"- {s.get('title', '')}: {st_label}{detail}")
                     sub_report = "\n".join(sub_status_lines) if sub_status_lines else ""
                     parent_desc = task.get("description", "") or local_sprint.get(key, {}).get("description", "")
+                    if days_over == 0:
+                        title_suffix = "종료일 도래, 완료 처리"
+                        subtitle_period = f"종료일 {t_end} (오늘)"
+                        text_prefix = f"종료일({t_end}) 도래."
+                        reason_text = f"종료일 {t_end} 도래"
+                    else:
+                        title_suffix = f"기한 초과 ({days_over}일), 완료 처리"
+                        subtitle_period = f"종료일 {t_end} ({days_over}일 경과)"
+                        text_prefix = f"기한({t_end}) 대비 {days_over}일 경과."
+                        reason_text = f"종료일 {t_end} 경과"
                     suggestions.append({
                         "id": f"s{sid}",
                         "task_key": key,
                         "type": "complete",
-                        "title": f"{title} — 기한 초과 ({days_over}일), 완료 처리",
-                        "subtitle": f"상위 작업 · 종료일 {t_end} ({days_over}일 경과) · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
-                        "suggested_text": f"기한({t_end}) 대비 {days_over}일 경과.\n{sub_report}\n종료 요청합니다.",
+                        "title": f"{title} — {title_suffix}",
+                        "subtitle": f"상위 작업 · {subtitle_period} · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
+                        "suggested_text": f"{text_prefix}\n{sub_report}\n종료 요청합니다.",
                         "suggested_description": parent_desc,
-                        "reason": f"종료일 {t_end} 경과 ({len(done_subs)}/{len(subtasks)} 부작업 완료)",
+                        "reason": f"{reason_text} ({len(done_subs)}/{len(subtasks)} 부작업 완료)",
                         "confidence": "high",
                         "status": "pending",
                     })
@@ -1303,17 +1368,26 @@ def generate_jira_suggestions(
 
     # Group unmatched commits and suggest subtask additions
     if unmatched_commits and len(suggestions) < max_suggestions:
-        # Find best parent: in_progress task closest to today
-        best_parent = None
-        for task in sprint_tasks:
-            if task.get("status") in ("진행 중", "in_progress"):
-                best_parent = task
-                break
-        if not best_parent:
-            for task in sprint_tasks:
-                if task.get("status") in ("예정", "pending"):
-                    best_parent = task
-                    break
+        # Pick the best parent PER COMMIT: score by word-overlap between commit
+        # subject and task title. Falls back to the first in_progress / pending
+        # task when overlap is zero (common when commits are English but tasks
+        # are Korean), so the previous behavior remains the floor.
+        _active_parents = [t for t in sprint_tasks if t.get("status") in ("진행 중", "in_progress")]
+        if not _active_parents:
+            _active_parents = [t for t in sprint_tasks if t.get("status") in ("예정", "pending")]
+
+        def _pick_parent(commit_subj: str) -> dict[str, Any] | None:
+            if not _active_parents:
+                return None
+            subj_words = {w for w in re.split(r"[\s,/\-_:()]+", commit_subj.lower()) if len(w) >= 3}
+            best = _active_parents[0]
+            best_score = -1
+            for cand in _active_parents:
+                title_lower = (cand.get("title") or "").lower()
+                score = sum(1 for w in subj_words if w in title_lower)
+                if score > best_score:
+                    best, best_score = cand, score
+            return best
 
         # Also suggest for commits that DO match a task but NOT any subtask
         # → suggests adding a new subtask for that specific area
@@ -1324,6 +1398,7 @@ def generate_jira_suggestions(
             # richer template so the two fields show distinct, useful info.
             clean_full = _strip_cc_prefix(commit_subj)
             clean_title = clean_full[:60]
+            best_parent = _pick_parent(commit_subj)
             if best_parent:
                 body_desc = _format_body_for_desc(commit_bodies.get(commit_subj, ""))
                 desc = body_desc if body_desc else f"- {clean_full}"
@@ -1622,7 +1697,10 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
         "- Keep the work type framing consistent.\n"
         f"- Domain profile: {payload.get('domain_profile_name', '')}\n"
         f"- Domain focus: {', '.join(payload.get('domain_focus') or [])}\n"
-        "- For jira, use the sprint_tasks data to map commits to APPL-xxx task keys. Show each task with its subtasks, status (완료/진행 중/예정), and related commits. Structure as task_board entries.\n"
+        "- For jira, use ONLY task keys that appear in payload.sprint_tasks[].key. NEVER invent new keys (no APPL-001, APPL-101, etc.). If sprint_tasks is empty, return task_board: [] and leave completed/in_progress/remaining empty.\n"
+        "- For each task_board entry, copy key/title/start/end from sprint_tasks; do not paraphrase or translate keys.\n"
+        "- Show each task with its subtasks, status (완료/진행 중/예정), and related commits.\n"
+        "- For daily/weekly/monthly/plan, when referencing Jira tasks in narrative text, quote keys exactly as they appear in payload.sprint_tasks[].key. Do not invent keys.\n"
         "- No markdown fence, JSON only.\n\n"
         f"Context JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
@@ -1691,7 +1769,7 @@ def ask_gemini_for_team_analysis(payload: dict[str, Any]) -> dict[str, list[str]
         "- structure: explain how the source/code structure changed.\n"
         "- quality: explain how quality, validation, test, or coverage improved.\n"
         "- feature: explain user-facing or workflow-facing impact.\n"
-        "- jira_strategy: explain parent task framing and grouped subtasks.\n"
+        "- jira_strategy: explain parent task framing and grouped subtasks. Reference Epic/task names ONLY from payload.sprint_tasks; never invent Epic titles or APPL keys.\n"
         "- Keep each list to 2-4 concise bullets.\n"
         "- Mention concrete modules or paths when evidence is strong.\n"
         f"- Domain profile: {payload.get('domain_profile_name', '')}\n"
@@ -2078,6 +2156,31 @@ def generate_document(report_type: str, payload: dict[str, Any]) -> tuple[str, s
         sections = build_fallback_jira_doc(report_type, payload) if report_type.startswith("jira") else build_fallback_sections(report_type, payload)
         mode = "fallback"
         sections_error = f"{type(exc).__name__}: {exc}"
+
+    # For jira reports: never trust the LLM for sprint-derived fact fields.
+    # Why: Gemini was hallucinating Jira keys (e.g. APPL-101/102/103) for the
+    # task_board / scope sections even when sprint_tasks carried the real
+    # APPL-XXX keys from the live board. Overwrite those fields with the
+    # deterministic fallback built directly from sprint_tasks.
+    if report_type.startswith("jira") and mode == "gemini":
+        # Never trust the LLM for sprint-derived fact fields. Two cases:
+        # 1) sprint_tasks present → overwrite with deterministic fallback values
+        #    derived directly from sprint_tasks (real APPL-XXX keys).
+        # 2) sprint_tasks empty (project lacks `jira` config) → wipe to empty
+        #    placeholders so Gemini cannot inject hallucinated keys like APPL-001.
+        if payload.get("sprint_tasks"):
+            truth = build_fallback_jira_doc(report_type, payload)
+            for fact_field in ("task_board", "scope", "completed", "in_progress",
+                               "remaining", "status_summary"):
+                if fact_field in truth:
+                    sections[fact_field] = truth[fact_field]
+        else:
+            sections["task_board"] = []
+            sections["scope"] = ["Jira 스프린트 미연동 — startup_projects.json 의 jira 설정 필요"]
+            sections["completed"] = ["Jira 스프린트 미연동 상태입니다."]
+            sections["in_progress"] = []
+            sections["remaining"] = []
+            sections["status_summary"] = {"completed_count": 0, "in_progress_count": 0, "remaining_count": 0}
 
     try:
         ai_team = ask_gemini_for_team_analysis(payload)
@@ -2822,6 +2925,9 @@ def svg_sprint_gantt(tasks: list[dict[str, Any]], sprint: dict[str, Any], today:
     Gantt mirrors the Jira Live Board grouping. Epic order matches the
     Live Board: task count desc → epic_key asc → "No Epic" last.
     """
+    # sprint param kept for API compatibility (callers pass it positionally) but
+    # the chart now derives its time range from actual task dates below.
+    del sprint
     if today is None:
         today = date.today()
 
@@ -4359,12 +4465,26 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]], project_conf
     total_files = sum(int(card["payload"].get("changed_file_count", 0)) for card in cards)
     total_added = sum(int((card["payload"].get("diff_summary") or {}).get("total_added", 0)) for card in cards)
     total_deleted = sum(int((card["payload"].get("diff_summary") or {}).get("total_deleted", 0)) for card in cards)
-    # Build Jira live boards for projects that have jira config
+    # Build Jira live boards for projects that have jira config.
+    # Dedup by (project_key, sprint_id, board_id): when multiple projects share
+    # the same sprint (사내 Jira 의 단일 APPL 보드를 여러 프로젝트가 공유) the
+    # board would otherwise render once per project, producing 6× duplicates.
     jira_boards_html = ""
     if project_configs:
+        seen_boards: set[tuple[str, int, int]] = set()
         for pc in project_configs:
-            if isinstance(pc.get("jira"), dict):
-                jira_boards_html += html_jira_live_board(pc)
+            jcfg = pc.get("jira") if isinstance(pc.get("jira"), dict) else None
+            if not jcfg:
+                continue
+            board_key = (
+                str(jcfg.get("project_key", "")),
+                int(jcfg.get("sprint_id") or 0),
+                int(jcfg.get("board_id") or 0),
+            )
+            if board_key in seen_boards:
+                continue
+            seen_boards.add(board_key)
+            jira_boards_html += html_jira_live_board(pc)
     # Add suggestions panel below Jira board
     suggestions_html = html_jira_suggestions_panel(jira_suggestions or [])
     jira_boards_html += suggestions_html
