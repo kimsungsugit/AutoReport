@@ -11,11 +11,62 @@ Usage:
 from __future__ import annotations
 
 import json
+import re
 import ssl
 from abc import ABC, abstractmethod
 from datetime import date
 from pathlib import Path
 from typing import Any
+
+
+# Korean/English generic nouns that match almost any commit — skipping these
+# prevents auto-extracted keywords from over-matching ("프로젝트", "시스템" 등을
+# 무차별 매칭 단어로 만들지 않기 위함).
+_DEFAULT_KEYWORD_SKIP: frozenset[str] = frozenset({
+    # Korean generic
+    "프로젝트", "시스템", "기능", "관리", "구성", "분석", "개선", "추가", "수정",
+    "통합", "위한", "통한", "결과", "관련", "기반", "검증", "구현", "처리", "확인",
+    "지원", "적용", "사용", "변경", "작성", "포함", "정리", "대응", "준비", "필요",
+    "고도화", "최신",
+    # English connectors
+    "and", "the", "for", "with", "from", "into", "etc",
+})
+
+
+def _default_keywords_from_title(title: str) -> list[dict[str, Any]]:
+    """Auto-extract matching keywords from a Jira task title.
+
+    Why: JiraApiTaskProvider previously returned `keywords: []`, leaving
+    `match_commits_to_tasks` with no signal beyond title-word startswith. This
+    produces conservative keywords (length ≥ 3 for Korean, ≥ 4 for English,
+    explicit skip list) so commit ↔ task matching becomes meaningful for the
+    sprint-suggestion pipeline without false-positive flooding.
+    """
+    if not title:
+        return []
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[\s,./\-_:()\[\]]+", title):
+        w = raw.strip()
+        if not w:
+            continue
+        wl = w.lower()
+        if wl in seen or wl in _DEFAULT_KEYWORD_SKIP:
+            continue
+        # Korean words: contain Hangul → length ≥ 3
+        has_hangul = any("가" <= ch <= "힣" for ch in w)
+        if has_hangul:
+            if len(w) < 3:
+                continue
+        else:
+            # English/Latin/digits: length ≥ 4 to avoid noise like 'ci'/'qa'
+            if len(wl) < 4 or not re.search(r"[a-z]", wl):
+                continue
+        seen.add(wl)
+        out.append({"word": wl, "weight": 1})
+        if len(out) >= 8:  # cap so a long title cannot flood matching
+            break
+    return out
 
 
 class TaskProvider(ABC):
@@ -590,9 +641,10 @@ class JiraApiTaskProvider(TaskProvider):
 
             status_name = fields.get("status", {}).get("name", "")
             status_map = {"완료": "done", "종료 요청": "done", "진행 중": "in_progress"}
+            title = fields.get("summary", "")
             tasks.append({
                 "key": key,
-                "title": fields.get("summary", ""),
+                "title": title,
                 "description": extras.get(key, {}).get("description", ""),
                 "status": status_map.get(status_name, "pending"),
                 "start": str(fields.get("customfield_10230", "") or "")[:10],
@@ -613,7 +665,7 @@ class JiraApiTaskProvider(TaskProvider):
                     }
                     for st in fields.get("subtasks", [])
                 ],
-                "keywords": [],
+                "keywords": _default_keywords_from_title(title),
             })
 
         # Batch-fetch epic summaries so the UI can show "APPL-401 소프트웨어 추가, 진단기능 개선"
