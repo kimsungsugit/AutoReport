@@ -69,7 +69,7 @@ class GeminiAdapter(LLMAdapter):
         messages: list[dict[str, str]],
         *,
         temperature: float = 0.3,
-        max_tokens: float = 65536,
+        max_tokens: int = 65536,
         timeout: float = 300.0,
     ) -> dict[str, Any]:
         from google import genai as genai_new
