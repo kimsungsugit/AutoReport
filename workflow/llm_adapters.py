@@ -73,6 +73,7 @@ class GeminiAdapter(LLMAdapter):
         timeout: float = 300.0,
     ) -> dict[str, Any]:
         from google import genai as genai_new
+        from google.genai import types as genai_types
 
         api_key = self.api_key or os.environ.get("GOOGLE_API_KEY", "")
         if not api_key:
@@ -88,7 +89,14 @@ class GeminiAdapter(LLMAdapter):
             else:
                 contents.append({"role": role, "parts": [{"text": text}]})
 
-        client = genai_new.Client(api_key=api_key)
+        # Wire the caller's timeout into the client. google-genai's HttpOptions.timeout
+        # is int in milliseconds; we receive seconds → multiply. Without this the SDK
+        # default applies and `timeout=180.0` from generate_periodic_reports.py was
+        # silently dropped.
+        client = genai_new.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(timeout=int(timeout * 1000)),
+        )
         config: dict[str, Any] = {"temperature": temperature, "max_output_tokens": int(max_tokens)}
         if system_instruction:
             config["system_instruction"] = system_instruction
