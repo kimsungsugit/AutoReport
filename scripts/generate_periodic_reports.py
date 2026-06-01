@@ -240,9 +240,29 @@ def match_commits_to_tasks(
             "hit_count": weighted_score,
             "related_commits": related_commits[:5],
             "subtask_progress": f"{subtask_done}/{subtask_total}",
+            # Preserve Epic so downstream board grouping + shared-sprint isolation
+            # work. Previously dropped → payload sprint_tasks had no epic_key, so
+            # every task collapsed into "No Epic" and epic scoping was impossible.
+            "epic_key": task.get("epic_key", ""),
+            "epic_summary": task.get("epic_summary", ""),
         })
     matched.sort(key=lambda x: x["hit_count"], reverse=True)
     return matched
+
+
+def _scope_tasks_to_epic(tasks: list[dict[str, Any]], epic_scope: str) -> list[dict[str, Any]]:
+    """Restrict tasks to a single 큰틀(Epic) for shared-sprint isolation.
+
+    Several projects (CyberSecurity, Release_claude) share one APPL sprint; without
+    this, each project's report body + suggestions show the *other* project's tasks.
+
+    No-op when epic_scope is empty OR when no task carries an epic_key (e.g. the local
+    sprint_tasks.json fallback doesn't populate epics) — so non-Jira projects relying
+    on the fallback aren't wiped to an empty board.
+    """
+    if not epic_scope or not any(t.get("epic_key") for t in tasks):
+        return list(tasks)
+    return [t for t in tasks if t.get("epic_key") == epic_scope]
 
 
 FIELD_SEP = "\x1f"
@@ -880,6 +900,23 @@ def build_context_payload(
     source_insights = infer_source_insights(changed_files, diff_summary)
     domain_profile = get_domain_profile(profile_name)
     auto_commit_status = load_auto_commit_status(repo_root.name, window.end)
+    # Shared-sprint isolation: scope this repo's sprint_tasks to its configured 큰틀
+    # (Epic) so the board / completed / in_progress lists / Gemini prompt / fact-override
+    # all see only this project's tasks — not other projects sharing the same Jira sprint.
+    _jira_cfg = _project_jira_for_repo(repo_root) if jira_enabled else None
+    epic_scope = str((_jira_cfg or {}).get("epic_key") or "")
+    if jira_enabled:
+        _sprint_tasks = _scope_tasks_to_epic(
+            match_commits_to_tasks(
+                [{"hash": c.short_hash, "time": c.authored_at, "author": c.author, "subject": c.subject} for c in commits[:20]],
+                changed_files,
+                load_sprint_tasks(repo_root),
+                today,
+            ),
+            epic_scope,
+        )
+    else:
+        _sprint_tasks = []
     return {
         "today": today.isoformat(),
         "report_type": report_type,
@@ -914,15 +951,8 @@ def build_context_payload(
         "uncommitted": uncommitted[:30],
         "github": github_meta,
         "jira_enabled": jira_enabled,
-        "sprint_tasks": (
-            match_commits_to_tasks(
-                [{"hash": c.short_hash, "time": c.authored_at, "author": c.author, "subject": c.subject} for c in commits[:20]],
-                changed_files,
-                load_sprint_tasks(repo_root),
-                today,
-            )
-            if jira_enabled else []
-        ),
+        "epic_scope": epic_scope,
+        "sprint_tasks": _sprint_tasks,
     }
 
 
@@ -1000,14 +1030,22 @@ def generate_jira_suggestions(
     # and repo A's report even suggests completing repo B's subtasks. Restrict the
     # whole suggestion pass to the project's own 큰틀(Epic) when one is configured.
     epic_scope = epic_scope or str(payload.get("epic_scope") or "")
-    if epic_scope:
-        sprint_tasks = [t for t in sprint_tasks if t.get("epic_key") == epic_scope]
+    sprint_tasks = _scope_tasks_to_epic(sprint_tasks, epic_scope)
     if not sprint_tasks:
         return []
 
     suggestions: list[dict[str, Any]] = []
     sid = 0
+    # Honor the report date (payload['today']) instead of the wall clock so that
+    # backdated reports compute 종료일/시작일 도래 against the correct day — and so the
+    # date-sensitive 규칙(Rule 2/3) tests are deterministic. Falls back to today.
     today = date.today()
+    _pt = payload.get("today")
+    if _pt:
+        try:
+            today = date.fromisoformat(str(_pt))
+        except ValueError:
+            pass
 
     # Build commit evidence — use sprint-wide commits, not just daily
     all_commits = [c.get("subject", "") for c in (payload.get("recent_commits") or [])]

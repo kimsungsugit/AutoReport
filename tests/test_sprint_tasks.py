@@ -20,6 +20,7 @@ from scripts.generate_periodic_reports import (
     _build_sprint_summary,
     _render_sprint_summary,
     _keyword_pattern,
+    _scope_tasks_to_epic,
     generate_jira_suggestions,
 )
 
@@ -310,6 +311,62 @@ class TestMatchCommitsToTasks:
         }
         result = match_commits_to_tasks([], [], data, date(2026, 4, 15))
         assert result[0]["status"] == "예정"
+
+    def test_preserves_epic_key(self):
+        """epic_key/epic_summary 가 출력에 보존돼야 한다 (보드 그룹핑 + epic 격리 의존).
+
+        이전엔 match 출력에서 누락 → payload sprint_tasks 가 전부 'No Epic' 으로
+        뭉치고 공유 스프린트 격리가 불가능했다.
+        """
+        data = {
+            "tasks": [
+                {"key": "E-1", "title": "Task", "start": "2026-05-01", "end": "2026-05-30",
+                 "subtasks": [], "keywords": [], "epic_key": "APPL-418",
+                 "epic_summary": "사이버보안"},
+            ],
+        }
+        result = match_commits_to_tasks([], [], data, date(2026, 5, 15))
+        assert result[0]["epic_key"] == "APPL-418"
+        assert result[0]["epic_summary"] == "사이버보안"
+
+    def test_missing_epic_key_defaults_empty(self):
+        """source 에 epic 정보 없으면 빈 문자열로 채워야 한다 (KeyError 금지)."""
+        data = {"tasks": [{"key": "E-2", "title": "T", "start": "2026-05-01",
+                           "end": "2026-05-30", "subtasks": [], "keywords": []}]}
+        result = match_commits_to_tasks([], [], data, date(2026, 5, 15))
+        assert result[0]["epic_key"] == ""
+        assert result[0]["epic_summary"] == ""
+
+
+# ---------------------------------------------------------------------------
+# _scope_tasks_to_epic — 공유 스프린트 epic 격리 헬퍼
+# ---------------------------------------------------------------------------
+
+class TestScopeTasksToEpic:
+    _TASKS = [
+        {"key": "A-1", "epic_key": "APPL-373"},
+        {"key": "A-2", "epic_key": "APPL-418"},
+        {"key": "A-3", "epic_key": "APPL-373"},
+    ]
+
+    def test_filters_to_configured_epic(self):
+        out = _scope_tasks_to_epic(self._TASKS, "APPL-418")
+        assert [t["key"] for t in out] == ["A-2"]
+
+    def test_empty_scope_is_noop(self):
+        out = _scope_tasks_to_epic(self._TASKS, "")
+        assert [t["key"] for t in out] == ["A-1", "A-2", "A-3"]
+
+    def test_no_epic_data_is_noop(self):
+        """epic_key 가 전혀 없는 데이터(로컬 fallback)는 wipe 하지 않고 그대로 둔다."""
+        tasks = [{"key": "X-1"}, {"key": "X-2", "epic_key": ""}]
+        out = _scope_tasks_to_epic(tasks, "APPL-418")
+        assert [t["key"] for t in out] == ["X-1", "X-2"]
+
+    def test_no_match_returns_empty(self):
+        """epic_key 데이터는 있으나 scope 와 하나도 안 맞으면 빈 리스트."""
+        out = _scope_tasks_to_epic(self._TASKS, "APPL-999")
+        assert out == []
 
 
 # ---------------------------------------------------------------------------
@@ -706,6 +763,25 @@ class TestGenerateJiraSuggestions:
         assert adds, "add_subtask 제안이 있어야 함"
         # 첫 add_subtask 가 T-B 로 향해야 함 (단어 overlap: replay/analysis)
         assert adds[0]["task_key"] == "T-B"
+
+    def test_honors_payload_today_not_wall_clock(self):
+        """제안은 payload['today'](리포트 날짜) 기준으로 종료일 도래를 판단해야 한다.
+
+        end=2099-12-31 은 실제 오늘 기준 한참 미래라 Rule 2 가 안 터져야 정상인데,
+        payload['today']=2100-01-01 로 백데이트(여기선 forward-date)하면 Rule 2 가
+        발동한다 — wall-clock(date.today())이 아니라 payload 날짜를 쓴다는 증거.
+        """
+        sprint = [{
+            "key": "FUT-1", "title": "Far future",
+            "start": "2099-01-01", "end": "2099-12-31",
+            "status": "in_progress", "subtasks": [],
+        }]
+        payload = _suggestion_payload(sprint)
+        payload["today"] = "2100-01-01"
+        result = generate_jira_suggestions(payload, None)
+        completes = [s for s in result if s["task_key"] == "FUT-1" and s["type"] == "complete"]
+        assert completes, "payload['today'] 기준 종료일 초과 → Rule 2 발동해야 함"
+        assert "기한 초과" in completes[0]["title"]
 
     def test_shared_sprint_leaks_without_epic_scope(self):
         """epic_scope 미설정 시: 단어 overlap 0 인 커밋은 _pick_parent 폴백으로
