@@ -20,7 +20,8 @@
       "jira": {
         "project_key": "APPL",
         "sprint_id": 152,
-        "board_id": 239
+        "board_id": 239,
+        "epic_key": "APPL-373"
       }
     },
     {
@@ -31,7 +32,8 @@
       "jira": {
         "project_key": "APPL",
         "sprint_id": 152,
-        "board_id": 239
+        "board_id": 239,
+        "epic_key": "APPL-418"
       }
     }
   ]

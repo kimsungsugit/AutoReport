@@ -969,6 +969,7 @@ def generate_jira_suggestions(
     # project's live data unconditionally, which leaked Release_claude's APPL
     # sprint into every other project's reports. Match by repo_root instead.
     sprint_tasks = []
+    epic_scope = ""
     if payload.get("jira_enabled"):
         try:
             from workflow.task_provider import get_task_provider
@@ -983,6 +984,7 @@ def generate_jira_suggestions(
                         for _pc in json.load(_f).get("projects", []) or []:
                             _pp = str(Path(str(_pc.get("path") or "")).resolve()).replace("\\", "/").lower()
                             if _pp == target and isinstance(_pc.get("jira"), dict):
+                                epic_scope = str(_pc["jira"].get("epic_key") or "")
                                 provider = get_task_provider(_pc)
                                 live_data = provider.get_tasks()
                                 sprint_tasks = live_data.get("tasks", [])
@@ -992,6 +994,14 @@ def generate_jira_suggestions(
     # Fallback to payload data if Jira unavailable (also empty when jira_enabled=False)
     if not sprint_tasks:
         sprint_tasks = list(payload.get("sprint_tasks") or [])
+    # Shared-sprint isolation: multiple projects (e.g. CyberSecurity + Release_claude)
+    # share one APPL sprint. Without scoping, repo A's unmatched commits land on repo
+    # B's first in-progress task via the add_subtask parent fallback (_pick_parent),
+    # and repo A's report even suggests completing repo B's subtasks. Restrict the
+    # whole suggestion pass to the project's own 큰틀(Epic) when one is configured.
+    epic_scope = epic_scope or str(payload.get("epic_scope") or "")
+    if epic_scope:
+        sprint_tasks = [t for t in sprint_tasks if t.get("epic_key") == epic_scope]
     if not sprint_tasks:
         return []
 

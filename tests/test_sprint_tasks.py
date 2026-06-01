@@ -707,6 +707,66 @@ class TestGenerateJiraSuggestions:
         # 첫 add_subtask 가 T-B 로 향해야 함 (단어 overlap: replay/analysis)
         assert adds[0]["task_key"] == "T-B"
 
+    def test_shared_sprint_leaks_without_epic_scope(self):
+        """epic_scope 미설정 시: 단어 overlap 0 인 커밋은 _pick_parent 폴백으로
+        '다른 에픽'의 첫 in_progress 작업에 붙는다 — 이게 막으려던 누수 버그다.
+        """
+        sprint = [
+            {"key": "OTH-1", "title": "사용자 피드백 및 개선",  # 다른 프로젝트(에픽 E-OTHER)
+             "start": "2026-05-01", "end": "2026-05-30",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-OTHER"},
+            {"key": "MINE-1", "title": "프로그램 통신 확장",     # 이 프로젝트(에픽 E-MINE)
+             "start": "2026-05-01", "end": "2026-05-30",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-MINE"},
+        ]
+        commits = ["feat(tara): ISO 26262 HARA 데이터모델"]  # 두 title 과 단어 겹침 0
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert adds, "add_subtask 제안이 있어야 함"
+        # 폴백이 _active_parents[0] = OTH-1 (남의 에픽) 으로 새는 게 기본 동작
+        assert adds[0]["task_key"] == "OTH-1"
+
+    def test_shared_sprint_scoped_to_configured_epic(self):
+        """공유 스프린트 격리: epic_scope 설정 시 제안이 그 에픽 작업으로만 한정되고
+        다른 에픽으로 새지 않아야 한다 (CyberSecurity↔Release_claude APPL 공유 버그).
+        """
+        sprint = [
+            {"key": "OTH-1", "title": "사용자 피드백 및 개선",
+             "start": "2026-05-01", "end": "2026-05-30",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-OTHER"},
+            {"key": "MINE-1", "title": "프로그램 통신 확장",
+             "start": "2026-05-01", "end": "2026-05-30",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-MINE"},
+        ]
+        commits = ["feat(tara): ISO 26262 HARA 데이터모델"]
+        payload = _suggestion_payload(sprint, commits)
+        payload["epic_scope"] = "E-MINE"
+        result = generate_jira_suggestions(payload, None)
+        assert result, "에픽 내 제안이 있어야 함"
+        # 모든 제안이 내 에픽(E-MINE)의 작업으로만 향해야 한다
+        assert all(s["task_key"] == "MINE-1" for s in result), \
+            f"제안이 다른 에픽으로 새면 안 됨: {[s['task_key'] for s in result]}"
+        assert all(s.get("epic_key") == "E-MINE" for s in result)
+        assert not any(s["task_key"] == "OTH-1" for s in result), "남의 에픽 작업 제안 금지"
+
+    def test_shared_jira_projects_have_distinct_epic_key(self):
+        """공유 APPL 스프린트의 프로젝트들은 startup_projects.json 에서 서로 다른
+        epic_key 를 가져 격리돼야 한다 (config 누락 시 누수 재발).
+        """
+        sp = Path(__file__).resolve().parents[1] / "scripts" / "startup_projects.json"
+        projects = json.loads(sp.read_text(encoding="utf-8")).get("projects", [])
+        jira_projects = [p for p in projects if isinstance(p.get("jira"), dict)]
+        # 같은 (project_key, sprint_id) 를 공유하는 프로젝트는 epic_key 가 모두 채워져야 함
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for p in jira_projects:
+            j = p["jira"]
+            groups[(j.get("project_key"), j.get("sprint_id"))].append(j.get("epic_key"))
+        for sig, epics in groups.items():
+            if len(epics) > 1:  # 공유 스프린트
+                assert all(epics), f"{sig} 공유 프로젝트는 모두 epic_key 필요: {epics}"
+                assert len(set(epics)) == len(epics), f"{sig} epic_key 중복: {epics}"
+
 
 # ---------------------------------------------------------------------------
 # generate_document 의 jira fact_field 후처리 (환각 차단) — Iteration 1/2
