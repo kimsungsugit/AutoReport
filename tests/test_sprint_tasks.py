@@ -21,6 +21,7 @@ from scripts.generate_periodic_reports import (
     _render_sprint_summary,
     _keyword_pattern,
     _scope_tasks_to_epic,
+    _log_swallowed,
     generate_jira_suggestions,
 )
 
@@ -341,6 +342,20 @@ class TestMatchCommitsToTasks:
 # ---------------------------------------------------------------------------
 # _scope_tasks_to_epic — 공유 스프린트 epic 격리 헬퍼
 # ---------------------------------------------------------------------------
+
+class TestLogSwallowed:
+    """침묵 실패 가시화 헬퍼 — 삼켜진 예외를 stderr 로 흘려 scheduler.log 가 잡게."""
+
+    def test_writes_context_and_exception_to_stderr(self, capsys):
+        _log_swallowed("load_sprint_tasks/provider", ValueError("boom"))
+        err = capsys.readouterr().err
+        assert "load_sprint_tasks/provider" in err
+        assert "ValueError" in err and "boom" in err
+
+    def test_does_not_raise_on_weird_exception(self):
+        # 헬퍼 자체가 절대 예외를 던지면 안 된다 (안전망이 안전망을 깨면 곤란).
+        _log_swallowed("ctx", RuntimeError(""))
+
 
 class TestScopeTasksToEpic:
     _TASKS = [
@@ -763,6 +778,54 @@ class TestGenerateJiraSuggestions:
         assert adds, "add_subtask 제안이 있어야 함"
         # 첫 add_subtask 가 T-B 로 향해야 함 (단어 overlap: replay/analysis)
         assert adds[0]["task_key"] == "T-B"
+
+    def test_dedup_identical_add_subtask(self):
+        """동일 (task_key, type, suggested_text) add_subtask 카드는 1건으로 dedup.
+
+        같은 커밋이 미매칭 루프 + 부모-title 매칭 루프 양쪽에서, 또는 동일 subject
+        커밋이 중복 입력될 때 같은 카드가 여러 장 생기던 것을 막는다.
+        """
+        sprint = [{
+            "key": "DUP-1", "title": "alpha",  # 커밋 토큰과 안 겹침
+            "start": "2026-05-25", "end": "2099-12-31",  # 미래 → Rule 2 안 탐
+            "status": "in_progress", "subtasks": [],
+        }]
+        # 동일 subject 커밋 2개 (무의미 토큰 → 어떤 keyword 와도 매칭 안 됨)
+        commits = ["feat: zzqqxx wibwob", "feat: zzqqxx wibwob"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask" and s["task_key"] == "DUP-1"]
+        sigs = {(s["task_key"], s["type"], s["suggested_text"]) for s in adds}
+        assert len(adds) == len(sigs), f"중복 카드 발생: {[s['suggested_text'] for s in adds]}"
+        assert len(adds) == 1, "동일 커밋 2개 → add_subtask 1건이어야 함"
+
+    def test_confidence_sort_preserves_high_under_cap(self):
+        """저신뢰 카드가 많아도 high-confidence 제안이 max_suggestions 컷에서 살아남아야 한다.
+
+        per-subtask 루프는 cap 체크 없이 medium 카드를 쌓아서, 정렬 없이 자르면 뒤
+        task 의 high Rule 2 제안이 잘려나갔다. confidence 정렬로 high 가 앞으로 온다.
+        """
+        big = {
+            "key": "BIG", "title": "big task",
+            "start": "2026-05-01", "end": "2099-12-31",  # 미래
+            "status": "in_progress",
+            "subtasks": [
+                {"key": f"BIG-{i}", "title": f"sub {i}", "status": "in_progress"}
+                for i in range(12)  # 12 medium 카드 → cap(10) 초과
+            ],
+        }
+        deadline = {
+            "key": "DEADLINE", "title": "overdue task",
+            "start": "2026-05-01", "end": "2026-05-01",  # today 이전 → Rule 2 high
+            "status": "in_progress", "subtasks": [],
+        }
+        payload = _suggestion_payload([big, deadline])  # 순서: BIG 먼저
+        payload["today"] = "2026-06-01"
+        result = generate_jira_suggestions(payload, None)
+        assert len(result) == 10  # max_suggestions 기본값
+        assert any(s["confidence"] == "high" and s["task_key"] == "DEADLINE"
+                   for s in result), "high-confidence Rule 2 제안이 컷에서 살아남아야 함"
+        # 정렬 결과: high 가 맨 앞
+        assert result[0]["confidence"] == "high"
 
     def test_honors_payload_today_not_wall_clock(self):
         """제안은 payload['today'](리포트 날짜) 기준으로 종료일 도래를 판단해야 한다.

@@ -62,6 +62,18 @@ def _drop_if_expired(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _log_swallowed(context: str, exc: BaseException) -> None:
+    """Surface an otherwise-swallowed exception on stderr so scheduler.log captures it.
+
+    The Jira pipeline's #1 failure mode is silent: a config/fetch/git failure degrades
+    to empty sprint_tasks → "0 suggestions / empty board" with zero trace, which is hard
+    to distinguish from a legitimately-empty sprint. Logging here keeps the safe fallback
+    behavior but makes the cause diagnosable (mirrors html_jira_live_board's stderr log).
+    """
+    import sys
+    print(f"[autoreport:{context}] swallowed {type(exc).__name__}: {exc}", file=sys.stderr)
+
+
 def load_sprint_tasks(repo_root: Path | None = None) -> dict[str, Any]:
     """Load sprint task definitions via TaskProvider.
 
@@ -91,7 +103,8 @@ def load_sprint_tasks(repo_root: Path | None = None) -> dict[str, Any]:
                         if _pp == target and isinstance(_proj.get("jira"), dict):
                             project_config = _proj
                             break
-        except Exception:
+        except Exception as exc:
+            _log_swallowed("load_sprint_tasks/config", exc)
             project_config = None
     try:
         task_provider_path = REPO_ROOT / "workflow" / "task_provider.py"
@@ -100,8 +113,8 @@ def load_sprint_tasks(repo_root: Path | None = None) -> dict[str, Any]:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
             return _drop_if_expired(mod.get_task_provider(project_config).get_tasks())
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_swallowed("load_sprint_tasks/provider", exc)
     # Direct fallback
     path = Path(__file__).resolve().parent / "sprint_tasks.json"
     if not path.exists():
@@ -139,7 +152,8 @@ def _project_jira_for_repo(repo_root: Path) -> dict[str, Any] | None:
             if proj_path == target:
                 jira = proj.get("jira")
                 return jira if isinstance(jira, dict) else None
-    except Exception:
+    except Exception as exc:
+        _log_swallowed("_project_jira_for_repo", exc)
         return None
     return None
 
@@ -1019,8 +1033,8 @@ def generate_jira_suggestions(
                                 live_data = provider.get_tasks()
                                 sprint_tasks = live_data.get("tasks", [])
                                 break
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_swallowed("generate_jira_suggestions/live_fetch", exc)
     # Fallback to payload data if Jira unavailable (also empty when jira_enabled=False)
     if not sprint_tasks:
         sprint_tasks = list(payload.get("sprint_tasks") or [])
@@ -1078,8 +1092,13 @@ def generate_jira_suggestions(
                         if body and subj not in commit_bodies:
                             commit_bodies[subj] = body
                     all_commits = list(dict.fromkeys(git_commits + all_commits))  # dedupe
-    except Exception:
-        pass
+                elif result.returncode != 0:
+                    _log_swallowed(
+                        "generate_jira_suggestions/git_log",
+                        RuntimeError(f"git log rc={result.returncode}: {result.stderr.strip()[:200]}"),
+                    )
+    except Exception as exc:
+        _log_swallowed("generate_jira_suggestions/git_log", exc)
     local_sprint = {}
     try:
         _local_path = Path(__file__).resolve().parent / "sprint_tasks.json"
@@ -1511,6 +1530,20 @@ def generate_jira_suggestions(
                 })
                 break
 
+    # Dedup: the unmatched-commit loop and the matched-parent loop can both emit an
+    # add_subtask for the same (task_key, suggested_text) when a commit matches a
+    # parent's title but isn't in any keyword set — producing identical cards. Keep
+    # first occurrence (the higher-confidence emitter runs first in most paths).
+    _seen_sig: set[tuple[str, str, str]] = set()
+    _deduped: list[dict[str, Any]] = []
+    for _s in suggestions:
+        _sig = (_s.get("task_key", ""), _s.get("type", ""), _s.get("suggested_text", ""))
+        if _sig in _seen_sig:
+            continue
+        _seen_sig.add(_sig)
+        _deduped.append(_s)
+    suggestions = _deduped
+
     # Attach epic_key / epic_summary so the suggestion review panel can group
     # cards by 큰틀 (Epic). Subtask suggestions inherit their parent's Epic.
     task_epic_map: dict[str, tuple[str, str]] = {}
@@ -1528,6 +1561,13 @@ def generate_jira_suggestions(
         _s["epic_key"] = _ek
         _s["epic_summary"] = _es
 
+    # Confidence-aware truncation: the per-subtask loop appends medium/low cards
+    # without a max_suggestions guard, so a task with many subtasks could push a
+    # later task's high-confidence Rule 1/2/3 parent suggestion past the cap. Sort
+    # by confidence (stable → original order preserved within a tier) before slicing
+    # so high-value suggestions are never crowded out by low-value ones.
+    _conf_rank = {"high": 0, "medium": 1, "low": 2}
+    suggestions.sort(key=lambda s: _conf_rank.get(s.get("confidence", "low"), 2))
     return suggestions[:max_suggestions]
 
 
