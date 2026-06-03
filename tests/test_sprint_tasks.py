@@ -685,7 +685,11 @@ class TestGenerateJiraSuggestions:
         assert generate_jira_suggestions(payload, None) == []
 
     def test_rule2_end_date_today_message(self):
-        """end_date == today → "종료일 도래" (days_over=0 분기)."""
+        """end_date == today → "종료일 도래" (days_over=0 분기).
+
+        커밋 증거도 완료 부작업도 없으면 confidence 는 'low' (날짜만으로 완료를 high 로
+        단정하지 않는다 — evidence-gate). 증거가 있을 때 high 인지는 아래 sibling 테스트.
+        """
         sprint = [{
             "key": "T-1", "title": "Wraps today",
             "start": "2026-05-01", "end": "2026-05-22",
@@ -697,7 +701,22 @@ class TestGenerateJiraSuggestions:
         s = complete_for_t1[0]
         assert "종료일 도래" in s["title"]
         assert "0일" not in s["title"]
-        assert s["confidence"] == "high"
+        assert s["confidence"] == "low"
+
+    def test_rule2_confidence_high_with_commit_evidence(self):
+        """Rule 2 는 커밋 증거가 있을 때만 high — 마감 도래 + 제목과 겹치는 커밋 → high."""
+        sprint = [{
+            "key": "T-1", "title": "Wraps today",
+            "start": "2026-05-01", "end": "2026-05-22",
+            "status": "in_progress", "subtasks": [],
+        }]
+        # "wraps"/"today" 가 제목과 겹쳐 _match_commits_for 가 증거를 찾는다
+        commits = ["feat: Wraps today final fix"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        complete_for_t1 = [s for s in result if s["task_key"] == "T-1" and s["type"] == "complete"]
+        assert complete_for_t1, "Rule 2 제안이 발동해야 함"
+        assert complete_for_t1[0]["confidence"] == "high"
+        assert "종료 요청합니다." in complete_for_t1[0]["suggested_text"]
 
     def test_rule2_overdue_message(self):
         """end_date < today → "기한 초과 N일" 분기."""
@@ -815,10 +834,12 @@ class TestGenerateJiraSuggestions:
         }
         deadline = {
             "key": "DEADLINE", "title": "overdue task",
-            "start": "2026-05-01", "end": "2026-05-01",  # today 이전 → Rule 2 high
+            "start": "2026-05-01", "end": "2026-05-01",  # today 이전 → Rule 2
             "status": "in_progress", "subtasks": [],
         }
-        payload = _suggestion_payload([big, deadline])  # 순서: BIG 먼저
+        # "overdue" 가 DEADLINE 제목과만 겹치는 커밋 → Rule 2 가 증거 기반으로 high.
+        # (BIG 제목 "big task" 와는 안 겹쳐 BIG 으로는 안 샌다)
+        payload = _suggestion_payload([big, deadline], ["feat: overdue cleanup"])  # 순서: BIG 먼저
         payload["today"] = "2026-06-01"
         result = generate_jira_suggestions(payload, None)
         assert len(result) == 10  # max_suggestions 기본값
@@ -905,6 +926,49 @@ class TestGenerateJiraSuggestions:
             if len(epics) > 1:  # 공유 스프린트
                 assert all(epics), f"{sig} 공유 프로젝트는 모두 epic_key 필요: {epics}"
                 assert len(set(epics)) == len(epics), f"{sig} epic_key 중복: {epics}"
+
+    def test_live_vocabulary_covers_matching_commit(self):
+        """all_keywords 가 LIVE 태스크 제목 토큰을 포함 → 그 토큰을 가진 커밋은 '미매칭'
+        low 카드를 만들면 안 된다 (이전엔 만료 캐시 어휘만 써서 라이브 매칭이 새로 noise).
+        """
+        sprint = [{
+            "key": "LIVE-1", "title": "Zephyr telemetry buffer",
+            "start": "2026-05-25", "end": "2099-12-31",  # 미래 → Rule 2 안 탐
+            "status": "in_progress", "subtasks": [],
+        }]
+        # "zephyr"/"telemetry" 가 라이브 제목 토큰 → 커밋이 커버된 것으로 분류돼야 함
+        commits = ["feat: zephyr telemetry flush"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert all(s["confidence"] != "low" for s in adds), \
+            f"라이브 제목과 겹치는 커밋은 미매칭 low 카드를 만들면 안 됨: {[s['confidence'] for s in adds]}"
+
+    def test_dedup_keys_on_source_commit_not_truncated_text(self):
+        """서로 다른 커밋이 60자 prefix 를 공유해 suggested_text 가 같아도, 원본 커밋이
+        다르면 2건으로 유지된다 (dedup 키가 truncate 텍스트가 아니라 _src_commit 기반).
+        """
+        prefix = "x" * 70  # _strip_cc_prefix 후 [:60] 이 동일해지는 긴 prefix
+        sprint = [{
+            "key": "SRC-1", "title": "alpha",  # 커밋 토큰과 안 겹침 → 둘 다 미매칭
+            "start": "2026-05-25", "end": "2099-12-31",
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = [f"feat: {prefix} AAA", f"feat: {prefix} BBB"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask" and s["task_key"] == "SRC-1"]
+        texts = {s["suggested_text"] for s in adds}
+        assert len(texts) == 1, "전제: 두 커밋의 suggested_text 가 60자 컷에서 동일해야 함"
+        assert len(adds) == 2, "원본 커밋이 다르면 2건 유지돼야 함 (truncate 텍스트로 잘못 병합 금지)"
+
+    def test_internal_src_commit_not_leaked_to_output(self):
+        """dedup 내부용 _src_commit 필드는 반환 카드에 남으면 안 된다."""
+        sprint = [{
+            "key": "LEAK-1", "title": "alpha",
+            "start": "2026-05-25", "end": "2099-12-31",
+            "status": "in_progress", "subtasks": [],
+        }]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, ["feat: zzqqxx wibwob"]), None)
+        assert all("_src_commit" not in s for s in result), "_src_commit 은 내부 필드 — 노출 금지"
 
 
 # ---------------------------------------------------------------------------

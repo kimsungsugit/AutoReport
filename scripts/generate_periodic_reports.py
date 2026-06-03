@@ -1108,6 +1108,17 @@ def generate_jira_suggestions(
     except Exception:
         pass
 
+    # Provider's title tokenizer, reused so the keyword matching reflects the LIVE
+    # tasks that actually drive suggestions — not just the expired on-disk
+    # sprint_tasks.json cache (local_sprint), whose keys (APPL-374..) are absent from
+    # the live sprint (APPL-423..). Same conservative policy (Hangul>=3 / English>=4 /
+    # skip list) that produced the live task keywords, so no looser second tokenizer.
+    try:
+        from workflow.task_provider import _default_keywords_from_title as _kw_from_title
+    except Exception as exc:
+        _log_swallowed("generate_jira_suggestions/kw_tokenizer_import", exc)
+        _kw_from_title = None
+
     # Noise patterns — skip these commits in suggestions.
     # NOTE: previously `"chore:"` (단독) 가 prefix 였으나 모든 chore commit 을 차단해서
     # `chore: requirements.txt 추가` 같은 의미 있는 변경도 unmatched_commits 에서 빠졌다.
@@ -1211,6 +1222,13 @@ def generate_jira_suggestions(
         kw_task = local_sprint.get(task_key, {})
         keywords = [e.get("word", "").lower() for e in kw_task.get("keywords", [])
                      if e.get("word") and e.get("word", "").lower() not in _NOISE_KEYWORDS]
+        # Live tasks are absent from the expired on-disk cache (kw_task == {} for them),
+        # so also seed keywords from the title via the provider's tokenizer — the same
+        # policy that built the live task keywords — instead of relying only on the
+        # cache + a raw title split.
+        if _kw_from_title:
+            keywords += [e["word"] for e in _kw_from_title(task_title)
+                         if e["word"] not in _NOISE_KEYWORDS]
         # Also use words from the title (exclude generic words)
         title_words = [w.lower() for w in task_title.split()
                        if len(w) >= 3 and w.lower() not in ("및", "위한", "통한", "결과")]
@@ -1373,16 +1391,23 @@ def generate_jira_suggestions(
                         subtitle_period = f"종료일 {t_end} ({days_over}일 경과)"
                         text_prefix = f"기한({t_end}) 대비 {days_over}일 경과."
                         reason_text = f"종료일 {t_end} 경과"
+                    # Evidence-gate the confidence. A date-only "마감 도래 → 완료 처리" must
+                    # not claim 'high' (the load-bearing UI signal driving batch-approve)
+                    # when there's no sign the work is actually done. high only with commit
+                    # evidence; medium if some subtasks are already done; else low.
+                    rule2_has_commits = bool(_match_commits_for(title, key))
+                    rule2_conf = "high" if rule2_has_commits else ("medium" if done_subs else "low")
+                    rule2_closing = "종료 요청합니다." if rule2_conf == "high" else "기한 도래 — 진행 상황 점검 필요."
                     suggestions.append({
                         "id": f"s{sid}",
                         "task_key": key,
                         "type": "complete",
                         "title": f"{title} — {title_suffix}",
                         "subtitle": f"상위 작업 · {subtitle_period} · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
-                        "suggested_text": f"{text_prefix}\n{sub_report}\n종료 요청합니다.",
+                        "suggested_text": f"{text_prefix}\n{sub_report}\n{rule2_closing}",
                         "suggested_description": parent_desc,
                         "reason": f"{reason_text} ({len(done_subs)}/{len(subtasks)} 부작업 완료)",
-                        "confidence": "high",
+                        "confidence": rule2_conf,
                         "status": "pending",
                     })
                     continue
@@ -1412,8 +1437,26 @@ def generate_jira_suggestions(
                 pass
 
     # ── 커밋 기반 새 작업/하위작업 추가 제안 ──
-    # Collect all keywords from all tasks
+    # Collect all keywords used by the "is this commit already covered?" gate.
+    # Seed from the LIVE sprint tasks first (the tasks actually driving suggestions),
+    # using the provider's tokenizer so the policy matches how live task keywords were
+    # built — previously this used ONLY local_sprint (the expired on-disk cache), so in
+    # production every live commit was tested against a stale, disjoint vocabulary and
+    # real covered work got re-suggested as low-confidence add_subtask noise.
     all_keywords: set[str] = set()
+    for t in sprint_tasks:
+        for kw in t.get("keywords", []) or []:
+            w = (kw.get("word", "") if isinstance(kw, dict) else str(kw)).lower()
+            if w:
+                all_keywords.add(w)
+        if _kw_from_title:
+            for e in _kw_from_title(t.get("title", "")):
+                all_keywords.add(e["word"])
+        for st in t.get("subtasks", []) or []:
+            for w in st.get("title", "").lower().split():
+                if len(w) >= 3 and w not in ("및", "위한", "통한"):
+                    all_keywords.add(w)
+    # Supplement with the local cache (covers tasks not in the live fetch).
     for lt in local_sprint.values():
         for kw in lt.get("keywords", []):
             w = kw.get("word", "").lower()
@@ -1458,6 +1501,11 @@ def generate_jira_suggestions(
 
         # Also suggest for commits that DO match a task but NOT any subtask
         # → suggests adding a new subtask for that specific area
+        if len(unmatched_commits) > 3:
+            _log_swallowed(
+                "generate_jira_suggestions/unmatched_cap",
+                RuntimeError(f"{len(unmatched_commits)} unmatched commits; only first 3 considered for add_subtask"),
+            )
         for commit_subj in unmatched_commits[:3]:
             if len(suggestions) >= max_suggestions:
                 break
@@ -1481,6 +1529,8 @@ def generate_jira_suggestions(
                     "reason": f"커밋 \"{clean_full[:50]}\" 이 기존 태스크에 매칭되지 않음",
                     "confidence": "low",
                     "status": "pending",
+                    # dedup keys add_subtask on the source commit, not the truncated text.
+                    "_src_commit": commit_subj,
                     # 부모 일정을 미리 채워두면 사용자는 변경할 때만 손대면 된다.
                     "parent_start": best_parent.get("start") or "",
                     "parent_end": best_parent.get("end") or "",
@@ -1524,6 +1574,8 @@ def generate_jira_suggestions(
                     "reason": f"커밋이 {tkey} 매칭되나 기존 부작업에 없는 영역",
                     "confidence": "medium",
                     "status": "pending",
+                    # dedup keys add_subtask on the source commit, not the truncated text.
+                    "_src_commit": tc,
                     # 부모 일정을 미리 채워두면 사용자는 변경할 때만 손대면 된다.
                     "parent_start": task.get("start") or "",
                     "parent_end": task.get("end") or "",
@@ -1534,10 +1586,19 @@ def generate_jira_suggestions(
     # add_subtask for the same (task_key, suggested_text) when a commit matches a
     # parent's title but isn't in any keyword set — producing identical cards. Keep
     # first occurrence (the higher-confidence emitter runs first in most paths).
-    _seen_sig: set[tuple[str, str, str]] = set()
+    _seen_sig: set[tuple] = set()
     _deduped: list[dict[str, Any]] = []
     for _s in suggestions:
-        _sig = (_s.get("task_key", ""), _s.get("type", ""), _s.get("suggested_text", ""))
+        # add_subtask cards key on the SOURCE commit, not the 60-char-truncated text:
+        # the same commit can land in BOTH the unmatched and matched-parent loops on
+        # different parents (different task_key) → keying on src collapses those to one;
+        # and two DISTINCT commits sharing a 60-char prefix stay distinct (the old
+        # (task_key, type, suggested_text) key would have wrongly merged them).
+        _src = _s.pop("_src_commit", None)
+        if _s.get("type") == "add_subtask" and _src:
+            _sig = ("add_subtask", _src)
+        else:
+            _sig = (_s.get("task_key", ""), _s.get("type", ""), _s.get("suggested_text", ""))
         if _sig in _seen_sig:
             continue
         _seen_sig.add(_sig)
@@ -1568,6 +1629,18 @@ def generate_jira_suggestions(
     # so high-value suggestions are never crowded out by low-value ones.
     _conf_rank = {"high": 0, "medium": 1, "low": 2}
     suggestions.sort(key=lambda s: _conf_rank.get(s.get("confidence", "low"), 2))
+    # Make the silent cap visible: a dropped card is indistinguishable from a
+    # correctly-empty sprint without this. _log_swallowed only writes stderr, so the
+    # return shape is unchanged. (failure mode #1 in the pipeline is "0 suggestions".)
+    if len(suggestions) > max_suggestions:
+        _dropped = suggestions[max_suggestions:]
+        _log_swallowed(
+            "generate_jira_suggestions/capped",
+            RuntimeError(
+                f"dropped {len(_dropped)} of {len(suggestions)} cards at cap={max_suggestions}: "
+                f"{[(d.get('task_key'), d.get('type'), d.get('confidence')) for d in _dropped]}"
+            ),
+        )
     return suggestions[:max_suggestions]
 
 
