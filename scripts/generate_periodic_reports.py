@@ -1369,7 +1369,8 @@ def generate_jira_suggestions(
                     "title": f"  └ {stitle} — 완료 처리",
                     "subtitle": f"{key} 하위작업 · {title}",
                     "suggested_text": text,
-                    "suggested_description": desc,
+                    # status/comment-only — 부작업 설명 덮어쓰기 방지(설명은 텍스트에 이미 포함).
+                    "suggested_description": "",
                     "reason": f"{key} 하위작업, 현재 진행 중",
                     "confidence": "medium",
                     "status": "pending",
@@ -1380,13 +1381,6 @@ def generate_jira_suggestions(
                 try:
                     if date.fromisoformat(t_start) <= today:
                         sid += 1
-                        sub_desc = sub.get("description", "")
-                        if not sub_desc:
-                            local_task = local_sprint.get(key, {})
-                            for ls in local_task.get("subtasks", []):
-                                if ls.get("title") == stitle:
-                                    sub_desc = ls.get("description", "")
-                                    break
                         suggestions.append({
                             "id": f"s{sid}",
                             "task_key": skey,
@@ -1394,7 +1388,8 @@ def generate_jira_suggestions(
                             "title": f"  └ {stitle} — 작업 시작",
                             "subtitle": f"{key} 하위작업 · {title} · 시작일 {t_start}",
                             "suggested_text": f"상위 작업({key}) 시작일 도래. 작업을 시작합니다.",
-                            "suggested_description": sub_desc,
+                            # status-only — never re-write the 부작업's own description.
+                            "suggested_description": "",
                             "reason": f"시작일 {t_start} ≤ 오늘",
                             "confidence": "low",
                             "status": "pending",
@@ -1418,7 +1413,6 @@ def generate_jira_suggestions(
                             break
                 sub_lines.append(f"- {s.get('title', '')}: {desc or '완료'}")
             sub_results = "\n".join(sub_lines)
-            parent_desc = task.get("description", "") or local_sprint.get(key, {}).get("description", "")
             suggestions.append({
                 "id": f"s{sid}",
                 "task_key": key,
@@ -1426,7 +1420,8 @@ def generate_jira_suggestions(
                 "title": f"{title} — 전체 완료 보고",
                 "subtitle": f"상위 작업 · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
                 "suggested_text": f"전체 하위작업 완료.\n{sub_results}\n종료 요청합니다.",
-                "suggested_description": parent_desc,
+                # status/comment-only — never re-write the issue's own description.
+                "suggested_description": "",
                 "reason": f"부작업 {len(done_subs)}/{len(subtasks)} 완료",
                 "confidence": "high",
                 "status": "pending",
@@ -1457,24 +1452,38 @@ def generate_jira_suggestions(
                                     break
                         sub_status_lines.append(f"- {s.get('title', '')}: {st_label}{detail}")
                     sub_report = "\n".join(sub_status_lines) if sub_status_lines else ""
-                    parent_desc = task.get("description", "") or local_sprint.get(key, {}).get("description", "")
                     if days_over == 0:
-                        title_suffix = "종료일 도래, 완료 처리"
                         subtitle_period = f"종료일 {t_end} (오늘)"
                         text_prefix = f"종료일({t_end}) 도래."
-                        reason_text = f"종료일 {t_end} 도래"
+                        when_text = f"종료일 {t_end} 도래"
+                        over_label = "종료일 도래"
                     else:
-                        title_suffix = f"기한 초과 ({days_over}일), 완료 처리"
                         subtitle_period = f"종료일 {t_end} ({days_over}일 경과)"
                         text_prefix = f"기한({t_end}) 대비 {days_over}일 경과."
-                        reason_text = f"종료일 {t_end} 경과"
-                    # Evidence-gate the confidence. A date-only "마감 도래 → 완료 처리" must
-                    # not claim 'high' (the load-bearing UI signal driving batch-approve)
-                    # when there's no sign the work is actually done. high only with commit
-                    # evidence; medium if some subtasks are already done; else low.
-                    rule2_has_commits = bool(_match_commits_for(title, key))
-                    rule2_conf = "high" if rule2_has_commits else ("medium" if done_subs else "low")
-                    rule2_closing = "종료 요청합니다." if rule2_conf == "high" else "기한 도래 — 진행 상황 점검 필요."
+                        when_text = f"종료일 {t_end} 경과"
+                        over_label = f"기한 초과 ({days_over}일)"
+                    # Evidence-gate confidence. A date-only "마감 도래" must not claim 'high'
+                    # (the batch-approve signal nudging 종료 요청) without real proof of work:
+                    # require a SUBJECT match or >=2 body matches. A lone body-only token is
+                    # thin → medium; no evidence → low (medium if some subtasks are done).
+                    subj_hits = _match_commits_for(title, key, body_aware=False)
+                    body_hits = _match_commits_for(title, key)
+                    if subj_hits or len(body_hits) >= 2:
+                        rule2_conf = "high"
+                    elif body_hits or done_subs:
+                        rule2_conf = "medium"
+                    else:
+                        rule2_conf = "low"
+                    # Keep title/reason/closing consistent: don't assert "완료 처리" when the
+                    # confidence demoted the action to a "점검 필요" nudge (self-contradiction).
+                    if rule2_conf == "high":
+                        title_suffix = f"{over_label}, 완료 처리"
+                        rule2_closing = "종료 요청합니다."
+                        reason_text = when_text
+                    else:
+                        title_suffix = f"{over_label} — 진행 점검 필요"
+                        rule2_closing = "기한 도래 — 진행 상황 점검 필요."
+                        reason_text = f"{when_text} — 진행 상황 점검 필요"
                     suggestions.append({
                         "id": f"s{sid}",
                         "task_key": key,
@@ -1482,7 +1491,9 @@ def generate_jira_suggestions(
                         "title": f"{title} — {title_suffix}",
                         "subtitle": f"상위 작업 · {subtitle_period} · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
                         "suggested_text": f"{text_prefix}\n{sub_report}\n{rule2_closing}",
-                        "suggested_description": parent_desc,
+                        # status/comment-only card — never re-write the issue's own
+                        # description (a stale snapshot would clobber concurrent edits).
+                        "suggested_description": "",
                         "reason": f"{reason_text} ({len(done_subs)}/{len(subtasks)} 부작업 완료)",
                         "confidence": rule2_conf,
                         "status": "pending",
@@ -1496,7 +1507,6 @@ def generate_jira_suggestions(
             try:
                 if date.fromisoformat(t_start) <= today:
                     sid += 1
-                    parent_desc = task.get("description", "") or local_sprint.get(key, {}).get("description", "")
                     suggestions.append({
                         "id": f"s{sid}",
                         "task_key": key,
@@ -1504,7 +1514,8 @@ def generate_jira_suggestions(
                         "title": f"{title} — 작업 시작",
                         "subtitle": f"상위 작업 · 시작일 {t_start}",
                         "suggested_text": f"시작일({t_start}) 도래. 작업을 시작합니다.",
-                        "suggested_description": parent_desc,
+                        # status-only — never re-write the issue's own description.
+                        "suggested_description": "",
                         "reason": f"시작일 {t_start} ≤ 오늘 {today.isoformat()}",
                         "confidence": "high",
                         "status": "pending",
@@ -1587,6 +1598,7 @@ def generate_jira_suggestions(
                 "generate_jira_suggestions/unmatched_cap",
                 RuntimeError(f"{len(unmatched_commits)} unmatched commits; only first 3 considered for add_subtask"),
             )
+        _suppressed_orphans: list[str] = []
         for commit_subj in unmatched_commits[:3]:
             if len(suggestions) >= max_suggestions:
                 break
@@ -1627,6 +1639,19 @@ def generate_jira_suggestions(
                     "parent_start": best_parent.get("start") or "",
                     "parent_end": best_parent.get("end") or "",
                 })
+            elif best_parent:
+                # zero-overlap under multi-epic ambiguity → suppressed to avoid a
+                # cross-epic leak; record so "0 제안 / 빈 보드" isn't mistaken for a
+                # genuinely-covered sprint (symmetric with the unmatched/cap logs).
+                _suppressed_orphans.append(commit_subj)
+        if _suppressed_orphans:
+            _log_swallowed(
+                "generate_jira_suggestions/orphan_suppressed",
+                RuntimeError(
+                    f"{len(_suppressed_orphans)} unmatched commits suppressed under multi-epic "
+                    f"ambiguity (need manual triage): {[c[:50] for c in _suppressed_orphans]}"
+                ),
+            )
 
     # Find commits matching a parent task but not covered by any subtask
     for task in sprint_tasks:
@@ -1690,6 +1715,16 @@ def generate_jira_suggestions(
     # comment doesn't pile a second card on the same evidence and burn the cap.
     _covered_keys = {s.get("task_key") for s in suggestions
                      if s.get("type") in ("complete", "transition", "add_subtask")}
+
+    def _clip_subj(c: str, limit: int = 40) -> str:
+        """Clean a commit subject for a progress note: drop the cc-prefix, clip on the
+        last space (not mid-word; works for Korean eojeol too) with an ellipsis."""
+        s = _strip_cc_prefix(c)
+        if len(s) <= limit:
+            return s
+        head = s[:limit]
+        return (head.rsplit(" ", 1)[0] if " " in head else s[:limit - 1]) + "…"
+
     for task in sprint_tasks:
         if len(suggestions) >= max_suggestions:
             break
@@ -1704,7 +1739,18 @@ def generate_jira_suggestions(
         if len(tcommits) < 2:
             continue
         sid += 1
-        _summ = "; ".join(_strip_cc_prefix(c)[:40] for c in tcommits[:3])
+        # Dedup near-identical iterations of the same feature by 15-char prefix so the
+        # note doesn't read as a machine dump of repeated subjects.
+        _seen_pref: set[str] = set()
+        _lines: list[str] = []
+        for _c in tcommits[:3]:
+            _line = _clip_subj(_c)
+            _pref = _line[:15].lower()
+            if _pref in _seen_pref:
+                continue
+            _seen_pref.add(_pref)
+            _lines.append(_line)
+        _summ = "; ".join(_lines)
         suggestions.append({
             "id": f"s{sid}",
             "task_key": tkey,
