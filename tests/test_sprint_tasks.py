@@ -867,9 +867,12 @@ class TestGenerateJiraSuggestions:
         assert completes, "payload['today'] 기준 종료일 초과 → Rule 2 발동해야 함"
         assert "기한 초과" in completes[0]["title"]
 
-    def test_shared_sprint_leaks_without_epic_scope(self):
-        """epic_scope 미설정 시: 단어 overlap 0 인 커밋은 _pick_parent 폴백으로
-        '다른 에픽'의 첫 in_progress 작업에 붙는다 — 이게 막으려던 누수 버그다.
+    def test_shared_sprint_no_leak_without_epic_scope(self):
+        """공유 스프린트(여러 에픽) + epic_scope 미설정 시: 단어 overlap 0 인 커밋은
+        '다른 에픽' 작업에 새지 않고 억제된다 (예전엔 _active_parents[0]=OTH-1 로 누수).
+
+        에픽이 모호할 땐 무작위 부모에 붙이느니 카드를 내지 않는 게 정밀도상 낫다.
+        epic_scope 가 설정되면 자기 에픽 작업에 분류용으로 붙는다(아래 scoped 테스트).
         """
         sprint = [
             {"key": "OTH-1", "title": "사용자 피드백 및 개선",  # 다른 프로젝트(에픽 E-OTHER)
@@ -881,10 +884,9 @@ class TestGenerateJiraSuggestions:
         ]
         commits = ["feat(tara): ISO 26262 HARA 데이터모델"]  # 두 title 과 단어 겹침 0
         result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        assert not any(s["task_key"] == "OTH-1" for s in result), "남의 에픽으로 누수 금지"
         adds = [s for s in result if s["type"] == "add_subtask"]
-        assert adds, "add_subtask 제안이 있어야 함"
-        # 폴백이 _active_parents[0] = OTH-1 (남의 에픽) 으로 새는 게 기본 동작
-        assert adds[0]["task_key"] == "OTH-1"
+        assert adds == [], "에픽 모호 + 단어 겹침 0 커밋은 억제돼야 함"
 
     def test_shared_sprint_scoped_to_configured_epic(self):
         """공유 스프린트 격리: epic_scope 설정 시 제안이 그 에픽 작업으로만 한정되고
@@ -969,6 +971,47 @@ class TestGenerateJiraSuggestions:
         }]
         result = generate_jira_suggestions(_suggestion_payload(sprint, ["feat: zzqqxx wibwob"]), None)
         assert all("_src_commit" not in s for s in result), "_src_commit 은 내부 필드 — 노출 금지"
+
+    def test_zero_overlap_attaches_when_single_epic(self):
+        """에픽 모호성이 없으면(단일/무 에픽) 단어 겹침 0 커밋도 부모에 분류용으로 붙되
+        confidence 는 low, reason 은 '부모 검토 필요' — 억제는 다중 에픽 미설정 한정.
+        """
+        sprint = [{
+            "key": "SOLO-1", "title": "alpha",
+            "start": "2026-05-01", "end": "2099-12-31",
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = ["feat(tara): ISO 26262 위협분석"]  # title 'alpha' 와 겹침 0
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert adds, "단일 에픽이면 겹침 0 도 분류용으로 붙어야 함"
+        assert adds[0]["task_key"] == "SOLO-1"
+        assert adds[0]["confidence"] == "low"
+        assert "부모 검토" in adds[0]["reason"]
+
+    def test_evidence_score_tiebreaks_within_confidence_tier(self):
+        """같은 medium tier 안에서 evidence_score 높은 카드가 먼저 정렬된다(삽입순서 무관).
+
+        입력 순서는 B 먼저지만 A 커밋의 신규 단어가 더 많아 A 가 앞서야 한다.
+        """
+        sprint = [
+            {"key": "TASK-B", "title": "xray yankee",
+             "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": []},
+            {"key": "TASK-A", "title": "alpha bravo",
+             "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": []},
+        ]
+        commits = [
+            "feat: xray yankee zulu",                        # B: 신규 단어 적음
+            "feat: alpha bravo charlie delta echo foxtrot",  # A: 신규 단어 많음
+        ]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        a = next(s for s in adds if s["task_key"] == "TASK-A")
+        b = next(s for s in adds if s["task_key"] == "TASK-B")
+        assert a["evidence_score"] > b["evidence_score"]
+        assert adds.index(a) < adds.index(b), "evidence_score 높은 카드가 먼저 와야 함"
 
 
 # ---------------------------------------------------------------------------

@@ -1070,10 +1070,18 @@ def generate_jira_suggestions(
         repo_root = Path(payload.get("repo_root", ""))
         if repo_root.exists():
             import subprocess
-            sprint_start = sprint_tasks[0].get("start", "") if sprint_tasks else ""
+            # Order-independent sprint start (not sprint_tasks[0], which depends on task
+            # ordering after epic-scoping) + an --until clamp so a backdated report
+            # (payload['today']) never pulls commits made AFTER the report date as
+            # evidence. Mirrors the main collector get_commits (--since AND --until).
+            sprint_start = min(
+                (str(t.get("start")) for t in sprint_tasks if t.get("start")), default=""
+            )
             if sprint_start:
                 result = subprocess.run(
-                    ["git", "log", f"--since={sprint_start}", "--format=%s\x1f%b\x1e", "-50"],
+                    ["git", "log", f"--since={sprint_start}",
+                     f"--until={(today + timedelta(days=1)).isoformat()}",
+                     "--format=%s\x1f%b\x1e", "-50"],
                     cwd=str(repo_root), capture_output=True, text=True, timeout=5,
                     encoding="utf-8", errors="replace",
                 )
@@ -1091,6 +1099,11 @@ def generate_jira_suggestions(
                         body = parts[1].strip() if len(parts) >= 2 else ""
                         if body and subj not in commit_bodies:
                             commit_bodies[subj] = body
+                    if len(git_commits) >= 50:
+                        _log_swallowed(
+                            "generate_jira_suggestions/git_log_cap",
+                            RuntimeError("git log hit -50 cap; older sprint commits excluded from evidence"),
+                        )
                     all_commits = list(dict.fromkeys(git_commits + all_commits))  # dedupe
                 elif result.returncode != 0:
                     _log_swallowed(
@@ -1486,9 +1499,17 @@ def generate_jira_suggestions(
         if not _active_parents:
             _active_parents = [t for t in sprint_tasks if t.get("status") in ("예정", "pending")]
 
-        def _pick_parent(commit_subj: str) -> dict[str, Any] | None:
+        # Cross-epic leak guard: when several epics share one sprint and no epic_scope
+        # is configured, a zero-overlap commit must NOT be parked on an arbitrary OTHER
+        # epic's task (the historical leak). Detect that ambiguity once.
+        _epic_keys_present = {t.get("epic_key") for t in _active_parents if t.get("epic_key")}
+        _multi_epic_unscoped = (not epic_scope) and len(_epic_keys_present) > 1
+
+        def _pick_parent(commit_subj: str) -> tuple[dict[str, Any] | None, int]:
+            """Return (best parent, word-overlap score). score 0 = no lexical overlap
+            with any active task title — a guess, not a real match."""
             if not _active_parents:
-                return None
+                return None, -1
             subj_words = {w for w in re.split(r"[\s,/\-_:()]+", commit_subj.lower()) if len(w) >= 3}
             best = _active_parents[0]
             best_score = -1
@@ -1497,7 +1518,7 @@ def generate_jira_suggestions(
                 score = sum(1 for w in subj_words if w in title_lower)
                 if score > best_score:
                     best, best_score = cand, score
-            return best
+            return best, best_score
 
         # Also suggest for commits that DO match a task but NOT any subtask
         # → suggests adding a new subtask for that specific area
@@ -1513,8 +1534,14 @@ def generate_jira_suggestions(
             # richer template so the two fields show distinct, useful info.
             clean_full = _strip_cc_prefix(commit_subj)
             clean_title = clean_full[:60]
-            best_parent = _pick_parent(commit_subj)
-            if best_parent:
+            best_parent, best_score = _pick_parent(commit_subj)
+            # score>=1 → genuine title overlap, always attach. score==0 → only attach
+            # when there's no cross-epic ambiguity; otherwise SUPPRESS so the commit
+            # doesn't leak onto a foreign epic's task. A guess is labeled honestly and
+            # stays 'low'; a strong (>=2 word) overlap earns 'medium'. evidence_score
+            # tie-breaks within a confidence tier at the final sort.
+            if best_parent and (best_score >= 1 or not _multi_epic_unscoped):
+                _is_guess = best_score <= 0
                 body_desc = _format_body_for_desc(commit_bodies.get(commit_subj, ""))
                 desc = body_desc if body_desc else f"- {clean_full}"
                 sid += 1
@@ -1526,8 +1553,13 @@ def generate_jira_suggestions(
                     "subtitle": f"부모: {best_parent['key']} · 미매칭 커밋 기반",
                     "suggested_text": clean_title,
                     "suggested_description": desc,
-                    "reason": f"커밋 \"{clean_full[:50]}\" 이 기존 태스크에 매칭되지 않음",
-                    "confidence": "low",
+                    "reason": (
+                        "기존 태스크와 단어 겹침 없음 — 부모 검토 필요"
+                        if _is_guess
+                        else f"커밋 \"{clean_full[:50]}\" 이 {best_parent['key']} 제목과 겹침 (부작업 미존재)"
+                    ),
+                    "confidence": "medium" if best_score >= 2 else "low",
+                    "evidence_score": float(max(best_score, 0)),
                     "status": "pending",
                     # dedup keys add_subtask on the source commit, not the truncated text.
                     "_src_commit": commit_subj,
@@ -1573,6 +1605,9 @@ def generate_jira_suggestions(
                     "suggested_description": desc,
                     "reason": f"커밋이 {tkey} 매칭되나 기존 부작업에 없는 영역",
                     "confidence": "medium",
+                    # More matching commits / more new words → stronger evidence → ranks
+                    # higher within the medium tier at the final sort.
+                    "evidence_score": 0.5 * len(task_commits) + float(len(new_words)),
                     "status": "pending",
                     # dedup keys add_subtask on the source commit, not the truncated text.
                     "_src_commit": tc,
@@ -1627,8 +1662,13 @@ def generate_jira_suggestions(
     # later task's high-confidence Rule 1/2/3 parent suggestion past the cap. Sort
     # by confidence (stable → original order preserved within a tier) before slicing
     # so high-value suggestions are never crowded out by low-value ones.
+    # Primary key: confidence tier (high first). Secondary: evidence_score desc, so
+    # within a tier a strongly-evidenced card (more matching commits / word overlap)
+    # outranks a weakly-evidenced one instead of relying on accidental insertion order
+    # — important when the [:max_suggestions] cut falls among same-tier cards.
     _conf_rank = {"high": 0, "medium": 1, "low": 2}
-    suggestions.sort(key=lambda s: _conf_rank.get(s.get("confidence", "low"), 2))
+    suggestions.sort(key=lambda s: (_conf_rank.get(s.get("confidence", "low"), 2),
+                                    -float(s.get("evidence_score", 0.0))))
     # Make the silent cap visible: a dropped card is indistinguishable from a
     # correctly-empty sprint without this. _log_swallowed only writes stderr, so the
     # return shape is unchanged. (failure mode #1 in the pipeline is "0 suggestions".)
