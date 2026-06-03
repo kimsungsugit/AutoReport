@@ -484,16 +484,27 @@ class TestBuildFallbackJiraDoc:
         assert any("Sub1" in c for c in doc["completed"])
         assert any("Sub2" in c for c in doc["completed"])
 
-    def test_in_progress_task_with_zero_hits_goes_to_remaining(self):
-        """진행 중 task with 0 hit_count should be classified as remaining."""
+    def test_in_progress_zero_hits_stays_in_progress_annotated(self):
+        """진행 중 task with 0 hit_count stays in_progress (not demoted to 잔여) so the
+        doc body agrees with the task-board badge; annotated '(커밋 미매칭)' to keep the
+        no-recent-activity signal. (Was: routed to remaining — a self-contradiction.)"""
         tasks = [
             {"key": "A-1", "title": "No hits", "status": "진행 중", "hit_count": 0,
              "start": "2026-04-01", "end": "2026-04-10",
              "subtasks": [], "related_commits": []},
         ]
         doc = build_fallback_jira_doc("jira", self._make_payload(tasks))
-        assert any("A-1" in c for c in doc["remaining"])
-        assert not any("A-1" in c for c in doc["in_progress"])
+        assert any("A-1" in c for c in doc["in_progress"]), "진행 중 작업은 in_progress 에 있어야 함"
+        assert not any("A-1" in c for c in doc["remaining"]), "잔여로 demote 되면 보드와 모순"
+        assert any("커밋 미매칭" in c for c in doc["in_progress"]), "0 hit 은 주석으로 표시"
+        # board still shows it as 진행 중 → now consistent with the in_progress list
+        assert any(t["key"] == "A-1" and t["status"] == "진행 중" for t in doc["task_board"])
+
+    def test_fallback_doc_survives_provider_shaped_task(self):
+        """live JiraApiTaskProvider task(hit_count/start/end 없음)로도 크래시 안 함(.get())."""
+        tasks = [{"key": "P-1", "title": "live task", "status": "진행 중", "subtasks": []}]
+        doc = build_fallback_jira_doc("jira", self._make_payload(tasks))
+        assert any("P-1" in c for c in doc["in_progress"])  # hit_count 기본 0 → 주석 처리
 
 
 # ---------------------------------------------------------------------------
@@ -1310,7 +1321,8 @@ class TestGenerateDocumentFactOverride:
             "task_board": [{"key": "APPL-101", "title": "FAKE", "status": "진행 중",
                             "period": "2026-05-01 ~ 2026-05-30", "subtasks": [],
                             "related_commits": []}],
-            "validation": [], "risks": [], "links": [],
+            "validation": [], "risks": [],
+            "links": ["https://github.com/fake/repo/commit/deadbeef"],  # 환각 URL
             "status_summary": {"completed_count": 0, "in_progress_count": 1, "remaining_count": 0},
         }
         with _patch.object(g, "ask_gemini_for_sections", return_value=hallucinated), \
@@ -1322,6 +1334,8 @@ class TestGenerateDocumentFactOverride:
         keys = [t.get("key") for t in sections.get("task_board") or []]
         assert "APPL-101" not in keys, "환각 키는 차단되어야 함"
         assert "APPL-373" in keys, "실제 sprint_tasks 의 키로 덮어써져야 함"
+        # 환각 GitHub URL 도 fact-override 로 제거(payload 에 github commits 없음 → [])
+        assert sections.get("links") == [], "환각 링크는 deterministic 값으로 덮어써져야 함"
 
     def test_jira_gemini_empty_sprint_forces_placeholder(self):
         """sprint_tasks 비어 있고 mode=gemini 면 task_board/scope 가 placeholder 로 강제됨."""
@@ -1351,6 +1365,7 @@ class TestGenerateDocumentFactOverride:
         assert sections.get("task_board") == []
         assert "Jira 스프린트 미연동" in (sections.get("scope") or [""])[0]
         assert "Jira 스프린트 미연동" in (sections.get("completed") or [""])[0]
+        assert sections.get("links") == [], "미연동 시 links 도 빈 값으로 강제"
         # status_summary 도 0 으로 강제
         assert sections["status_summary"]["completed_count"] == 0
 
@@ -1535,11 +1550,11 @@ class TestSuggestionPersistence:
         assert jp._split_namespaced_id("my-proj-sXYZ") == ("my-proj", "sXYZ")  # 하이픈 프로젝트명
 
     def test_task_key_format_guard(self):
-        """add_subtask 의 잘못된 task_key 를 막는 정규식 (project split 가 깨지기 전 차단)."""
-        # jira_proxy 가 쓰는 패턴과 동일해야 함 — divergence 방지 표식
-        src = (Path(__file__).resolve().parents[1] / "scripts" / "jira_proxy.py").read_text(encoding="utf-8")
-        assert r'[A-Z][A-Z0-9]+-[0-9]+' in src, "task_key 형식 가드 정규식이 존재해야 함"
-        import re as _re
-        pat = r"[A-Z][A-Z0-9]+-[0-9]+"
-        assert _re.fullmatch(pat, "APPL-423") and not _re.fullmatch(pat, "APPL")
-        assert not _re.fullmatch(pat, "-5") and not _re.fullmatch(pat, "appl-423")
+        """잘못된/빈/traversal task_key 를 막는 _valid_jira_key (REST 경로 주입 차단)."""
+        from scripts import jira_proxy as jp
+        assert jp._valid_jira_key("APPL-423")
+        assert not jp._valid_jira_key("APPL")      # 번호 없음
+        assert not jp._valid_jira_key("-5")         # 프로젝트 없음
+        assert not jp._valid_jira_key("appl-423")   # 소문자
+        assert not jp._valid_jira_key("")           # 빈 키(empty-key 갭)
+        assert not jp._valid_jira_key("foo%2F..%2Fbar")  # path traversal

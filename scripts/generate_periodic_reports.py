@@ -1932,20 +1932,25 @@ def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str,
     in_progress_tasks = []
     remaining_tasks = []
     for task in sprint_tasks:
-        entry = f"[{task['key']}] {task['title']}"
+        # .get() throughout: live JiraApiTaskProvider task dicts lack hit_count/start/end,
+        # and this fallback runs OUTSIDE the Gemini try — a hard subscript would crash the
+        # whole jira doc instead of degrading.
+        entry = f"[{task.get('key', '')}] {task.get('title', '')}"
         if task.get("related_commits"):
             entry += f" — {', '.join(task['related_commits'][:2])}"
-        if task["status"] == "완료":
+        status = task.get("status", "")
+        if status == "완료":
             # 완료 상세 내역 추가
             done_subtasks = [s for s in task.get("subtasks", []) if s.get("status") == "done"]
             completed_tasks.append(entry)
             for s in done_subtasks:
-                completed_tasks.append(f"  ✅ {s['title']}: {s.get('description', '')}")
-        elif task["status"] == "진행 중":
-            if task["hit_count"] > 0:
-                in_progress_tasks.append(entry)
-            else:
-                remaining_tasks.append(entry)
+                completed_tasks.append(f"  ✅ {s.get('title', '')}: {s.get('description', '')}")
+        elif status == "진행 중":
+            # Every 진행 중 task goes to in_progress so the doc body agrees with the
+            # task-board badge (which renders the raw status). Annotate — not demote to
+            # 잔여 — when no commit matched this period, preserving the "no recent
+            # activity" signal without contradicting the board in the same report.
+            in_progress_tasks.append(entry + ("" if task.get("hit_count", 0) else " (커밋 미매칭)"))
         else:
             remaining_tasks.append(entry)
 
@@ -1958,10 +1963,10 @@ def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str,
     for task in sprint_tasks:
         subtasks = task.get("subtasks", [])
         task_board.append({
-            "key": task["key"],
-            "title": task["title"],
-            "status": task["status"],
-            "period": f"{task['start']} ~ {task['end']}",
+            "key": task.get("key", ""),
+            "title": task.get("title", ""),
+            "status": task.get("status", ""),
+            "period": f"{task.get('start', '')} ~ {task.get('end', '')}",
             "subtasks": subtasks,
             "subtask_progress": task.get("subtask_progress", f"0/{len(subtasks)}"),
             "related_commits": task.get("related_commits", []),
@@ -1972,7 +1977,7 @@ def build_fallback_jira_doc(doc_type: str, payload: dict[str, Any]) -> dict[str,
         "summary": source_insights[0] if source_insights else f"{work_type} 유형 작업에 대한 스프린트 현황입니다.",
         "task_name": f"{payload['repository']} {work_type} 작업",
         "task_goal": "Jira 스프린트 작업 기반으로 계획, 진행, 완료 현황을 추적합니다.",
-        "scope": [f"[{t['key']}] {t['title']}" for t in sprint_tasks if t["status"] == "진행 중"][:4] or ["스프린트 작업 범위 확인 필요"],
+        "scope": [f"[{t.get('key', '')}] {t.get('title', '')}" for t in sprint_tasks if t.get("status") == "진행 중"][:4] or ["스프린트 작업 범위 확인 필요"],
         "completed": completed_tasks or ["완료된 작업이 없습니다."],
         "in_progress": in_progress_tasks or ["진행 중인 작업이 없습니다."],
         "remaining": remaining_tasks or ["잔여 작업이 없습니다."],
@@ -2605,8 +2610,11 @@ def generate_document(report_type: str, payload: dict[str, Any]) -> tuple[str, s
         #    placeholders so Gemini cannot inject hallucinated keys like APPL-001.
         if payload.get("sprint_tasks"):
             truth = build_fallback_jira_doc(report_type, payload)
+            # 'links' is fact-overridden too: the schema invites GitHub commit URLs, so
+            # Gemini can fabricate plausible https://github.com/… links when github
+            # metadata is empty. truth['links'] is the real payload.github-derived list.
             for fact_field in ("task_board", "scope", "completed", "in_progress",
-                               "remaining", "status_summary"):
+                               "remaining", "status_summary", "links"):
                 if fact_field in truth:
                     sections[fact_field] = truth[fact_field]
         else:
@@ -2615,6 +2623,7 @@ def generate_document(report_type: str, payload: dict[str, Any]) -> tuple[str, s
             sections["completed"] = ["Jira 스프린트 미연동 상태입니다."]
             sections["in_progress"] = []
             sections["remaining"] = []
+            sections["links"] = []
             sections["status_summary"] = {"completed_count": 0, "in_progress_count": 0, "remaining_count": 0}
 
     try:

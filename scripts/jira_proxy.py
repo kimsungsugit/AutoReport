@@ -245,6 +245,13 @@ def _split_namespaced_id(sid: str) -> tuple[str, str]:
     return "", sid
 
 
+def _valid_jira_key(k: str) -> bool:
+    """A real Jira issue key (PROJ-123). The /api/issue/{key}/* handlers take key raw
+    from the URL and interpolate it into the REST path, so reject malformed / empty /
+    traversal values up front."""
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9]+-[0-9]+", k or ""))
+
+
 def _load_suggestions(target_date: str | None = None) -> tuple[Path | None, dict]:
     path = _find_suggestions_file(target_date)
     if not path or not path.exists():
@@ -336,9 +343,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             sprint_id = qs.get("sprint_id", [None])[0]
             p = provider
-            if sprint_id and hasattr(p, "sprint_id"):
-                p.sprint_id = sprint_id
-            tasks = p.get_tasks()
+            if sprint_id is not None and not re.fullmatch(r"[0-9]+", sprint_id):
+                _json_response(self, {"error": "sprint_id must be numeric"}, 400)
+                return
+            # Snapshot/restore the shared singleton's sprint_id instead of permanently
+            # mutating it from a query string (the raw value was interpolated into the
+            # Jira REST path → cross-request state leak + path injection). int() also
+            # fixes the str/int drift vs the module default.
+            old_sid = getattr(p, "sprint_id", None)
+            try:
+                if sprint_id and hasattr(p, "sprint_id"):
+                    p.sprint_id = int(sprint_id)
+                tasks = p.get_tasks()
+            finally:
+                if hasattr(p, "sprint_id") and old_sid is not None:
+                    p.sprint_id = old_sid
             # Attach a freshly-rendered Gantt SVG so the client can replace the
             # chart in-place after task dates change. Lazy import keeps boot light.
             try:
@@ -408,6 +427,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 _json_response(self, {"ok": False, "error": err, "state": state}, 409)
             return
+
+        # All /api/issue/{key}/<action> endpoints take key raw from the URL and
+        # interpolate it into the Jira REST path — validate up front (mirrors the approve
+        # handler's guard). /api/issue/create has no key segment and is exempt.
+        if path.startswith("/api/issue/") and path != "/api/issue/create":
+            _parts = path.split("/")
+            _key = _parts[3] if len(_parts) > 3 else ""
+            if not _valid_jira_key(_key):
+                _json_response(self, {"ok": False, "error": f"task_key 형식이 올바르지 않습니다: {_key}"}, 400)
+                return
 
         # POST /api/issue/{key}/comment
         if path.startswith("/api/issue/") and path.endswith("/comment"):
@@ -617,10 +646,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"ok": False, "error": "부작업 제목이 비어 있습니다",
                                       "comment_ok": False, "description_ok": False}, 400)
                 return
-            # task_key must be a real Jira key (PROJ-123). A malformed key ('APPL', '-5')
-            # would otherwise reach project=task_key.split('-')[0] and 400 deep in Jira
-            # with an opaque error — reject it up front with an actionable message.
-            if task_key and not re.fullmatch(r"[A-Z][A-Z0-9]+-[0-9]+", task_key):
+            # task_key must be a real Jira key (PROJ-123). A malformed/empty key would
+            # otherwise reach project=task_key.split('-')[0] and 400 deep in Jira with an
+            # opaque error — reject up front (the helper also closes the empty-key gap).
+            if not _valid_jira_key(task_key):
                 _json_response(self, {"ok": False, "error": f"task_key 형식이 올바르지 않습니다: {task_key}",
                                       "comment_ok": False, "description_ok": False}, 400)
                 return

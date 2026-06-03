@@ -46,7 +46,12 @@ def is_git_repo(path: Path) -> bool:
 
 def run_project_report(project: dict, report_date: str | None) -> tuple[bool, str]:
     repo_path = Path(str(project.get("path") or "")).resolve()
-    safe_name = repo_path.name
+    # Key output on the config `name` (what every reader uses: the portfolio loader, the
+    # id namespace, main(), and jira_proxy's id-prefix reconstruction). Falling back to
+    # repo_path.name only when name is unset. Previously this used repo_path.name, which
+    # agrees with `name` only by coincidence — when /add-project sets name != folder,
+    # the report writes one dir while readers look in another → approvals never persist.
+    safe_name = str(project.get("name") or repo_path.name)
     output_root = WORKSPACE_ROOT / "reports" / "projects" / safe_name
     cmd = [
         sys.executable,
