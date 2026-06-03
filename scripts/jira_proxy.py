@@ -390,7 +390,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             target_date = qs.get("date", [None])[0]
             _, data = _load_suggestions(target_date)
-            pending = [s for s in data.get("suggestions", []) if s.get("status") == "pending"]
+            # Include 'failed' so a transient-hiccup card reappears for retry (the
+            # approve idempotency guard only short-circuits 'approved').
+            pending = [s for s in data.get("suggestions", []) if s.get("status") in ("pending", "failed")]
             _json_response(self, {"date": data.get("date", ""), "suggestions": pending})
 
         elif parsed.path in ("/", "/dashboard", "/portfolio"):
@@ -739,7 +741,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     err_action = str(e)
             ok = ok_action and ok_desc
             # Persist status on the RESOLVED project file, matched by raw (un-namespaced)
-            # id, so a portfolio approve lands on the right file and survives regen.
+            # id, so a portfolio approve lands on the right file and survives regen. Track
+            # whether a row was actually found — if not (wrong/missing file), the Jira
+            # write fired but status wasn't recorded, so signal status_persisted=False and
+            # the client must NOT grey the card (re-clicking would double-write).
+            _persisted = False
             if _spath and _spath.exists():
                 data = _read_suggestions_path(_spath)
                 for s in data.get("suggestions", []):
@@ -747,24 +753,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         s["status"] = "approved" if ok else "failed"
                         s["suggested_text"] = comment
                         s["suggested_description"] = description
+                        _persisted = True
                         break
-                _save_suggestions(_spath, data)
+                if _persisted:
+                    _save_suggestions(_spath, data)
+            if ok and not _persisted:
+                print(f"[jira_proxy] approve {sid}: Jira write OK but status not persisted "
+                      f"(file={_spath}, raw_id={_raw_id})", file=sys.stderr)
             _json_response(self, {"ok": ok, "comment_ok": ok_action, "description_ok": ok_desc,
-                                  "comment_error": err_action, "description_error": err_desc})
+                                  "comment_error": err_action, "description_error": err_desc,
+                                  "status_persisted": _persisted})
 
         # POST /api/suggestions/{id}/reject
         elif "/api/suggestions/" in path and path.endswith("/reject"):
             sid = path.split("/")[3]
             _project, _raw_id = _split_namespaced_id(sid)
             _spath = _find_project_suggestions_file(_project, body.get("date") or None)
+            _matched = False
             if _spath and _spath.exists():
                 data = _read_suggestions_path(_spath)
                 for s in data.get("suggestions", []):
                     if s.get("id") == _raw_id:
                         s["status"] = "rejected"
+                        _matched = True
                         break
-                _save_suggestions(_spath, data)
-            _json_response(self, {"ok": True})
+                if _matched:
+                    _save_suggestions(_spath, data)
+            # ok reflects whether the reject actually persisted — the client greys the
+            # card only on ok, else it would silently reappear after a regen.
+            _json_response(self, {"ok": _matched})
 
         # POST /api/proxy/restart
         # Spawn a detached child first (so the response can report success/failure

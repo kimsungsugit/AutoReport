@@ -381,7 +381,7 @@ def _build_jira_sections(run_date: str) -> tuple[str, str]:
                 _seen_sig.add(sig)
                 _deduped.append(s)
             merged_suggestions = _deduped
-        suggestions_html = html_jira_suggestions_panel(merged_suggestions) if merged_suggestions else ""
+        suggestions_html = html_jira_suggestions_panel(merged_suggestions, run_date) if merged_suggestions else ""
 
         scripts = ""
         if boards_html:

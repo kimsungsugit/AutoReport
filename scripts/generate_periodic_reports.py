@@ -548,9 +548,12 @@ def merge_suggestion_status(fresh: list[dict[str, Any]], existing_path: Path) ->
     except (json.JSONDecodeError, OSError) as exc:
         _log_swallowed("merge_suggestion_status/read", exc)
         return fresh
+    # Carry only TERMINAL user decisions (approved/rejected). Deliberately NOT 'failed':
+    # a transient Jira hiccup must not permanently bury a never-applied suggestion —
+    # letting it regenerate as fresh 'pending' makes it retryable.
     prior_by_id = {
         p["id"]: p for p in prior
-        if isinstance(p, dict) and p.get("id") and p.get("status") and p.get("status") != "pending"
+        if isinstance(p, dict) and p.get("id") and p.get("status") in ("approved", "rejected")
     }
     if not prior_by_id:
         return fresh
@@ -4282,12 +4285,19 @@ JIRA_BOARD_SCRIPT = """
 """
 
 
-def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
-    """Render an interactive suggestion review panel for auto-generated Jira actions."""
+def html_jira_suggestions_panel(suggestions: list[dict[str, Any]], panel_date: str = "") -> str:
+    """Render an interactive suggestion review panel for auto-generated Jira actions.
+
+    panel_date stamps the panel (data-date) so approve/reject can target the exact
+    suggestions file the cards came from — otherwise the proxy resolves the newest file
+    and a stale tab can re-fire a Jira write across the date boundary.
+    """
     if not suggestions:
         return ""
 
-    pending = [s for s in suggestions if s.get("status") == "pending"]
+    # Include 'failed' so a transient-hiccup card stays visible for retry (the approve
+    # idempotency guard only blocks 'approved').
+    pending = [s for s in suggestions if s.get("status") in ("pending", "failed")]
     if not pending:
         return ""
 
@@ -4399,7 +4409,7 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
         toggle = f'<button class="suggestion-toggle" onclick="suggToggleLow()">낮은 확신 {low_count}건 더 보기</button>'
 
     return f'''
-<div class="jira-suggestions" id="jira-suggestions-panel">
+<div class="jira-suggestions" id="jira-suggestions-panel" data-date="{escape(panel_date)}">
   <div class="jira-suggestions-header">
     <div>
       <h3>Jira 제안 리뷰</h3>
@@ -4656,13 +4666,17 @@ JIRA_SUGGESTIONS_SCRIPT = """
     btn.textContent = '처리 중...';
 
     const actionLabel = {comment:'댓글', complete:'완료처리', transition:'상태전환', add_subtask:'부작업'}[type] || '액션';
+    // Send the panel's date so the proxy targets the EXACT file these cards came from
+    // (else it resolves the newest file → a stale tab can re-fire a Jira write).
+    const _panel = document.getElementById('jira-suggestions-panel');
+    const panelDate = _panel ? (_panel.dataset.date || '') : '';
 
     fetch(API + '/api/suggestions/' + sid + '/approve', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({task_key: key, type: type, text: text, comment: text, description: desc, start: start, end: end})
+      body: JSON.stringify({task_key: key, type: type, text: text, comment: text, description: desc, start: start, end: end, date: panelDate})
     }).then(r => r.json()).then(d => {
-      if (d.ok) {
+      if (d.ok && d.status_persisted !== false) {
         card.classList.add('applied');
         btn.textContent = '완료';
         _suggUpdateEpicState(card);
@@ -4671,6 +4685,11 @@ JIRA_SUGGESTIONS_SCRIPT = """
         if (desc.trim()) parts.push('설명');
         jiraToast(key + ' 승인 완료 (' + (parts.join('+') || '액션') + ')');
         _afterAction();
+      } else if (d.ok && d.status_persisted === false) {
+        // Jira write succeeded but the audit row wasn't found — warn so the user
+        // doesn't re-click (which would double-write). Do NOT grey it.
+        btn.disabled = false; btn.textContent = '승인';
+        jiraToast(key + ' Jira 반영됨 but 상태 저장 실패 — 재클릭 금지(중복 방지), 새로고침 필요');
       } else {
         btn.textContent = '실패';
         const reasons = [];
@@ -4688,15 +4707,23 @@ JIRA_SUGGESTIONS_SCRIPT = """
   window.suggReject = function(sid) {
     const card = document.querySelector('[data-sid="' + sid + '"]');
     if (!card) return;
+    const _panel = document.getElementById('jira-suggestions-panel');
+    const panelDate = _panel ? (_panel.dataset.date || '') : '';
     fetch(API + '/api/suggestions/' + sid + '/reject', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({})
+      body: JSON.stringify({date: panelDate})
     }).then(r => r.json()).then(d => {
-      card.classList.add('applied');
-      card.querySelector('.reject').textContent = '거절됨';
-      _suggUpdateEpicState(card);
-      jiraToast(card.dataset.key + ' 제안 거절');
+      // Only grey the card if the reject actually persisted (a row was found); else the
+      // card would silently reappear after a regen.
+      if (d && d.ok) {
+        card.classList.add('applied');
+        card.querySelector('.reject').textContent = '거절됨';
+        _suggUpdateEpicState(card);
+        jiraToast(card.dataset.key + ' 제안 거절');
+      } else {
+        jiraToast(card.dataset.key + ' 대상 제안을 찾지 못했습니다 (파일/날짜 불일치)');
+      }
     }).catch(() => { jiraToast('프록시 서버 미실행 (python scripts/jira_proxy.py)'); });
   };
 
@@ -4943,7 +4970,7 @@ def render_html_dashboard(today: date, cards: list[dict[str, Any]], project_conf
             seen_boards.add(board_key)
             jira_boards_html += html_jira_live_board(pc)
     # Add suggestions panel below Jira board
-    suggestions_html = html_jira_suggestions_panel(jira_suggestions or [])
+    suggestions_html = html_jira_suggestions_panel(jira_suggestions or [], today.isoformat())
     jira_boards_html += suggestions_html
     card_html = []
     for card in cards:

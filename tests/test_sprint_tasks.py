@@ -1558,3 +1558,28 @@ class TestSuggestionPersistence:
         assert not jp._valid_jira_key("appl-423")   # 소문자
         assert not jp._valid_jira_key("")           # 빈 키(empty-key 갭)
         assert not jp._valid_jira_key("foo%2F..%2Fbar")  # path traversal
+
+    def test_merge_does_not_carry_failed_status(self, tmp_path):
+        """transient 'failed' 는 regen 후 carry 하지 않음 → fresh 'pending' 으로 재시도 가능."""
+        existing = tmp_path / "x.json"
+        existing.write_text(json.dumps({"suggestions": [
+            {"id": "sFAIL", "status": "failed"},
+            {"id": "sOK", "status": "approved"},
+        ]}), encoding="utf-8")
+        fresh = [{"id": "sFAIL", "status": "pending"}, {"id": "sOK", "status": "pending"}]
+        merged = {s["id"]: s for s in merge_suggestion_status(fresh, existing)}
+        assert merged["sFAIL"]["status"] == "pending", "failed 는 재시도 위해 pending 유지"
+        assert merged["sOK"]["status"] == "approved", "approved/rejected 는 계속 carry"
+
+    def test_find_project_file_honors_date(self, tmp_path, monkeypatch):
+        """date 를 주면 그 날짜의 파일을 해석(stale-tab 재승인이 다른 날 파일 안 건드리게)."""
+        from scripts import jira_proxy as jp
+        proj_dir = tmp_path / "reports" / "projects" / "ProjX" / "reports" / "jira"
+        proj_dir.mkdir(parents=True)
+        (proj_dir / "2026-06-02-jira-suggestions.json").write_text("{}", encoding="utf-8")
+        (proj_dir / "2026-06-03-jira-suggestions.json").write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(jp, "REPO_ROOT", tmp_path)
+        f = jp._find_project_suggestions_file("ProjX", "2026-06-02")
+        assert f is not None and f.name == "2026-06-02-jira-suggestions.json"
+        f2 = jp._find_project_suggestions_file("ProjX", None)  # 날짜 없으면 최신
+        assert f2 is not None and f2.name == "2026-06-03-jira-suggestions.json"
