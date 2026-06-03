@@ -519,6 +519,7 @@ def render_portfolio_dashboard(run_date: str, items: list[dict]) -> str:
   </div>
 {CHECKLIST_JS}
 {TABS_JS}
+<script>window.__JIRA_PORTFOLIO__ = true;</script>
 {jira_scripts}
 {REGENERATE_SCRIPT}
 <script>

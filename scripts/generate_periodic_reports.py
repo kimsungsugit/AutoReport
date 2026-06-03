@@ -4398,7 +4398,7 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]]) -> str:
     </div>
     <div class="jira-board-actions">
       <button class="jira-btn approve" onclick="suggBatchApprove()">전체 승인</button>
-      <button class="jira-btn" onclick="suggRefresh()">Refresh</button>
+      <button class="jira-btn" id="sugg-refresh-btn" onclick="suggRefresh()">Refresh</button>
     </div>
   </div>
   <div id="jira-suggestions-body">{"".join(rows)}</div>
@@ -4700,6 +4700,11 @@ JIRA_SUGGESTIONS_SCRIPT = """
   };
 
   window.suggRefresh = function() {
+    // The portfolio panel is server-rendered & merged across projects with namespaced
+    // ids; a single-file GET /api/suggestions would collapse it to ONE project and
+    // rewrite ids to bare. Approvals already grey their own card (suggApprove) and
+    // update the epic state, so refresh is unnecessary there — skip it.
+    if (window.__JIRA_PORTFOLIO__) return;
     fetch(API + '/api/suggestions')
       .then(r => r.json())
       .then(data => {
@@ -4821,6 +4826,14 @@ JIRA_SUGGESTIONS_SCRIPT = """
     const btn = document.querySelector('.suggestion-toggle');
     if (btn) btn.remove();
   };
+
+  // Portfolio: hide the Refresh button — it can't safely re-fetch the merged
+  // multi-project set (the GET endpoint returns a single file). The panel is complete
+  // from the server render. (Single-project dashboards leave the button visible.)
+  if (window.__JIRA_PORTFOLIO__) {
+    var _rb = document.getElementById('sugg-refresh-btn');
+    if (_rb) _rb.style.display = 'none';
+  }
 })();
 </script>
 """
