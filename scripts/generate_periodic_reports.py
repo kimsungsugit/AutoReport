@@ -1063,8 +1063,14 @@ def generate_jira_suggestions(
 
     # Build commit evidence — use sprint-wide commits, not just daily
     all_commits = [c.get("subject", "") for c in (payload.get("recent_commits") or [])]
-    # subject → body mapping for richer add_subtask descriptions
+    # subject → body mapping; bodies enrich add_subtask descriptions AND feed
+    # commit↔task matching. Seed from payload first (so body matching works without a
+    # live git repo), then the git-log block below adds/refines from the working tree.
     commit_bodies: dict[str, str] = {}
+    for _c in (payload.get("recent_commits") or []):
+        _cs, _cb = _c.get("subject", ""), _c.get("body", "")
+        if _cs and _cb and _cs not in commit_bodies:
+            commit_bodies[_cs] = _cb
     # Extend with git log from sprint period if available
     try:
         repo_root = Path(payload.get("repo_root", ""))
@@ -1230,8 +1236,27 @@ def generate_jira_suggestions(
             return any(rest.startswith(k) for k in _NOISE_CHORE_BODY)
         return False
 
+    def _commit_match_text(subj: str) -> str:
+        """Subject + a capped, trailer-stripped slice of the body (lowercased), so
+        matching also sees the Korean context conventional commits put in the body
+        (e.g. 'feat(tara): work' / body '- ISO 26262 HARA 위협분석 ...'). The cap via
+        _format_body_for_desc strips git trailers / section markers to limit noise."""
+        body = _format_body_for_desc(commit_bodies.get(subj, ""), max_lines=3)
+        return (subj + " " + body).lower() if body else subj.lower()
+
+    def _term_in(term: str, text: str, text_ns: str) -> bool:
+        """Substring match, tolerant of Korean spacing for Hangul terms only ('위협분석'
+        should match 'TARA 위협 분석'). English terms use plain substring to avoid
+        artificial-split false positives. text_ns is text with whitespace removed."""
+        if term in text:
+            return True
+        if any("가" <= ch <= "힣" for ch in term):
+            t = re.sub(r"\s+", "", term)
+            return bool(t) and t in text_ns
+        return False
+
     def _match_commits_for(task_title: str, task_key: str) -> list[str]:
-        """Find commits relevant to a task by keyword matching."""
+        """Find commits relevant to a task by keyword matching (subject + body)."""
         kw_task = local_sprint.get(task_key, {})
         keywords = [e.get("word", "").lower() for e in kw_task.get("keywords", [])
                      if e.get("word") and e.get("word", "").lower() not in _NOISE_KEYWORDS]
@@ -1252,8 +1277,9 @@ def generate_jira_suggestions(
         for subj in all_commits:
             if _is_noise_commit(subj):
                 continue
-            subj_lower = subj.lower()
-            if any(term in subj_lower for term in search_terms):
+            text = _commit_match_text(subj)
+            text_ns = re.sub(r"\s+", "", text)
+            if any(_term_in(term, text, text_ns) for term in search_terms):
                 matched.append(subj)
         return matched[:5]
 
@@ -1485,8 +1511,9 @@ def generate_jira_suggestions(
     for subj in all_commits:
         if _is_noise_commit(subj):
             continue
-        subj_lower = subj.lower()
-        if not any(kw in subj_lower for kw in all_keywords):
+        text = _commit_match_text(subj)
+        text_ns = re.sub(r"\s+", "", text)
+        if not any(_term_in(kw, text, text_ns) for kw in all_keywords):
             unmatched_commits.append(subj)
 
     # Group unmatched commits and suggest subtask additions
@@ -1510,7 +1537,10 @@ def generate_jira_suggestions(
             with any active task title — a guess, not a real match."""
             if not _active_parents:
                 return None, -1
-            subj_words = {w for w in re.split(r"[\s,/\-_:()]+", commit_subj.lower()) if len(w) >= 3}
+            # Include capped body tokens so a zero-subject-overlap commit can still
+            # find its right parent via body context (epic isolation upstream bounds
+            # the cross-epic risk; the 3-line cap bounds the noise).
+            subj_words = {w for w in re.split(r"[\s,/\-_:()]+", _commit_match_text(commit_subj)) if len(w) >= 3}
             best = _active_parents[0]
             best_score = -1
             for cand in _active_parents:
@@ -1616,6 +1646,40 @@ def generate_jira_suggestions(
                     "parent_end": task.get("end") or "",
                 })
                 break
+
+    # ── 진행 상황 코멘트 (커버리지 갭) ──
+    # An in_progress task with commit evidence but no rule-based complete/transition
+    # suggestion produces nothing today — visible work, silent tool. Emit a low-friction
+    # 'comment' suggestion (non-destructive, reversible; the type is wired end-to-end —
+    # icon/label/jira_proxy add_comment — but was never emitted) to surface the activity.
+    _rule_keys = {s.get("task_key") for s in suggestions
+                  if s.get("type") in ("complete", "transition")}
+    for task in sprint_tasks:
+        if len(suggestions) >= max_suggestions:
+            break
+        if task.get("status") not in ("진행 중", "in_progress"):
+            continue
+        tkey = task.get("key", "")
+        if not tkey or tkey in _rule_keys:
+            continue
+        tcommits = _match_commits_for(task.get("title", ""), tkey)
+        if len(tcommits) < 2:
+            continue
+        sid += 1
+        _summ = "; ".join(_strip_cc_prefix(c)[:40] for c in tcommits[:3])
+        suggestions.append({
+            "id": f"s{sid}",
+            "task_key": tkey,
+            "type": "comment",
+            "title": f"{task.get('title', '')} — 진행 상황 코멘트",
+            "subtitle": f"상위 작업 · 관련 커밋 {len(tcommits)}건",
+            "suggested_text": f"이번 스프린트 진행 사항: {_summ}",
+            "suggested_description": "",
+            "reason": f"{tkey} 관련 커밋 {len(tcommits)}건 — 진행 상황 공유 권장",
+            "confidence": "medium" if len(tcommits) >= 3 else "low",
+            "evidence_score": float(len(tcommits)),
+            "status": "pending",
+        })
 
     # Dedup: the unmatched-commit loop and the matched-parent loop can both emit an
     # add_subtask for the same (task_key, suggested_text) when a commit matches a

@@ -648,8 +648,13 @@ class TestBuildFallbackSectionsSprintSummary:
 # generate_jira_suggestions — Iteration 1-4 회귀 방지
 # ---------------------------------------------------------------------------
 
-def _suggestion_payload(sprint_tasks, commits=None):
-    """Minimal payload for generate_jira_suggestions / generate_document tests."""
+def _suggestion_payload(sprint_tasks, commits=None, bodies=None):
+    """Minimal payload for generate_jira_suggestions / generate_document tests.
+
+    bodies: optional {subject: body} so commit-body matching can be tested without a
+    live git repo (the engine seeds commit_bodies from recent_commits[].body).
+    """
+    bodies = bodies or {}
     return {
         "today": "2026-05-22",
         "report_type": "jira",
@@ -662,7 +667,8 @@ def _suggestion_payload(sprint_tasks, commits=None):
         "domain_focus": [],
         "jira_enabled": True,
         "sprint_tasks": sprint_tasks,
-        "recent_commits": [{"hash": "h", "subject": s, "author": "", "time": ""}
+        "recent_commits": [{"hash": "h", "subject": s, "author": "", "time": "",
+                            "body": bodies.get(s, "")}
                            for s in (commits or [])],
         "changed_files": [], "uncommitted": [], "uncommitted_count": 0,
         # Fields render_jira_markdown / render_report_markdown read directly
@@ -1012,6 +1018,66 @@ class TestGenerateJiraSuggestions:
         b = next(s for s in adds if s["task_key"] == "TASK-B")
         assert a["evidence_score"] > b["evidence_score"]
         assert adds.index(a) < adds.index(b), "evidence_score 높은 카드가 먼저 와야 함"
+
+    def test_body_matching_routes_korean_body_to_korean_task(self):
+        """영어 subject + 한국어 body 커밋이 한국어 task 에 매칭된다 (TARA 패턴, 노트 #14).
+
+        subject 'feat(tara): work' 는 제목 '위협분석 모델' 과 겹침 0 이지만, body 의
+        '위협분석' 이 매칭을 살린다.
+        """
+        sprint = [{
+            "key": "TARA-1", "title": "위협분석 모델",
+            "start": "2026-05-25", "end": "2099-12-31",  # 미래 → Rule 2 안 탐
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = ["feat(tara): work"]
+        bodies = {"feat(tara): work": "- ISO 26262 HARA 위협분석 데이터모델\n- ASIL 등급 산정"}
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits, bodies), None)
+        adds = [s for s in result if s["type"] == "add_subtask" and s["task_key"] == "TARA-1"]
+        assert adds, "body 의 한국어 토큰('위협분석')으로 TARA-1 에 매칭돼야 함"
+
+    def test_korean_spacing_insensitive_match(self):
+        """한글 토큰은 공백 무시로 매칭된다: 제목 토큰 '위협분석'(붙임) ↔ body '위협 분석'(띄움)."""
+        sprint = [{
+            "key": "KSP-1", "title": "위협분석 자동화",  # 한 토큰 '위협분석'(붙임)
+            "start": "2026-05-25", "end": "2099-12-31",
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = ["feat: pipeline"]
+        bodies = {"feat: pipeline": "- 위협 분석 결과 리포트 자동 생성"}  # 띄어쓴 '위협 분석'
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits, bodies), None)
+        adds = [s for s in result if s["type"] == "add_subtask" and s["task_key"] == "KSP-1"]
+        assert adds, "'위협분석'(제목) 과 '위협 분석'(body) 이 공백 무시로 매칭돼야 함"
+
+    def test_comment_suggestion_for_active_task_with_commits(self):
+        """rule 미발동 + 커밋 증거(>=2) 있는 in_progress 태스크 → comment 진행노트 카드.
+
+        예전엔 마감 미도래 + 부작업 없는 활성 작업이 아무 제안도 못 냈다(침묵). 'comment'
+        타입은 배선돼 있었으나 한 번도 emit 되지 않았다.
+        """
+        sprint = [{
+            "key": "ACT-1", "title": "telemetry buffer flush",
+            "start": "2026-05-01", "end": "2099-12-31",  # 미래 → Rule 2 안 탐
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = ["feat: telemetry init", "fix: buffer flush bug", "refactor: telemetry pool"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        comments = [s for s in result if s["type"] == "comment" and s["task_key"] == "ACT-1"]
+        assert comments, "활동 있는 진행중 작업에 comment 제안이 나와야 함"
+        assert comments[0]["confidence"] == "medium"  # 커밋 >=3 → medium
+
+    def test_no_comment_when_rule_already_fired(self):
+        """이미 complete/transition 제안이 있는 태스크엔 중복 comment 를 안 낸다."""
+        sprint = [{
+            "key": "OVR-1", "title": "telemetry buffer flush",
+            "start": "2026-05-01", "end": "2026-05-15",  # 종료 도래 → Rule 2 complete
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = ["feat: telemetry init", "fix: buffer flush", "refactor: telemetry pool"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        assert any(s["type"] == "complete" and s["task_key"] == "OVR-1" for s in result)
+        assert not any(s["type"] == "comment" and s["task_key"] == "OVR-1" for s in result), \
+            "Rule 2 가 이미 발동했으면 comment 중복 금지"
 
 
 # ---------------------------------------------------------------------------
