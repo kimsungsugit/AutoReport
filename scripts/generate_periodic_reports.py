@@ -534,6 +534,44 @@ def write_text_atomic(path: Path, text: str) -> None:
         raise
 
 
+def merge_suggestion_status(fresh: list[dict[str, Any]], existing_path: Path) -> list[dict[str, Any]]:
+    """Carry approved/rejected/failed status (and the user-edited text/description the
+    proxy persists at approve time) from a prior suggestions file onto freshly-generated
+    suggestions, matched by their content-stable id. Without this, a regenerate rewrites
+    the file all-'pending', wiping the audit trail and resurrecting already-applied cards
+    — so a second approve fires a DUPLICATE Jira write (duplicate subtask / comment).
+    Matches by id only, so this is safe only with stable ids (see _stable_id)."""
+    if not existing_path.exists():
+        return fresh
+    try:
+        prior = json.loads(existing_path.read_text(encoding="utf-8")).get("suggestions", []) or []
+    except (json.JSONDecodeError, OSError) as exc:
+        _log_swallowed("merge_suggestion_status/read", exc)
+        return fresh
+    prior_by_id = {
+        p["id"]: p for p in prior
+        if isinstance(p, dict) and p.get("id") and p.get("status") and p.get("status") != "pending"
+    }
+    if not prior_by_id:
+        return fresh
+    carried = 0
+    for s in fresh:
+        prev = prior_by_id.get(s.get("id"))
+        if not prev:
+            continue
+        s["status"] = prev.get("status", s.get("status"))
+        for k in ("suggested_text", "suggested_description"):
+            if prev.get(k):
+                s[k] = prev[k]
+        carried += 1
+    if carried:
+        _log_swallowed(
+            "merge_suggestion_status/carried",
+            RuntimeError(f"carried {carried} non-pending statuses across regen (of {len(prior_by_id)} prior)"),
+        )
+    return fresh
+
+
 def cleanup_legacy_jira_outputs(output_root: Path, today: date) -> None:
     jira_dir = output_root / "reports" / "jira"
     legacy_names = [
@@ -1802,6 +1840,18 @@ def generate_jira_suggestions(
     # add_subtask for the same (task_key, suggested_text) when a commit matches a
     # parent's title but isn't in any keyword set — producing identical cards. Keep
     # first occurrence (the higher-confidence emitter runs first in most paths).
+    import hashlib
+
+    def _stable_id(task_key: str, stype: str, disc: str) -> str:
+        # Content-stable id (not a positional s{n}) so a regen, which can shift order
+        # when an upstream task is added/removed, keeps the SAME id for the same logical
+        # suggestion. Required for status-merge-on-regen and to stop a stale browser tab
+        # from approving an id that now points at a different card. Discriminator is the
+        # source commit for add_subtask, else just (task_key,type) — NOT the truncated
+        # suggested_text, so a reworded summary doesn't orphan a still-pending card.
+        h = hashlib.sha1(f"{task_key}|{stype}|{disc}".encode("utf-8")).hexdigest()[:10]
+        return f"s{h}"
+
     _seen_sig: set[tuple] = set()
     _deduped: list[dict[str, Any]] = []
     for _s in suggestions:
@@ -1813,11 +1863,14 @@ def generate_jira_suggestions(
         _src = _s.pop("_src_commit", None)
         if _s.get("type") == "add_subtask" and _src:
             _sig = ("add_subtask", _src)
+            _disc = _src
         else:
             _sig = (_s.get("task_key", ""), _s.get("type", ""), _s.get("suggested_text", ""))
+            _disc = ""
         if _sig in _seen_sig:
             continue
         _seen_sig.add(_sig)
+        _s["id"] = _stable_id(_s.get("task_key", ""), _s.get("type", ""), _disc)
         _deduped.append(_s)
     suggestions = _deduped
 
@@ -5296,6 +5349,9 @@ def main() -> int:
             )
             if _jira_suggestions:
                 sugg_path = output_root / "reports" / "jira" / f"{today.isoformat()}-jira-suggestions.json"
+                # Preserve approve/reject status across a regen so applied cards don't
+                # resurface as pending (which would let a second approve double-write Jira).
+                _jira_suggestions = merge_suggestion_status(_jira_suggestions, sugg_path)
                 write_text_atomic(sugg_path, json.dumps(
                     {"date": today.isoformat(), "suggestions": _jira_suggestions},
                     ensure_ascii=False, indent=2,

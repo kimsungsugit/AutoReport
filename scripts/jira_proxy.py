@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -199,6 +200,49 @@ def _find_suggestions_file(target_date: str | None = None) -> Path | None:
             if target_date in f:
                 return Path(f)
     return Path(files[0]) if files else None
+
+
+def _find_project_suggestions_file(project: str, target_date: str | None = None) -> Path | None:
+    """Resolve a SPECIFIC project's suggestions file. Portfolio cards carry a namespaced
+    id '{project}-{stableid}', so an approve must update THAT project's file — not the
+    newest file across all projects (the single-most-recent scan could flip an unrelated
+    card on another project / another day). Falls back to the global scan when project
+    is empty (single-project dashboard, bare id)."""
+    if not project:
+        return _find_suggestions_file(target_date)
+    dirs = [REPO_ROOT / "reports" / "projects" / project / "reports" / "jira"]
+    if project == "Release_claude":  # output-root variant (mirrors _find_suggestions_file)
+        dirs.append(Path("D:/Project/devops/Release_claude/reports/jira"))
+    files: list[str] = []
+    for d in dirs:
+        files.extend(glob(str(d / "*-jira-suggestions.json")))
+    files.sort(key=lambda fp: (Path(fp).name, fp), reverse=True)
+    if target_date:
+        for f in files:
+            if target_date in f:
+                return Path(f)
+    return Path(files[0]) if files else None
+
+
+def _read_suggestions_path(path: Path | None) -> dict:
+    """Load a specific suggestions file (vs _load_suggestions which globs for newest)."""
+    if not path or not path.exists():
+        return {"date": "", "suggestions": []}
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[jira_proxy] read failed for {path}: {exc!r}", file=sys.stderr)
+        return {"date": "", "suggestions": []}
+
+
+def _split_namespaced_id(sid: str) -> tuple[str, str]:
+    """Portfolio ids are '{project}-{stableid}'; stable ids are 's'+hex (no '-'), so the
+    last '-' cleanly separates project from raw id. A bare id (no '-') → project=''."""
+    if "-" in sid:
+        project, _, raw = sid.rpartition("-")
+        return project, raw
+    return "", sid
 
 
 def _load_suggestions(target_date: str | None = None) -> tuple[Path | None, dict]:
@@ -538,6 +582,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # POST /api/suggestions/{id}/approve
         elif "/api/suggestions/" in path and path.endswith("/approve"):
             sid = path.split("/")[3]
+            # Portfolio ids are '{project}-{rawid}'; resolve to THAT project's file so the
+            # status lands on the right file (not the newest file across all projects).
+            _project, _raw_id = _split_namespaced_id(sid)
+            _target_date = body.get("date") or None
+            _spath = _find_project_suggestions_file(_project, _target_date)
+            # Idempotency: if this exact suggestion is already approved on disk, do NOT
+            # fire a second Jira write (the regen-resurrect path created duplicate subtasks
+            # / comments). Return ok so the UI greys it out without re-applying.
+            _existing = next(
+                (s for s in _read_suggestions_path(_spath).get("suggestions", [])
+                 if s.get("id") == _raw_id),
+                None,
+            )
+            if _existing and _existing.get("status") == "approved":
+                _json_response(self, {"ok": True, "comment_ok": True, "description_ok": True,
+                                      "already_applied": True})
+                return
             task_key = body.get("task_key", "")
             stype = body.get("type", "comment")
             # `text` is the legacy single-field; `comment` and `description` are the
@@ -554,6 +615,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # add_subtask: summary is mandatory (Jira rejects empty summary).
             if stype == "add_subtask" and not (comment.strip() or text.strip()):
                 _json_response(self, {"ok": False, "error": "부작업 제목이 비어 있습니다",
+                                      "comment_ok": False, "description_ok": False}, 400)
+                return
+            # task_key must be a real Jira key (PROJ-123). A malformed key ('APPL', '-5')
+            # would otherwise reach project=task_key.split('-')[0] and 400 deep in Jira
+            # with an opaque error — reject it up front with an actionable message.
+            if task_key and not re.fullmatch(r"[A-Z][A-Z0-9]+-[0-9]+", task_key):
+                _json_response(self, {"ok": False, "error": f"task_key 형식이 올바르지 않습니다: {task_key}",
                                       "comment_ok": False, "description_ok": False}, 400)
                 return
 
@@ -630,35 +698,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         sub_fields["customfield_10230"] = user_start
                     if user_end:
                         sub_fields["customfield_10900"] = user_end
+                    # Preflight: if neither the parent nor the user supplied start/end,
+                    # the create would 400 on the required date fields — surface a clear,
+                    # actionable message instead of an opaque raw Jira error.
+                    if "customfield_10230" not in sub_fields or "customfield_10900" not in sub_fields:
+                        raise ValueError("상위 작업에 시작/종료일이 없습니다 — 부작업 시작/종료일을 직접 입력하세요")
                     provider._request("POST", "/rest/api/2/issue", {"fields": sub_fields})
                     ok_action = True
                 except Exception as e:
                     ok_action = False
                     err_action = str(e)
             ok = ok_action and ok_desc
-            # Update suggestion status in JSON
-            fpath, data = _load_suggestions()
-            if fpath:
+            # Persist status on the RESOLVED project file, matched by raw (un-namespaced)
+            # id, so a portfolio approve lands on the right file and survives regen.
+            if _spath and _spath.exists():
+                data = _read_suggestions_path(_spath)
                 for s in data.get("suggestions", []):
-                    if s.get("id") == sid:
+                    if s.get("id") == _raw_id:
                         s["status"] = "approved" if ok else "failed"
                         s["suggested_text"] = comment
                         s["suggested_description"] = description
                         break
-                _save_suggestions(fpath, data)
+                _save_suggestions(_spath, data)
             _json_response(self, {"ok": ok, "comment_ok": ok_action, "description_ok": ok_desc,
                                   "comment_error": err_action, "description_error": err_desc})
 
         # POST /api/suggestions/{id}/reject
         elif "/api/suggestions/" in path and path.endswith("/reject"):
             sid = path.split("/")[3]
-            fpath, data = _load_suggestions()
-            if fpath:
+            _project, _raw_id = _split_namespaced_id(sid)
+            _spath = _find_project_suggestions_file(_project, body.get("date") or None)
+            if _spath and _spath.exists():
+                data = _read_suggestions_path(_spath)
                 for s in data.get("suggestions", []):
-                    if s.get("id") == sid:
+                    if s.get("id") == _raw_id:
                         s["status"] = "rejected"
                         break
-                _save_suggestions(fpath, data)
+                _save_suggestions(_spath, data)
             _json_response(self, {"ok": True})
 
         # POST /api/proxy/restart

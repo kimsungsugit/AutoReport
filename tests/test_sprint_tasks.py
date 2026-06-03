@@ -24,6 +24,7 @@ from scripts.generate_periodic_reports import (
     _log_swallowed,
     generate_jira_suggestions,
     write_text_atomic,
+    merge_suggestion_status,
 )
 
 
@@ -1486,3 +1487,59 @@ class TestWriteTextAtomic:
         monkeypatch.setattr(_os, "replace", real_replace)
         assert p.read_text(encoding="utf-8") == "good", "실패 시 기존 파일이 보존돼야 함"
         assert not list(tmp_path.glob("**/*.tmp")), "실패 시 임시 파일 정리돼야 함"
+
+
+class TestSuggestionPersistence:
+    """제안 영속성 클러스터: 안정 ID, regen status 머지, 포트폴리오 id 라운드트립."""
+
+    def test_ids_are_content_stable_not_positional(self):
+        """제안 id 는 위치가 아니라 내용 기반 — 앞에 무관한 작업이 추가돼 순서가 바뀌어도
+        같은 제안은 같은 id 를 유지한다(regen 시 status 머지/승인 타겟이 안 어긋나게)."""
+        base = {"key": "S-1", "title": "stable task", "start": "2026-05-01", "end": "2026-05-10",
+                "status": "in_progress", "subtasks": []}
+        r1 = generate_jira_suggestions(_suggestion_payload([dict(base)]), None)
+        extra = {"key": "X-9", "title": "unrelated extra", "start": "2026-05-01", "end": "2026-05-10",
+                 "status": "in_progress", "subtasks": []}
+        r2 = generate_jira_suggestions(_suggestion_payload([extra, dict(base)]), None)
+        id1 = {s["task_key"]: s["id"] for s in r1}["S-1"]
+        id2 = {s["task_key"]: s["id"] for s in r2}["S-1"]
+        assert id1 == id2, f"위치가 바뀌어도 같은 제안은 같은 id 여야 함: {id1} vs {id2}"
+        # 결정적: 같은 입력 두 번 → 같은 id
+        r3 = generate_jira_suggestions(_suggestion_payload([dict(base)]), None)
+        assert {s["task_key"]: s["id"] for s in r3}["S-1"] == id1
+        assert id1.startswith("s") and len(id1) > 3, "content-hash 형식이어야 함"
+
+    def test_merge_carries_approved_status_and_user_edits(self, tmp_path):
+        existing = tmp_path / "x.json"
+        existing.write_text(json.dumps({"suggestions": [
+            {"id": "sABC", "status": "approved", "suggested_text": "edited", "suggested_description": "ed"},
+            {"id": "sDEF", "status": "pending"},
+        ]}), encoding="utf-8")
+        fresh = [
+            {"id": "sABC", "status": "pending", "suggested_text": "fresh", "suggested_description": ""},
+            {"id": "sNEW", "status": "pending"},
+        ]
+        merged = {s["id"]: s for s in merge_suggestion_status(fresh, existing)}
+        assert merged["sABC"]["status"] == "approved", "승인 상태가 regen 후에도 유지돼야 함"
+        assert merged["sABC"]["suggested_text"] == "edited", "사용자 편집 텍스트 보존"
+        assert merged["sNEW"]["status"] == "pending", "신규 제안은 pending"
+
+    def test_merge_noop_when_no_existing_file(self, tmp_path):
+        fresh = [{"id": "s1", "status": "pending"}]
+        assert merge_suggestion_status(fresh, tmp_path / "missing.json") == fresh
+
+    def test_namespaced_id_split(self):
+        from scripts import jira_proxy as jp
+        assert jp._split_namespaced_id("Release_claude-sa1b2c3") == ("Release_claude", "sa1b2c3")
+        assert jp._split_namespaced_id("sa1b2c3") == ("", "sa1b2c3")  # 단일 프로젝트(bare)
+        assert jp._split_namespaced_id("my-proj-sXYZ") == ("my-proj", "sXYZ")  # 하이픈 프로젝트명
+
+    def test_task_key_format_guard(self):
+        """add_subtask 의 잘못된 task_key 를 막는 정규식 (project split 가 깨지기 전 차단)."""
+        # jira_proxy 가 쓰는 패턴과 동일해야 함 — divergence 방지 표식
+        src = (Path(__file__).resolve().parents[1] / "scripts" / "jira_proxy.py").read_text(encoding="utf-8")
+        assert r'[A-Z][A-Z0-9]+-[0-9]+' in src, "task_key 형식 가드 정규식이 존재해야 함"
+        import re as _re
+        pat = r"[A-Z][A-Z0-9]+-[0-9]+"
+        assert _re.fullmatch(pat, "APPL-423") and not _re.fullmatch(pat, "APPL")
+        assert not _re.fullmatch(pat, "-5") and not _re.fullmatch(pat, "appl-423")
