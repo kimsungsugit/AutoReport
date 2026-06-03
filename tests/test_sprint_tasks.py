@@ -1050,21 +1050,40 @@ class TestGenerateJiraSuggestions:
         assert adds, "'위협분석'(제목) 과 '위협 분석'(body) 이 공백 무시로 매칭돼야 함"
 
     def test_comment_suggestion_for_active_task_with_commits(self):
-        """rule 미발동 + 커밋 증거(>=2) 있는 in_progress 태스크 → comment 진행노트 카드.
+        """rule 미발동 + add_subtask 도 안 생기는 활성 태스크에 커밋 증거(>=2) → comment.
 
-        예전엔 마감 미도래 + 부작업 없는 활성 작업이 아무 제안도 못 냈다(침묵). 'comment'
-        타입은 배선돼 있었으나 한 번도 emit 되지 않았다.
+        'comment' 타입은 배선돼 있었으나 한 번도 emit 되지 않던 침묵 갭. 부작업이 커밋
+        토큰을 모두 덮어 add_subtask 의 new_words>=2 게이트가 안 걸리고(중복 카드 없음),
+        부모 시작일이 미래라 부작업 transition 도 안 뜨게 해 comment 단독을 검증한다.
         """
         sprint = [{
             "key": "ACT-1", "title": "telemetry buffer flush",
-            "start": "2026-05-01", "end": "2099-12-31",  # 미래 → Rule 2 안 탐
-            "status": "in_progress", "subtasks": [],
+            "start": "2099-01-01", "end": "2099-12-31",  # 미래 → Rule 2/3 안 탐, 부작업 inert
+            "status": "in_progress",
+            # 부작업 제목이 커밋 토큰을 모두 덮음 → matched-parent add_subtask new_words<2
+            "subtasks": [{"key": "ACT-1-1", "title": "telemetry buffer flush init pool bug",
+                          "status": "pending"}],
         }]
-        commits = ["feat: telemetry init", "fix: buffer flush bug", "refactor: telemetry pool"]
+        commits = ["feat: telemetry", "fix: buffer", "refactor: flush"]
         result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        assert not any(s["type"] == "add_subtask" and s["task_key"] == "ACT-1" for s in result), \
+            "전제: 이 픽스처는 add_subtask 를 만들지 않아야 함"
         comments = [s for s in result if s["type"] == "comment" and s["task_key"] == "ACT-1"]
         assert comments, "활동 있는 진행중 작업에 comment 제안이 나와야 함"
         assert comments[0]["confidence"] == "medium"  # 커밋 >=3 → medium
+
+    def test_no_duplicate_comment_when_add_subtask_emitted(self):
+        """add_subtask 가 이미 난 작업엔 같은 증거로 comment 를 중복 발행하지 않는다."""
+        sprint = [{
+            "key": "DUP2-1", "title": "telemetry buffer flush",
+            "start": "2026-05-01", "end": "2099-12-31",
+            "status": "in_progress", "subtasks": [],  # add_subtask 발생 (new_words>=2)
+        }]
+        commits = ["feat: telemetry init", "fix: buffer flush bug"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        assert any(s["type"] == "add_subtask" and s["task_key"] == "DUP2-1" for s in result)
+        assert not any(s["type"] == "comment" and s["task_key"] == "DUP2-1" for s in result), \
+            "add_subtask 이미 있으면 같은 작업에 comment 중복 금지"
 
     def test_no_comment_when_rule_already_fired(self):
         """이미 complete/transition 제안이 있는 태스크엔 중복 comment 를 안 낸다."""
@@ -1078,6 +1097,126 @@ class TestGenerateJiraSuggestions:
         assert any(s["type"] == "complete" and s["task_key"] == "OVR-1" for s in result)
         assert not any(s["type"] == "comment" and s["task_key"] == "OVR-1" for s in result), \
             "Rule 2 가 이미 발동했으면 comment 중복 금지"
+
+    def test_no_body_leak_to_foreign_epic_multi_epic(self):
+        """본문-only 매칭이 다중 에픽(미설정)에서 남의 에픽 작업에 새지 않는다.
+
+        subject 는 두 제목 모두와 겹침 0 이지만 body 가 OTH-1 제목 토큰('rendering')을
+        우연히 포함 → 본문 매칭으로 OTH-1 에 add_subtask/comment 가 새던 회귀(self-review #1).
+        """
+        sprint = [
+            {"key": "OTH-1", "title": "alpha rendering subsystem",
+             "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-OTHER"},
+            {"key": "MINE-1", "title": "프로그램 통신 확장",
+             "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-MINE"},
+        ]
+        commits = ["feat: zzz unrelated work"]  # subject 겹침 0
+        bodies = {"feat: zzz unrelated work": "- touched the rendering path slightly"}
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits, bodies), None)
+        assert not any(s["task_key"] == "OTH-1" for s in result), "본문-only 외부 에픽 누수 금지"
+
+    def test_no_leak_with_partial_epic_key_population(self):
+        """epic_key 가 부분만 채워진 공유 스프린트(하나는 키, 하나는 공백)에서도 겹침 0
+        커밋은 억제된다 (config 누락 시 누수 재발 방지, self-review #2)."""
+        sprint = [
+            {"key": "OTH-1", "title": "사용자 피드백 및 개선",
+             "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-OTHER"},
+            {"key": "MINE-1", "title": "프로그램 통신 확장",
+             "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": [], "epic_key": ""},  # 공백
+        ]
+        commits = ["feat(tara): ISO 26262 HARA 데이터모델"]  # 겹침 0
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert adds == [], "부분 epic_key 여도 겹침 0 커밋은 억제돼야 함"
+
+    def test_multi_epic_overlap_still_attaches(self):
+        """다중 에픽 미설정이라도 subject 단어 겹침(>=1)이 있으면 올바른 작업에 붙는다(recall)."""
+        sprint = [
+            {"key": "OTH-1", "title": "documentation cleanup",
+             "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-A"},
+            {"key": "MINE-1", "title": "replay analysis system",
+             "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-B"},
+        ]
+        commits = ["feat: replay zzz"]  # subject 가 MINE-1 'replay' 와 겹침
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert any(s["task_key"] == "MINE-1" for s in adds), "겹침 있는 커밋은 올바른 작업에 붙어야 함"
+        assert not any(s["task_key"] == "OTH-1" for s in adds), "남의 에픽엔 안 붙음"
+
+    def test_rule2_high_from_body_evidence(self):
+        """Rule 2 high 는 body 증거로도 정당하게 승격된다 (가장 결과 큰 출력 경로 보호)."""
+        sprint = [{
+            "key": "BOD-1", "title": "위협분석 모델",
+            "start": "2026-05-01", "end": "2026-05-15",  # overdue vs today 2026-05-22
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = ["feat(tara): work"]  # subject 겹침 0
+        bodies = {"feat(tara): work": "- ISO 26262 HARA 위협분석 데이터모델"}
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits, bodies), None)
+        comp = [s for s in result if s["type"] == "complete" and s["task_key"] == "BOD-1"]
+        assert comp and comp[0]["confidence"] == "high"
+        assert "종료 요청합니다." in comp[0]["suggested_text"]
+
+    def test_english_token_word_boundary_no_false_coverage(self):
+        """짧은 영어 토큰('api')이 부분문자열로 무관 커밋('rapid')을 covered 처리하면 안 됨."""
+        sprint = [{
+            "key": "API-1", "title": "service",
+            "start": "2099-01-01", "end": "2099-12-31",  # 부작업/룰 inert
+            "status": "in_progress",
+            "subtasks": [{"key": "API-1-1", "title": "api gateway", "status": "pending"}],
+        }]
+        commits = ["feat: rapid kayak zebra"]  # 'api' 를 'rapid' 안에 부분포함하나 무관
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert adds, "단어 경계 매칭이면 'api'⊂'rapid' 로 covered 되지 않아 add_subtask 가 나와야 함"
+
+    def test_korean_3char_token_no_cross_boundary_false_match(self):
+        """3자 한글 토큰('관리자')은 '관리 자료실'(공백)을 가로질러 매칭되면 안 된다."""
+        sprint = [{
+            "key": "KO3-1", "title": "관리자",  # 3자 토큰
+            "start": "2026-05-25", "end": "2099-12-31",
+            "status": "in_progress", "subtasks": [],
+        }]
+        commits = ["feat: archive"]
+        bodies = {"feat: archive": "- 관리 자료실 정리"}  # ns '관리자료실' 에 '관리자' 부분포함
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits, bodies), None)
+        adds = [s for s in result if s["type"] == "add_subtask"]
+        assert adds, "3자 한글 토큰은 공백 가로질러 매칭되면 안 됨 (커밋이 covered 되면 안 됨)"
+
+    def test_git_log_evidence_window_clamp_and_min_start(self, tmp_path, monkeypatch):
+        """git-log 증거 윈도우: --since=min(start)(순서 무관) + --until=today+1d 클램프."""
+        import subprocess
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = list(args)
+
+            class _R:
+                returncode = 0
+                stdout = ""  # 커밋 없음 — 윈도우 인자만 검증
+                stderr = ""
+            return _R()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        sprint = [
+            {"key": "G-1", "title": "task one", "start": "2026-05-10", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": []},
+            {"key": "G-2", "title": "task two", "start": "2026-05-03", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": []},
+        ]
+        payload = _suggestion_payload(sprint)
+        payload["repo_root"] = str(tmp_path)  # 존재 → git 블록 실행
+        payload["today"] = "2026-05-22"
+        generate_jira_suggestions(payload, None)
+        args = captured.get("args", [])
+        assert "--since=2026-05-03" in args, f"min(start) 윈도우여야 함: {args}"
+        assert "--until=2026-05-23" in args, f"--until=today+1d 클램프여야 함: {args}"
 
 
 # ---------------------------------------------------------------------------

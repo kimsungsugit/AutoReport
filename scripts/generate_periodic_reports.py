@@ -1048,6 +1048,17 @@ def generate_jira_suggestions(
     if not sprint_tasks:
         return []
 
+    # Cross-epic ambiguity guard (used by ALL emission paths: unmatched / matched-parent
+    # / comment). When a shared sprint spans more than one 큰틀(Epic) — OR mixes keyed
+    # with unkeyed tasks — and no epic_scope is set, a commit that doesn't clearly belong
+    # to one task must NOT be parked on an arbitrary OTHER epic's task (the historical
+    # leak). Computed over attachable (non-done) tasks so a done task can't flip it; a
+    # missing/blank epic_key is its OWN bucket so partial config still suppresses.
+    _attachable = [t for t in sprint_tasks if t.get("status") not in ("완료", "done")]
+    _epic_keys_present = {t.get("epic_key") for t in _attachable if t.get("epic_key")}
+    _epic_buckets = len(_epic_keys_present) + (1 if any(not t.get("epic_key") for t in _attachable) else 0)
+    _multi_epic_unscoped = (not epic_scope) and _epic_buckets > 1
+
     suggestions: list[dict[str, Any]] = []
     sid = 0
     # Honor the report date (payload['today']) instead of the wall clock so that
@@ -1244,19 +1255,43 @@ def generate_jira_suggestions(
         body = _format_body_for_desc(commit_bodies.get(subj, ""), max_lines=3)
         return (subj + " " + body).lower() if body else subj.lower()
 
-    def _term_in(term: str, text: str, text_ns: str) -> bool:
-        """Substring match, tolerant of Korean spacing for Hangul terms only ('위협분석'
-        should match 'TARA 위협 분석'). English terms use plain substring to avoid
-        artificial-split false positives. text_ns is text with whitespace removed."""
-        if term in text:
-            return True
-        if any("가" <= ch <= "힣" for ch in term):
-            t = re.sub(r"\s+", "", term)
-            return bool(t) and t in text_ns
-        return False
+    _pat_cache: dict[str, re.Pattern[str]] = {}
 
-    def _match_commits_for(task_title: str, task_key: str) -> list[str]:
-        """Find commits relevant to a task by keyword matching (subject + body)."""
+    def _en_pat(term: str) -> re.Pattern[str]:
+        p = _pat_cache.get(term)
+        if p is None:
+            p = _keyword_pattern(term)
+            _pat_cache[term] = p
+        return p
+
+    def _term_in(term: str, text: str, text_ns: str) -> bool:
+        """Does a search term appear in the commit text?
+
+        - Hangul terms: substring, plus a whitespace-insensitive fallback ('위협분석'
+          matches '위협 분석') — but only when the stripped term is >=4 chars, so a
+          3-char token like '관리자' can't match across the '관리 자료실' word boundary.
+        - English/Latin terms: word-boundary match (_keyword_pattern) so 'api' does NOT
+          match inside 'rapid'. (Same boundary semantics as match_commits_to_tasks.)
+        text is lowercased; text_ns is text with whitespace removed."""
+        if any("가" <= ch <= "힣" for ch in term):
+            if term in text:
+                return True
+            t = re.sub(r"\s+", "", term)
+            return len(t) >= 4 and t in text_ns
+        return bool(_en_pat(term).search(text))
+
+    # Precompute commit match-text once (depends only on the subject, not the task):
+    # _match_commits_for runs per task across Rule 2 + matched-parent + comment passes,
+    # so this avoids re-parsing every commit body O(tasks) times.
+    _mt = {s: _commit_match_text(s) for s in all_commits}
+    _mt_ns = {s: re.sub(r"\s+", "", v) for s, v in _mt.items()}
+
+    def _match_commits_for(task_title: str, task_key: str, body_aware: bool = True) -> list[str]:
+        """Find commits relevant to a task by keyword matching.
+
+        body_aware=True matches subject+body; False matches the subject only — used when
+        cross-epic ambiguity means a body token must not ATTACH a commit to a (possibly
+        foreign) task."""
         kw_task = local_sprint.get(task_key, {})
         keywords = [e.get("word", "").lower() for e in kw_task.get("keywords", [])
                      if e.get("word") and e.get("word", "").lower() not in _NOISE_KEYWORDS]
@@ -1277,8 +1312,11 @@ def generate_jira_suggestions(
         for subj in all_commits:
             if _is_noise_commit(subj):
                 continue
-            text = _commit_match_text(subj)
-            text_ns = re.sub(r"\s+", "", text)
+            if body_aware:
+                text, text_ns = _mt[subj], _mt_ns[subj]
+            else:
+                text = subj.lower()
+                text_ns = re.sub(r"\s+", "", text)
             if any(_term_in(term, text, text_ns) for term in search_terms):
                 matched.append(subj)
         return matched[:5]
@@ -1511,9 +1549,7 @@ def generate_jira_suggestions(
     for subj in all_commits:
         if _is_noise_commit(subj):
             continue
-        text = _commit_match_text(subj)
-        text_ns = re.sub(r"\s+", "", text)
-        if not any(_term_in(kw, text, text_ns) for kw in all_keywords):
+        if not any(_term_in(kw, _mt[subj], _mt_ns[subj]) for kw in all_keywords):
             unmatched_commits.append(subj)
 
     # Group unmatched commits and suggest subtask additions
@@ -1526,12 +1562,6 @@ def generate_jira_suggestions(
         if not _active_parents:
             _active_parents = [t for t in sprint_tasks if t.get("status") in ("예정", "pending")]
 
-        # Cross-epic leak guard: when several epics share one sprint and no epic_scope
-        # is configured, a zero-overlap commit must NOT be parked on an arbitrary OTHER
-        # epic's task (the historical leak). Detect that ambiguity once.
-        _epic_keys_present = {t.get("epic_key") for t in _active_parents if t.get("epic_key")}
-        _multi_epic_unscoped = (not epic_scope) and len(_epic_keys_present) > 1
-
         def _pick_parent(commit_subj: str) -> tuple[dict[str, Any] | None, int]:
             """Return (best parent, word-overlap score). score 0 = no lexical overlap
             with any active task title — a guess, not a real match."""
@@ -1540,7 +1570,7 @@ def generate_jira_suggestions(
             # Include capped body tokens so a zero-subject-overlap commit can still
             # find its right parent via body context (epic isolation upstream bounds
             # the cross-epic risk; the 3-line cap bounds the noise).
-            subj_words = {w for w in re.split(r"[\s,/\-_:()]+", _commit_match_text(commit_subj)) if len(w) >= 3}
+            subj_words = {w for w in re.split(r"[\s,/\-_:()]+", _mt.get(commit_subj, commit_subj.lower())) if len(w) >= 3}
             best = _active_parents[0]
             best_score = -1
             for cand in _active_parents:
@@ -1606,7 +1636,11 @@ def generate_jira_suggestions(
         ttitle = task.get("title", "")
         if task.get("status") in ("완료", "done"):
             continue
-        task_commits = _match_commits_for(ttitle, tkey)
+        # In a multi-epic shared sprint with no epic_scope, require a SUBJECT match to
+        # attach — a body token coincidentally naming another epic's task would otherwise
+        # leak across epics (the body-matching change reopened the #5 leak on this path).
+        # Single-epic / epic_scoped paths keep full subject+body matching.
+        task_commits = _match_commits_for(ttitle, tkey, body_aware=not _multi_epic_unscoped)
         if not task_commits:
             continue
         # Check which commits are NOT covered by any subtask title
@@ -1652,17 +1686,21 @@ def generate_jira_suggestions(
     # suggestion produces nothing today — visible work, silent tool. Emit a low-friction
     # 'comment' suggestion (non-destructive, reversible; the type is wired end-to-end —
     # icon/label/jira_proxy add_comment — but was never emitted) to surface the activity.
-    _rule_keys = {s.get("task_key") for s in suggestions
-                  if s.get("type") in ("complete", "transition")}
+    # Exclude tasks that already produced ANY card (complete/transition/add_subtask) so a
+    # comment doesn't pile a second card on the same evidence and burn the cap.
+    _covered_keys = {s.get("task_key") for s in suggestions
+                     if s.get("type") in ("complete", "transition", "add_subtask")}
     for task in sprint_tasks:
         if len(suggestions) >= max_suggestions:
             break
         if task.get("status") not in ("진행 중", "in_progress"):
             continue
         tkey = task.get("key", "")
-        if not tkey or tkey in _rule_keys:
+        if not tkey or tkey in _covered_keys:
             continue
-        tcommits = _match_commits_for(task.get("title", ""), tkey)
+        # Subject-only under multi-epic ambiguity (same leak guard as the matched-parent
+        # loop) so a body-only foreign-epic match can't surface as a comment either.
+        tcommits = _match_commits_for(task.get("title", ""), tkey, body_aware=not _multi_epic_unscoped)
         if len(tcommits) < 2:
             continue
         sid += 1
