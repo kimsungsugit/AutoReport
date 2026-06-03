@@ -208,13 +208,31 @@ def _load_suggestions(target_date: str | None = None) -> tuple[Path | None, dict
     try:
         with open(path, encoding="utf-8") as f:
             return path, json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError) as exc:
+        # Don't silently pretend the sprint is empty: a torn/partial read (the file is
+        # written non-atomically by the regenerator) would otherwise show "0 제안" and an
+        # approve could write the empty dict back, wiping every pending suggestion.
+        print(f"[jira_proxy] _load_suggestions failed for {path}: {exc!r}", file=sys.stderr)
         return path, {"date": "", "suggestions": []}
 
 
 def _save_suggestions(path: Path, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    # Atomic write (temp + os.replace) so a concurrent reader never sees a partial file
+    # and a crash mid-write can't truncate the existing suggestions.
+    import tempfile
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _last_error() -> str:

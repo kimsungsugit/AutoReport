@@ -511,6 +511,29 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def write_text_atomic(path: Path, text: str) -> None:
+    """Write via a same-dir temp file + os.replace so a crash or a concurrent reader
+    never sees a partial/empty file. Used for the suggestions JSON, which a separate
+    long-running jira_proxy process reads and rewrites (a torn read there silently
+    degrades to an empty list and can wipe pending suggestions)."""
+    import os
+    import tempfile
+    ensure_parent(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)  # atomic on same volume (NTFS + POSIX)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def cleanup_legacy_jira_outputs(output_root: Path, today: date) -> None:
     jira_dir = output_root / "reports" / "jira"
     legacy_names = [
@@ -1256,11 +1279,21 @@ def generate_jira_suggestions(
         return (subj + " " + body).lower() if body else subj.lower()
 
     _pat_cache: dict[str, re.Pattern[str]] = {}
+    # Inflectional-suffix allowlist for English keyword recall: task titles carry the
+    # noun ('report') while commits use verb/plural forms ('reporting'/'reports').
+    # Applied ONLY to single-token Latin terms len>=4, so it cannot widen short terms
+    # into wrong matches (scan↛scandal, mark↛market — those suffixes aren't listed).
+    # Scoped to the suggestion path's _en_pat; the shared _keyword_pattern (used by
+    # match_commits_to_tasks) stays strict.
+    _STEM_SUFFIX = r"(?:s|es|ed|ing|er|ers|or|ors|ion|ions|ation|ations|ment|ments|able|ible)?"
 
     def _en_pat(term: str) -> re.Pattern[str]:
         p = _pat_cache.get(term)
         if p is None:
-            p = _keyword_pattern(term)
+            if len(term) >= 4 and re.fullmatch(r"[a-z0-9]+", term):
+                p = re.compile(rf"(?<![a-z0-9]){re.escape(term)}{_STEM_SUFFIX}(?![a-z0-9])", re.IGNORECASE)
+            else:
+                p = _keyword_pattern(term)
             _pat_cache[term] = p
         return p
 
@@ -5263,7 +5296,7 @@ def main() -> int:
             )
             if _jira_suggestions:
                 sugg_path = output_root / "reports" / "jira" / f"{today.isoformat()}-jira-suggestions.json"
-                write_text(sugg_path, json.dumps(
+                write_text_atomic(sugg_path, json.dumps(
                     {"date": today.isoformat(), "suggestions": _jira_suggestions},
                     ensure_ascii=False, indent=2,
                 ))

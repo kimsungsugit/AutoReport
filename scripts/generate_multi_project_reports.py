@@ -359,6 +359,23 @@ def _build_jira_sections(run_date: str) -> tuple[str, str]:
                         s["id"] = f"{proj_prefix}-{s.get('id', '')}"
                         s["_project"] = proj_prefix
                         merged_suggestions.append(s)
+        # Cross-project suggestion dedup: when projects share a sprint (or one lacks an
+        # epic_key so the full shared task list is returned), two projects can each emit
+        # an identical date-based complete/transition/comment card for the same task_key,
+        # and the epic-grouped panel would otherwise show it twice (a reviewer could
+        # complete the same issue twice). Collapse byte-identical (task_key, type,
+        # suggested_text) cards, keeping the first with its prefixed id; distinct
+        # add_subtask cards (each keyed by its own repo's commit text) survive.
+        if merged_suggestions:
+            _seen_sig: set[tuple[str, str, str]] = set()
+            _deduped: list[dict[str, Any]] = []
+            for s in merged_suggestions:
+                sig = (s.get("task_key", ""), s.get("type", ""), s.get("suggested_text", ""))
+                if sig in _seen_sig:
+                    continue
+                _seen_sig.add(sig)
+                _deduped.append(s)
+            merged_suggestions = _deduped
         suggestions_html = html_jira_suggestions_panel(merged_suggestions) if merged_suggestions else ""
 
         scripts = ""

@@ -23,6 +23,7 @@ from scripts.generate_periodic_reports import (
     _scope_tasks_to_epic,
     _log_swallowed,
     generate_jira_suggestions,
+    write_text_atomic,
 )
 
 
@@ -1149,19 +1150,81 @@ class TestGenerateJiraSuggestions:
         assert any(s["task_key"] == "MINE-1" for s in adds), "겹침 있는 커밋은 올바른 작업에 붙어야 함"
         assert not any(s["task_key"] == "OTH-1" for s in adds), "남의 에픽엔 안 붙음"
 
-    def test_rule2_high_from_body_evidence(self):
-        """Rule 2 high 는 body 증거로도 정당하게 승격된다 (가장 결과 큰 출력 경로 보호)."""
+    def test_rule2_body_evidence_calibration(self):
+        """Rule 2 신뢰도 보정: 단일 body-only 매칭은 thin → medium(점검 필요), subject 또는
+        2건 이상 body 매칭이라야 high(종료 요청). high 는 배치승인 신호라 증거 기준을 높인다.
+        """
+        base = {"key": "BOD-1", "title": "위협분석 모델",
+                "start": "2026-05-01", "end": "2026-05-15",  # overdue vs today 2026-05-22 (7일)
+                "status": "in_progress", "subtasks": []}
+        # (1) 단일 body-only → medium + '점검 필요', 제목에 '완료 처리' 없음
+        r1 = generate_jira_suggestions(_suggestion_payload(
+            [dict(base)], ["feat(tara): work"],
+            {"feat(tara): work": "- ISO 26262 HARA 위협분석 데이터모델"}), None)
+        c1 = [s for s in r1 if s["type"] == "complete" and s["task_key"] == "BOD-1"][0]
+        assert c1["confidence"] == "medium"
+        assert "점검 필요" in c1["suggested_text"]
+        assert "완료 처리" not in c1["title"], "low/medium 카드는 제목에 '완료 처리' 단정 금지"
+        # (2) 2건 body 매칭 → high + '종료 요청합니다.'
+        r2 = generate_jira_suggestions(_suggestion_payload(
+            [dict(base)], ["feat(tara): work", "fix(tara): patch"],
+            {"feat(tara): work": "- HARA 위협분석 1", "fix(tara): patch": "- 위협분석 개선"}), None)
+        c2 = [s for s in r2 if s["type"] == "complete" and s["task_key"] == "BOD-1"][0]
+        assert c2["confidence"] == "high"
+        assert "종료 요청합니다." in c2["suggested_text"]
+        assert "완료 처리" in c2["title"]
+
+    def test_status_cards_never_carry_description(self):
+        """complete/transition 카드는 suggested_description 이 항상 ""(빈 값) — 승인 시
+        기존 Jira 설명을 stale 스냅샷으로 덮어쓰지 않게(데이터 손실 방지)."""
+        sprint = [
+            # Rule 1: 부작업 전부 done → 완료
+            {"key": "R1", "title": "rule one", "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "description": "기존 설명 1",
+             "subtasks": [{"key": "R1-1", "title": "s", "status": "done", "description": "sub d"}]},
+            # Rule 3: 시작일 도래 + pending → 전환
+            {"key": "R3", "title": "rule three", "start": "2026-05-01", "end": "2099-12-31",
+             "status": "pending", "description": "기존 설명 3", "subtasks": []},
+            # Rule 2: 마감 도래 → 완료(점검)
+            {"key": "R2", "title": "rule two", "start": "2026-05-01", "end": "2026-05-10",
+             "status": "in_progress", "description": "기존 설명 2", "subtasks": []},
+        ]
+        result = generate_jira_suggestions(_suggestion_payload(sprint), None)
+        status_cards = [s for s in result if s["type"] in ("complete", "transition")]
+        assert status_cards, "complete/transition 카드가 있어야 함"
+        assert all(s["suggested_description"] == "" for s in status_cards), \
+            f"상태 카드는 설명을 비워야 함: {[(s['task_key'], s['suggested_description']) for s in status_cards]}"
+
+    def test_orphan_suppressed_is_logged(self, capsys):
+        """다중 에픽 미설정에서 억제된 zero-overlap 커밋은 stderr 로 로깅된다
+        ('0 제안'을 covered 와 구분 — unmatched/cap 로그와 대칭)."""
+        sprint = [
+            {"key": "OTH-1", "title": "alpha", "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-OTHER"},
+            {"key": "MINE-1", "title": "bravo", "start": "2026-05-01", "end": "2099-12-31",
+             "status": "in_progress", "subtasks": [], "epic_key": "E-MINE"},
+        ]
+        commits = ["feat: zzqqxx wibwob"]  # 두 제목과 겹침 0 → 억제
+        generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        err = capsys.readouterr().err
+        assert "orphan_suppressed" in err, f"억제된 orphan 이 stderr 로 로깅돼야 함: {err}"
+
+    def test_progress_comment_dedups_near_duplicate_subjects(self):
+        """진행노트 comment 는 prefix 가 같은 near-dup 커밋 제목을 한 줄로 합친다."""
         sprint = [{
-            "key": "BOD-1", "title": "위협분석 모델",
-            "start": "2026-05-01", "end": "2026-05-15",  # overdue vs today 2026-05-22
-            "status": "in_progress", "subtasks": [],
+            "key": "PC-1", "title": "telemetry buffer flush",
+            "start": "2099-01-01", "end": "2099-12-31",  # 부작업/룰 inert
+            "status": "in_progress",
+            # 부작업이 커밋 토큰을 덮어 add_subtask 미발생 → comment 단독
+            "subtasks": [{"key": "PC-1-1", "title": "telemetry buffer flush done redo",
+                          "status": "pending"}],
         }]
-        commits = ["feat(tara): work"]  # subject 겹침 0
-        bodies = {"feat(tara): work": "- ISO 26262 HARA 위협분석 데이터모델"}
-        result = generate_jira_suggestions(_suggestion_payload(sprint, commits, bodies), None)
-        comp = [s for s in result if s["type"] == "complete" and s["task_key"] == "BOD-1"]
-        assert comp and comp[0]["confidence"] == "high"
-        assert "종료 요청합니다." in comp[0]["suggested_text"]
+        commits = ["feat: telemetry buffer flush done", "fix: telemetry buffer flush redo"]
+        result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
+        comments = [s for s in result if s["type"] == "comment" and s["task_key"] == "PC-1"]
+        assert comments, "comment 가 나와야 함"
+        txt = comments[0]["suggested_text"]
+        assert txt.count("telemetry") == 1, f"near-dup 제목이 1건으로 dedup 돼야 함: {txt}"
 
     def test_english_token_word_boundary_no_false_coverage(self):
         """짧은 영어 토큰('api')이 부분문자열로 무관 커밋('rapid')을 covered 처리하면 안 됨."""
@@ -1389,3 +1452,37 @@ class TestDefaultKeywordsFromTitle:
         # 한국어 2자 단어들이 다 제외되더라도 split 자체는 동작해야 함
         # → 결과는 [] 일 수 있지만 예외 발생하면 안 됨
         assert isinstance(kws, list)
+
+
+class TestWriteTextAtomic:
+    """제안 JSON 의 원자적 쓰기 — 별도 jira_proxy 프로세스가 같은 파일을 읽/쓰기하므로
+    torn/partial 파일이 보이면 안 된다."""
+
+    def test_writes_content_and_leaves_no_temp(self, tmp_path):
+        p = tmp_path / "sub" / "f.json"  # 부모 디렉토리 자동 생성
+        write_text_atomic(p, '{"a": 1}')
+        assert p.read_text(encoding="utf-8") == '{"a": 1}'
+        assert not list(tmp_path.glob("**/*.tmp")), "임시 파일이 남으면 안 됨"
+
+    def test_overwrite_is_complete(self, tmp_path):
+        p = tmp_path / "f.json"
+        write_text_atomic(p, "old-content")
+        write_text_atomic(p, "new-content")
+        assert p.read_text(encoding="utf-8") == "new-content"
+
+    def test_failed_write_preserves_previous_file(self, tmp_path, monkeypatch):
+        """쓰기 도중 실패해도 기존 완전한 파일이 보존된다(truncate 안 됨)."""
+        import os as _os
+        p = tmp_path / "f.json"
+        write_text_atomic(p, "good")
+        real_replace = _os.replace
+
+        def boom(src, dst):
+            raise OSError("simulated crash before replace")
+
+        monkeypatch.setattr(_os, "replace", boom)
+        with pytest.raises(OSError):
+            write_text_atomic(p, "partial-never-lands")
+        monkeypatch.setattr(_os, "replace", real_replace)
+        assert p.read_text(encoding="utf-8") == "good", "실패 시 기존 파일이 보존돼야 함"
+        assert not list(tmp_path.glob("**/*.tmp")), "실패 시 임시 파일 정리돼야 함"
