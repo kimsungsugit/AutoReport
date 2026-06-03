@@ -1470,6 +1470,67 @@ class TestDefaultKeywordsFromTitle:
         assert isinstance(kws, list)
 
 
+class TestCsrfGuard:
+    """jira_proxy 의 CSRF 가드: 비가역 Jira-write POST 는 per-process 토큰 필요."""
+
+    def _serve(self):
+        from scripts import jira_proxy as jp
+        import threading
+        srv = jp._ReusableHTTPServer(("127.0.0.1", 0), jp.ProxyHandler)  # ephemeral port
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return jp, srv, port
+
+    def _post(self, port, path, headers=None):
+        import urllib.request
+        import urllib.error
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}", data=b"{}", method="POST",
+            headers={"Content-Type": "application/json", **(headers or {})})
+        try:
+            r = urllib.request.urlopen(req, timeout=5)
+            return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_post_without_token_is_403(self):
+        jp, srv, port = self._serve()
+        try:
+            code, _ = self._post(port, "/api/suggestions/x/approve")
+            assert code == 403, f"토큰 없는 Jira-write POST 는 403 이어야 함: {code}"
+        finally:
+            srv.shutdown()
+
+    def test_post_with_valid_token_passes_csrf_gate(self):
+        jp, srv, port = self._serve()
+        try:
+            # 유효 토큰 → CSRF 게이트 통과(403 아님). 빈 body 라 이후 400 으로 떨어지지만
+            # 핵심은 403 이 아니라는 것(토큰이 게이트를 통과시킴).
+            code, _ = self._post(port, "/api/suggestions/x/approve",
+                                 {"X-Proxy-Token": jp.PROXY_TOKEN})
+            assert code != 403, f"유효 토큰이면 CSRF 게이트 통과해야 함: {code}"
+        finally:
+            srv.shutdown()
+
+    def test_served_dashboard_injects_token_script(self, tmp_path, monkeypatch):
+        """프록시가 serve 시 토큰+fetch 래퍼 스크립트를 주입한다(정적 HTML 재생성 불필요)."""
+        from scripts import jira_proxy as jp
+        import urllib.request
+        dash_dir = tmp_path / "reports" / "projects" / "X" / "reports" / "dashboard"
+        dash_dir.mkdir(parents=True)
+        dash = dash_dir / "2026-06-03-startup-dashboard.html"
+        dash.write_text("<!DOCTYPE html><html><head><title>t</title></head><body>x</body></html>",
+                        encoding="utf-8")
+        monkeypatch.setattr(jp, "REPO_ROOT", tmp_path)
+        _, srv, port = self._serve()
+        try:
+            html = urllib.request.urlopen(f"http://127.0.0.1:{port}/dashboard", timeout=5).read().decode()
+            assert "window.__PROXY_TOKEN__" in html and jp.PROXY_TOKEN in html, "토큰 주입돼야 함"
+            assert "X-Proxy-Token" in html, "fetch 래퍼 주입돼야 함"
+        finally:
+            srv.shutdown()
+
+
 class TestWriteTextAtomic:
     """제안 JSON 의 원자적 쓰기 — 별도 jira_proxy 프로세스가 같은 파일을 읽/쓰기하므로
     torn/partial 파일이 보이면 안 된다."""

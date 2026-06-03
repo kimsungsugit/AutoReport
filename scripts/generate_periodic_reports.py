@@ -4554,7 +4554,10 @@ REGENERATE_SCRIPT = """
           .then(r => r.ok ? r.json() : Promise.reject())
           .then(() => {
             if (btn) { btn.disabled = false; btn.textContent = '프록시 재시작'; }
-            if (typeof jiraToast === 'function') jiraToast('프록시 재시작 완료');
+            if (typeof jiraToast === 'function') jiraToast('프록시 재시작 완료 — 새 토큰 적용 위해 새로고침');
+            // The restarted proxy has a new CSRF token; reload so the served page picks
+            // it up (writes from the stale page would otherwise 403).
+            setTimeout(() => location.reload(), 1200);
           })
           .catch(() => {
             if (Date.now() < deadline) {

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -31,6 +32,26 @@ from workflow.task_provider import get_task_provider
 
 PORT = 18923
 provider = get_task_provider({"jira": {"project_key": "APPL", "sprint_id": 152}})
+
+# CSRF defense: every POST here performs an irreversible REAL Jira write (signed by the
+# user's PAT). The server is reachable by any page the user visits (localhost bind does
+# not stop the browser delivering the request), so a per-process token gates writes. The
+# proxy injects it into the dashboard HTML it serves; a cross-origin attacker page cannot
+# read it, so a drive-by fetch is rejected. Regenerated each start → reload the page (no
+# dashboard regeneration) to pick up a new token after a restart.
+PROXY_TOKEN = secrets.token_urlsafe(24)
+
+
+def _csrf_inject_script() -> str:
+    """A <script> that exposes the per-process token and wraps fetch() to attach it to
+    every POST automatically (so individual call sites don't each need editing)."""
+    return (
+        "<script>window.__PROXY_TOKEN__=" + json.dumps(PROXY_TOKEN) + ";"
+        "(function(){var _f=window.fetch;window.fetch=function(u,o){o=o||{};"
+        'if(String(o.method||"GET").toUpperCase()==="POST"){'
+        'o.headers=Object.assign({},o.headers||{},{"X-Proxy-Token":window.__PROXY_TOKEN__||""});}'
+        "return _f.call(this,u,o);};})();</script>"
+    )
 
 # --- Report regeneration state ---------------------------------------------
 # A single in-flight regeneration is tracked via a lock file. The file is
@@ -404,7 +425,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
             else:
                 dashboard = _find_latest_dashboard()
             if dashboard and dashboard.exists():
-                body = dashboard.read_bytes()
+                # Inject the per-process CSRF token at serve time so the STATIC dashboard
+                # never needs regeneration — old and new dashboards both get a live token,
+                # and a proxy restart only needs a page reload. file:// access (unused) is
+                # not injected and so cannot write, which is the intended CSRF posture.
+                html = dashboard.read_bytes().decode("utf-8", errors="replace")
+                inject = _csrf_inject_script()
+                if "<head>" in html:
+                    html = html.replace("<head>", "<head>" + inject, 1)
+                elif "<body>" in html:
+                    html = html.replace("<body>", "<body>" + inject, 1)
+                else:
+                    html = inject + html
+                body = html.encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -420,6 +453,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         body = _read_body(self)
+
+        # CSRF guard: every POST is a state-changing / irreversible Jira-write action, so
+        # require the per-process token the proxy injected into the dashboard. A
+        # cross-origin attacker page can't read it → drive-by Jira mutation is rejected.
+        # A stale page (old token after a restart) gets a clear "reload" message.
+        if self.headers.get("X-Proxy-Token") != PROXY_TOKEN:
+            _json_response(self, {"ok": False, "error": "forbidden — 페이지를 새로고침하세요 (토큰 만료/누락)"}, 403)
+            return
 
         # POST /api/regenerate
         if path == "/api/regenerate":
