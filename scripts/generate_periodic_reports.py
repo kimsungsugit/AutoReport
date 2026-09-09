@@ -45,7 +45,38 @@ def load_get_adapter():
 get_adapter = load_get_adapter()
 
 
-def _drop_if_expired(data: dict[str, Any]) -> dict[str, Any]:
+# Sprint-wide git evidence window. 50 was far too small for active repos (a 5-month
+# sprint on CyberSecurity has 600+ commits), which silently starved Rule 1/2 of evidence.
+_GIT_EVIDENCE_CAP = 1500
+
+# Dashboard suggestion cap. 10 was set when a sprint held a dozen tasks; a sprint
+# with hundreds of issues silently dropped most cards (only the log showed it), so
+# a whole week of finished work could stay invisible. Per-project override:
+# startup_projects.json → jira.max_suggestions.
+_DEFAULT_MAX_SUGGESTIONS = 60
+_MAX_SUGGESTIONS_LIMIT = 300
+
+
+def _resolve_max_suggestions(payload: dict[str, Any], explicit: int | None) -> int:
+    """Cap size: explicit argument > project config > default, clamped to 1..300."""
+    value = explicit
+    if value is None:
+        cfg = payload.get("jira_config")
+        if isinstance(cfg, dict):
+            raw = cfg.get("max_suggestions")
+            if raw is not None:
+                try:
+                    value = int(raw)
+                except (TypeError, ValueError):
+                    value = None
+    if value is None:
+        value = _DEFAULT_MAX_SUGGESTIONS
+    return max(1, min(int(value), _MAX_SUGGESTIONS_LIMIT))
+
+
+def _drop_if_expired(
+    data: dict[str, Any], reference_day: date | None = None
+) -> dict[str, Any]:
     """Return {} if the sprint window already ended — avoids leaking stale Jira data
     into reports when the next sprint hasn't been opened on the server side yet."""
     if not data:
@@ -55,7 +86,7 @@ def _drop_if_expired(data: dict[str, Any]) -> dict[str, Any]:
     if not end:
         return data
     try:
-        if date.fromisoformat(end) < date.today():
+        if date.fromisoformat(end) < (reference_day or date.today()):
             return {}
     except (ValueError, TypeError):
         pass
@@ -386,6 +417,145 @@ def get_commits(repo_root: Path, branch: str, start_day: date, end_day: date) ->
     return parse_commits(raw)
 
 
+def _commit_url(remote_url: str, full_hash: str) -> str:
+    """Build a human-facing commit URL without assuming the commit is pushed yet."""
+    cleaned = (remote_url or "").strip()
+    if not cleaned or cleaned == "-":
+        return ""
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+    if cleaned.startswith("git@") and ":" in cleaned:
+        host_path = cleaned[4:]
+        host, path = host_path.split(":", 1)
+        cleaned = f"https://{host}/{path}"
+    if not cleaned.startswith(("http://", "https://")):
+        return ""
+    return f"{cleaned.rstrip('/')}/commit/{full_hash}"
+
+
+_EXECUTABLE_VALIDATION_COMMAND_RE = re.compile(
+    r"(?i)(?:^|[:：]\s*|[`'\"])(?:"
+    r"(?:python\s+-m\s+)?pytest\b|python\s+-m\s+unittest\b|"
+    r"python\s+-m\s+compileall\b|npm(?:\.cmd)?\s+(?:run\s+)?test\b|"
+    r"dotnet\s+test\b|node\s+--check\b|ruff\b|mypy\b|"
+    r"cargo\s+test\b|go\s+test\b|mvn\s+test\b|gradle(?:w)?\s+test\b)"
+)
+
+
+def _is_executable_validation_line(value: Any) -> bool:
+    """Reject headings and analysis prose; keep only an executable command line."""
+    return bool(_EXECUTABLE_VALIDATION_COMMAND_RE.search(str(value or "").strip()))
+
+
+def collect_commit_evidence(
+    repo_root: Path,
+    commits: list[Commit],
+    remote_url: str,
+    github_meta: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Preserve commit-level evidence for plans and Jira traceability.
+
+    The legacy payload kept only the short hash and subject, so Jira proposals lost
+    the commit body, changed files, validation notes, and even the exact SHA.  This
+    collector deliberately uses local git as the source of truth; remote availability
+    is recorded separately because a valid local commit may still be awaiting push.
+    """
+    remote_shas = {
+        str(item.get("sha") or "")[:7]
+        for item in ((github_meta or {}).get("commits") or [])
+        if item.get("sha")
+    }
+    evidence: list[dict[str, Any]] = []
+    for commit in commits[:20]:
+        raw = run_git(
+            repo_root,
+            ["show", "-s", "--format=%H%x1f%B", commit.short_hash],
+            check=False,
+        )
+        full_hash, _, body = raw.partition(FIELD_SEP)
+        full_hash = full_hash.strip() or commit.short_hash
+        body = body.strip()
+        files_raw = run_git(
+            repo_root,
+            ["diff-tree", "--no-commit-id", "--name-only", "-r", full_hash],
+            check=False,
+        )
+        files = [line.strip() for line in files_raw.splitlines() if line.strip()]
+        numstat_raw = run_git(
+            repo_root,
+            ["show", "--numstat", "--format=", full_hash],
+            check=False,
+        )
+        added = deleted = 0
+        for line in numstat_raw.splitlines():
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                continue
+            if parts[0].isdigit():
+                added += int(parts[0])
+            if parts[1].isdigit():
+                deleted += int(parts[1])
+        jira_keys = sorted(set(re.findall(
+            r"\b[A-Z][A-Z0-9]+-[0-9]+\b",
+            f"{commit.subject}\n{body}",
+        )))
+        body_lines = [
+            re.sub(r"^[\s*+-]+", "", line).strip()
+            for line in body.splitlines()
+            if line.strip()
+        ]
+        validation = [
+            line for line in body_lines
+            if _is_executable_validation_line(line)
+        ][:12]
+        validation_environment = []
+        for line in body_lines:
+            match = re.match(
+                r"(?i)^(?:validation environment|test environment|environment|"
+                r"검증 환경|테스트 환경|실행 환경)\s*[:：]\s*(.+)$",
+                line,
+            )
+            if match and match.group(1).strip():
+                validation_environment.append(match.group(1).strip())
+        executed_validation: list[dict[str, str]] = []
+        verification_plan: list[dict[str, str]] = []
+        try:
+            from workflow.jira_planning import parse_validation_evidence
+
+            validation_inputs = [
+                {
+                    "text": line,
+                    "environment": "; ".join(validation_environment),
+                }
+                for line in validation
+            ]
+            executed_validation, verification_plan = parse_validation_evidence(
+                validation_inputs,
+                source=f"commit:{full_hash}",
+            )
+        except (ImportError, TypeError, ValueError) as exc:
+            _log_swallowed("collect_commit_evidence/validation", exc)
+        evidence.append({
+            "hash": full_hash,
+            "short_hash": full_hash[:7],
+            "time": commit.authored_at,
+            "author": commit.author,
+            "subject": commit.subject,
+            "body": body,
+            "url": _commit_url(remote_url, full_hash),
+            "remote_synced": full_hash[:7] in remote_shas,
+            "files": files[:80],
+            "added_lines": added,
+            "deleted_lines": deleted,
+            "jira_keys": jira_keys,
+            "validation": validation,
+            "executed_validation": executed_validation,
+            "verification_plan": verification_plan,
+            "validation_environment": validation_environment,
+        })
+    return evidence
+
+
 def get_changed_files(repo_root: Path, branch: str, start_day: date, end_day: date) -> list[str]:
     start_iso = datetime.combine(start_day, time.min).isoformat()
     end_iso = datetime.combine(end_day + timedelta(days=1), time.min).isoformat()
@@ -563,9 +733,30 @@ def merge_suggestion_status(fresh: list[dict[str, Any]], existing_path: Path) ->
         if not prev:
             continue
         s["status"] = prev.get("status", s.get("status"))
-        for k in ("suggested_text", "suggested_description"):
-            if prev.get(k):
+        # Preserve the exact reviewed editable values and Jira/outbox trace. Using
+        # membership (not truthiness) retains an intentionally-cleared description.
+        for k in (
+            "suggested_text",
+            "suggested_description",
+            "start",
+            "end",
+            "report_required",
+            "created_task_key",
+            "jira_operation_id",
+            "jira_proposal_marker",
+            "jira_outbox_state",
+            "jira_review_revision",
+            "jira_applied_revision",
+        ):
+            if k in prev:
                 s[k] = prev[k]
+        if s.get("type") == "create_task":
+            try:
+                from workflow.jira_apply import proposal_revision
+
+                s["proposal_revision"] = proposal_revision(s)
+            except Exception as exc:
+                _log_swallowed("merge_suggestion_status/proposal_revision", exc)
         carried += 1
     if carried:
         _log_swallowed(
@@ -981,7 +1172,7 @@ def build_context_payload(
     # Shared-sprint isolation: scope this repo's sprint_tasks to its configured 큰틀
     # (Epic) so the board / completed / in_progress lists / Gemini prompt / fact-override
     # all see only this project's tasks — not other projects sharing the same Jira sprint.
-    _jira_cfg = _project_jira_for_repo(repo_root) if jira_enabled else None
+    _jira_cfg = _project_jira_for_repo(repo_root)
     epic_scope = str((_jira_cfg or {}).get("epic_key") or "")
     if jira_enabled:
         _sprint_tasks = _scope_tasks_to_epic(
@@ -995,6 +1186,12 @@ def build_context_payload(
         )
     else:
         _sprint_tasks = []
+    commit_evidence = collect_commit_evidence(
+        repo_root,
+        commits,
+        remote_url,
+        github_meta,
+    )
     return {
         "today": today.isoformat(),
         "report_type": report_type,
@@ -1020,15 +1217,19 @@ def build_context_payload(
         "auto_commit_status": auto_commit_status or {},
         "top_areas": [{"area": area, "count": count} for area, count in top_directories(changed_files, limit=8)],
         "diff_summary": diff_summary,
-        "recent_commits": [
-            {"hash": c.short_hash, "time": c.authored_at, "author": c.author, "subject": c.subject}
-            for c in commits[:20]
-        ],
+        "recent_commits": commit_evidence,
         "changed_files": changed_files[:80],
         "changed_docs": changed_markdown_docs(changed_files)[:20],
         "uncommitted": uncommitted[:30],
         "github": github_meta,
         "jira_enabled": jira_enabled,
+        "jira_planning_enabled": bool((_jira_cfg or {}).get("auto_plan", False)),
+        "jira_project_key": str(
+            (_jira_cfg or {}).get("project_key")
+            or os.environ.get("JIRA_PROJECT_KEY")
+            or ""
+        ),
+        "jira_config": dict(_jira_cfg or {}),
         "epic_scope": epic_scope,
         "sprint_tasks": _sprint_tasks,
     }
@@ -1059,19 +1260,394 @@ def _build_sprint_summary(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return summary
 
 
+def _jira_wiki_list(items: list[str]) -> str:
+    """Bullet list, or "" when there is nothing to say.
+
+    Empty returns "" (not "* 없음") so _jira_plan_description can drop the whole
+    section — a heading over "없음" is noise in the Jira body, not information.
+    """
+    return "\n".join(f"* {item}" for item in items if str(item).strip())
+
+
+_SCOPE_RENDER_LIMIT = 8
+
+
+def _jira_wiki_list_capped(items: list[str], limit: int = _SCOPE_RENDER_LIMIT) -> str:
+    """Bullet list truncated for reading, with the remainder shown as a count.
+
+    Render-time only: ``proposal['scope']`` keeps every entry, because the quality
+    gate anchors task-specific risks on the full scope/source_files token set.
+    A 26-file commit otherwise opened the ticket with a 26-line wall.
+    """
+    cleaned = [str(item) for item in items if str(item).strip()]
+    if len(cleaned) <= limit:
+        return _jira_wiki_list(cleaned)
+    body = _jira_wiki_list(cleaned[:limit])
+    return f"{body}\n* 외 {len(cleaned) - limit}개"
+
+
+_SUBTASK_RENDER_LIMIT = 5
+
+
+def _jira_subtask_lines(items: list[Any], limit: int = _SUBTASK_RENDER_LIMIT) -> str:
+    """Render the work breakdown as numbered bullets: title — 설명 (완료: 조건).
+
+    Kept in the description rather than created as real Jira 부작업: creating
+    issues is a Jira write, and this pipeline is review-gated. A reviewer reads
+    the breakdown here and decides.
+    """
+    rendered: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            summary = str(item.get("summary") or "").strip()
+            description = str(item.get("description") or "").strip()
+            criteria = [
+                str(entry).strip()
+                for entry in (item.get("acceptance_criteria") or [])
+                if str(entry).strip()
+            ]
+        else:
+            summary, description, criteria = str(item or "").strip(), "", []
+        if not summary:
+            continue
+        line = f"*{len(rendered) + 1}. {summary}*"
+        if description:
+            line += f" — {description}"
+        if criteria:
+            line += f" (완료: {'; '.join(criteria)})"
+        rendered.append(line)
+    if len(rendered) <= limit:
+        return _jira_wiki_list(rendered)
+    body = _jira_wiki_list(rendered[:limit])
+    return f"{body}\n* 외 {len(rendered) - limit}개"
+
+
+def _next_business_day(value: date) -> date:
+    current = value + timedelta(days=1)
+    while current.weekday() >= 5:
+        current += timedelta(days=1)
+    return current
+
+
+def _add_business_days(value: date, working_days: int) -> date:
+    current = value
+    remaining = max(0, int(working_days))
+    while remaining:
+        current += timedelta(days=1)
+        if current.weekday() < 5:
+            remaining -= 1
+    return current
+
+
+def _jira_validation_lines(items: list[Any], *, planned: bool = False) -> list[str]:
+    """Render structured validation records without mixing plans with results."""
+    lines: list[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            text = str(item or "").strip()
+            if text:
+                lines.append(text)
+            continue
+        command = str(item.get("command") or "").strip()
+        environment = str(item.get("environment") or "").strip()
+        source = str(item.get("source") or "").strip()
+        if planned:
+            expected = str(item.get("expected_result") or "").strip()
+            criteria = str(item.get("pass_criteria") or "").strip()
+            status = str(item.get("status") or "not_run").strip()
+            parts = [
+                f"명령: {command}" if command else "",
+                f"환경: {environment}" if environment else "",
+                f"기대 결과: {expected}" if expected else "",
+                f"판정 기준: {criteria}" if criteria else "",
+                f"상태: {status}",
+            ]
+        else:
+            actual = str(item.get("actual_result") or item.get("result") or "").strip()
+            exit_code = item.get("exit_code")
+            parts = [
+                f"명령: {command}" if command else "",
+                f"환경: {environment}" if environment else "",
+                f"실제 결과: {actual}" if actual else "",
+                f"종료 코드: {exit_code}" if exit_code not in (None, "") else "",
+                f"출처: {source}" if source else "",
+            ]
+        rendered = " | ".join(part for part in parts if part)
+        if rendered:
+            lines.append(rendered)
+    return lines
+
+
+# Developer shorthand that a manager cannot read. Commit subjects arrive with
+# conventional-commit prefixes, short shas, file paths and §-section refs; those
+# name code, not work, and they were why the first Jira upload had to be deleted.
+_CONVENTIONAL_PREFIX_RE = re.compile(
+    r"^(?:feat|fix|docs|test|chore|refactor|perf|style|build|ci|merge|revert)"
+    r"(?:\([^)]*\))?\s*[:!]\s*", re.IGNORECASE)
+_SCOPE_PREFIX_RE = re.compile(
+    r"^(?:tara|replay|gui|cli|samples|process|quality|review|docgen|harness|"
+    r"target|trace|scheduler|channel|caps|notice|codegen|hosting|loopback)\s*:\s*",
+    re.IGNORECASE)
+_CODE_PATH_RE = re.compile(
+    r"\S*[/\\]\S+"
+    r"|\b[\w.-]+\.(?:py|js|jsx|ts|tsx|md|json|html?|xlsx|xlsm|xml|csv|asc|dbc|ldf|"
+    r"arxml|docx|bat|ps1|spec|yml|yaml|sqlite)\b")
+_SECTION_REF_RE = re.compile(r"§\s*[\d.]+[A-Za-z]*")
+_BACKTICK_RE = re.compile(r"`[^`]*`")
+_SHORT_SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+# snake_case / dotted identifiers and bare file extensions read as code to a
+# reviewer even when the surrounding sentence is Korean.
+_IDENTIFIER_RE = re.compile(
+    r"(?<![\\w])_*[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)+(?![\\w])")
+_BARE_EXT_RE = re.compile(
+    r"(?<![A-Za-z0-9])\.(?:py|js|jsx|ts|md|json|html?|xlsx|xlsm|xml|csv|asc|dbc|"
+    r"ldf|arxml|docx|bat|ps1|spec|yml|yaml|sqlite)\b", re.IGNORECASE)
+# Separators left behind once code tokens are removed ("A — + B", "A ·, B").
+_DANGLING_SEP_RE = re.compile(r"\s*[-—+·,/]{1,}(?=\s*[-—+·,/])")
+_HANGUL_RE = re.compile(r"[가-힣]")
+
+
+def _manager_phrase(text: Any) -> str:
+    """Strip code identifiers from one line so a non-engineer can read it."""
+    out = str(text or "").strip()
+    out = _CONVENTIONAL_PREFIX_RE.sub("", out)
+    out = _SCOPE_PREFIX_RE.sub("", out)
+    out = _BACKTICK_RE.sub(" ", out)
+    out = _CODE_PATH_RE.sub(" ", out)
+    out = _SECTION_REF_RE.sub(" ", out)
+    out = _SHORT_SHA_RE.sub(
+        lambda m: "" if re.search(r"[a-f]", m.group(0)) else m.group(0), out)
+    out = _IDENTIFIER_RE.sub(" ", out)
+    out = _BARE_EXT_RE.sub(" ", out)
+    out = re.sub(r"\(\s*\)|\[\s*\]", " ", out)
+    out = re.sub(r"\s{2,}", " ", out)
+    out = _DANGLING_SEP_RE.sub("", out)
+    out = re.sub(r"\s{2,}", " ", out)
+    return out.strip(" \t-—·,:;+/")
+
+
+def _reads_as_work(phrase: str) -> bool:
+    """True when the cleaned line still says something a reviewer can act on."""
+    return len(phrase) >= 4 and bool(_HANGUL_RE.search(phrase))
+
+
+def _jira_plan_description(proposal: dict[str, Any]) -> str:
+    """Render one proposal as the plain work list a manager approves.
+
+    The earlier layout (목적/문제/완료 조건/검증/리스크/근거 커밋 with sha links)
+    was written for an engineer reading a diff.  The person who approves these
+    cards is not one, so the body is now the work items and nothing else.
+    The single audit line survives: without it a plan reads as a result.
+    """
+    bullets: list[str] = []
+    for item in proposal.get("subtasks") or []:
+        raw = item.get("summary") if isinstance(item, dict) else item
+        phrase = _manager_phrase(raw)
+        if _reads_as_work(phrase):
+            bullets.append(phrase)
+    if not bullets:
+        for entry in proposal.get("scope") or []:
+            phrase = _manager_phrase(entry)
+            if _reads_as_work(phrase):
+                bullets.append(phrase)
+    if not bullets:
+        for line in str(proposal.get("outcome") or "").splitlines():
+            phrase = _manager_phrase(line)
+            if _reads_as_work(phrase):
+                bullets.append(phrase)
+    bullets = list(dict.fromkeys(bullets))[:_SCOPE_RENDER_LIMIT]
+    body = "\n".join(f"* {line}" for line in bullets)
+    executed = _jira_validation_lines(
+        list(proposal.get("executed_validation") or []), planned=False
+    )
+    if not executed:
+        body = (body + "\n* 검증 미실행").strip("\n")
+    return body
+
+
+def generate_jira_creation_suggestions(
+    payload: dict[str, Any],
+    plan_sections: dict[str, Any] | None,
+    max_suggestions: int | None = None,
+) -> list[dict[str, Any]]:
+    """Turn commit evidence + plan sections into safe create/comment proposals.
+
+    This path never emits complete/transition actions.  A commit carrying an explicit
+    Jira key binds to that issue as a progress comment; otherwise a new Task proposal is
+    produced with a deterministic Jira-side dedupe marker.
+    """
+    commits = list(payload.get("recent_commits") or [])
+    if not payload.get("jira_planning_enabled") or not commits:
+        return []
+    try:
+        from workflow.jira_planning import (
+            build_create_task_proposals,
+            enrich_proposal_quality,
+        )
+        proposals = [enrich_proposal_quality(item) for item in build_create_task_proposals(
+            commits,
+            plan_sections or {},
+            repository_url=str(payload.get("remote_url") or ""),
+            default_project_key=str(payload.get("jira_project_key") or ""),
+            default_epic_key=str(payload.get("epic_scope") or ""),
+        )]
+    except Exception as exc:
+        _log_swallowed("generate_jira_creation_suggestions", exc)
+        return []
+
+    cfg = dict(payload.get("jira_config") or {})
+    try:
+        report_day = date.fromisoformat(str(payload.get("today") or date.today().isoformat()))
+    except ValueError:
+        report_day = date.today()
+    horizon = int(cfg.get("plan_horizon_days") or 7)
+    horizon = min(max(horizon, 1), 90)
+    result: list[dict[str, Any]] = []
+    for proposal in proposals[:_resolve_max_suggestions(payload, max_suggestions)]:
+        start_day = _next_business_day(report_day)
+        raw_estimate = (proposal.get("schedule") or {}).get("estimated_working_days")
+        try:
+            estimated_working_days = int(raw_estimate or horizon)
+        except (TypeError, ValueError):
+            estimated_working_days = horizon
+        estimated_working_days = min(max(estimated_working_days, 1), horizon)
+        end_day = _add_business_days(start_day, estimated_working_days)
+        related_key = str(proposal.get("related_jira_key") or "")
+        source_commits = list(proposal.get("source_commits") or [])
+        validation = list(proposal.get("validation") or [])
+        executed_validation = list(proposal.get("executed_validation") or [])
+        verification_plan = list(proposal.get("verification_plan") or [])
+        evidence_type = str(proposal.get("evidence_type") or "plan_draft")
+        quality_score = int(proposal.get("quality_score") or 0)
+        quality_grade = str(proposal.get("quality_grade") or "draft")
+        blocking_reasons = list(proposal.get("blocking_reasons") or [])
+        auto_apply_eligible = bool(proposal.get("auto_apply_eligible"))
+        stype = "comment" if related_key else "create_task"
+        if related_key:
+            commit_lines = [
+                f"{str(c.get('sha') or '')[:12]} {c.get('subject') or ''}".strip()
+                for c in source_commits
+            ]
+            action_text = "\n".join([
+                "AutoReport 커밋/계획 진행 업데이트",
+                str(proposal.get("outcome") or ""),
+                *[f"- {line}" for line in commit_lines],
+                *[
+                    f"- 실행 검증: {line}"
+                    for line in _jira_validation_lines(executed_validation)
+                ],
+                *[
+                    f"- 향후 검증: {line}"
+                    for line in _jira_validation_lines(verification_plan, planned=True)
+                ],
+            ]).strip()
+            description = ""
+        else:
+            _raw_summary = str(proposal.get("summary") or "")
+            action_text = _manager_phrase(_raw_summary) or _raw_summary
+            description = _jira_plan_description(proposal)
+        result.append({
+            "id": proposal["id"],
+            "action": proposal.get("action") or "create_task",
+            "issue_type": proposal.get("issue_type") or "Task",
+            "task_key": related_key,
+            "type": stype,
+            "title": (
+                f"{related_key} 커밋·계획 업데이트"
+                if related_key else f"신규 작업 계획 — {proposal.get('summary', '')}"
+            ),
+            "subtitle": (
+                f"명시적 Jira 키 연결 · 근거 커밋 {len(source_commits)}건"
+                if related_key else (
+                    f"{proposal.get('project_key', '')} 신규 Task · "
+                    f"{evidence_type} · 근거 커밋 {len(source_commits)}건 · 품질 {quality_score}/100"
+                )
+            ),
+            "suggested_text": action_text,
+            "suggested_description": description,
+            "reason": (
+                f"{proposal.get('binding_source')} 우선 연결"
+                if related_key else (
+                    "기존 Jira 키가 없는 커밋과 실행 계획에서 생성"
+                    if not blocking_reasons
+                    else "품질 보완 필요: " + "; ".join(str(item) for item in blocking_reasons[:3])
+                )
+            ),
+            "confidence": (
+                "high" if related_key and source_commits and executed_validation
+                else "medium" if related_key
+                else {"high": "high", "manual": "medium", "draft": "low"}.get(
+                    quality_grade, "low"
+                )
+            ),
+            "status": "pending",
+            "project_key": proposal.get("project_key") or payload.get("jira_project_key") or "",
+            "epic_key": proposal.get("epic_key") or "",
+            "epic_summary": "커밋·계획 자동 생성",
+            "dedupe_marker": proposal.get("dedupe_marker") or "",
+            "labels": ["autoreport", f"autoreport-{proposal['id'].lower()}"],
+            "source_commits": source_commits,
+            "source_files": proposal.get("source_files") or [],
+            "grouping_rationale": proposal.get("grouping_rationale") or "",
+            "proposal_type": proposal.get("proposal_type") or evidence_type,
+            "create_suppressed": bool(proposal.get("create_suppressed")),
+            "plan_source": proposal.get("plan_source") or "",
+            "acceptance_criteria": proposal.get("acceptance_criteria") or [],
+            "validation": validation,
+            "executed_validation": executed_validation,
+            "verification_plan": verification_plan,
+            "evidence_type": evidence_type,
+            "quality_score": quality_score,
+            "quality_grade": quality_grade,
+            "quality_dimensions": proposal.get("quality_dimensions") or {},
+            "blocking_reasons": blocking_reasons,
+            "auto_apply_eligible": auto_apply_eligible,
+            "problem": proposal.get("problem") or "",
+            "outcome": proposal.get("outcome") or "",
+            "purpose": proposal.get("purpose") or "",
+            "scope": proposal.get("scope") or [],
+            "out_of_scope": proposal.get("out_of_scope") or [],
+            # Structured alongside the rendered description so the quality report
+            # and any later "create these as real 부작업" step read records rather
+            # than re-parsing wiki bullets.
+            "subtasks": proposal.get("subtasks") or [],
+            "remaining_work": proposal.get("remaining_work") or [],
+            "risks": proposal.get("risks") or [],
+            "task_specific_risks": proposal.get("task_specific_risks") or [],
+            "validation_environment": proposal.get("validation_environment") or [],
+            "schedule": proposal.get("schedule") or {},
+            "schedule_rationale": proposal.get("schedule_rationale") or "",
+            "epic_rationale": proposal.get("epic_rationale") or "",
+            "start": start_day.isoformat(),
+            "end": end_day.isoformat(),
+            "report_required": str(cfg.get("report_required") or "yes"),
+        })
+    return result
+
+
 def generate_jira_suggestions(
     payload: dict[str, Any],
     ai_sections: dict[str, Any] | None = None,
-    max_suggestions: int = 10,
+    max_suggestions: int | None = None,
 ) -> list[dict[str, Any]]:
     """Generate actionable Jira suggestions from commit-task matching and AI analysis.
 
     Returns a list of suggestion dicts with id, task_key, type, title,
     suggested_text, reason, confidence, status fields.
     """
-    # ai_sections is part of the public API but currently unused — silence Pyright
-    # without breaking callers in generate_document that pass it positionally.
-    del ai_sections
+    max_suggestions = _resolve_max_suggestions(payload, max_suggestions)
+    plan_sections = dict((ai_sections or {}).get("plan") or ai_sections or {})
+    try:
+        suggestion_day = date.fromisoformat(
+            str(payload.get("today") or date.today().isoformat())
+        )
+    except ValueError:
+        suggestion_day = date.today()
+    planning_suggestions = generate_jira_creation_suggestions(
+        payload,
+        plan_sections,
+        max_suggestions=max_suggestions,
+    )
     # Suggestions only make sense for repos whose jira is configured in
     # startup_projects.json. Previously we grabbed the *first* jira-enabled
     # project's live data unconditionally, which leaked Release_claude's APPL
@@ -1094,7 +1670,9 @@ def generate_jira_suggestions(
                             if _pp == target and isinstance(_pc.get("jira"), dict):
                                 epic_scope = str(_pc["jira"].get("epic_key") or "")
                                 provider = get_task_provider(_pc)
-                                live_data = provider.get_tasks()
+                                live_data = _drop_if_expired(
+                                    provider.get_tasks(), suggestion_day
+                                )
                                 sprint_tasks = live_data.get("tasks", [])
                                 break
         except Exception as exc:
@@ -1110,7 +1688,20 @@ def generate_jira_suggestions(
     epic_scope = epic_scope or str(payload.get("epic_scope") or "")
     sprint_tasks = _scope_tasks_to_epic(sprint_tasks, epic_scope)
     if not sprint_tasks:
-        return []
+        # Planning-only projects and expired sprints return here before the legacy
+        # task-matching pipeline.  Create cards still need the same optimistic
+        # revision used by the proxy; otherwise every approval is rejected as stale.
+        try:
+            from workflow.jira_apply import proposal_revision
+
+            for suggestion in planning_suggestions:
+                if suggestion.get("type") == "create_task":
+                    suggestion["proposal_revision"] = proposal_revision(suggestion)
+        except Exception as exc:
+            _log_swallowed(
+                "generate_jira_suggestions/planning_only_revision", exc
+            )
+        return planning_suggestions[:max_suggestions]
 
     # Cross-epic ambiguity guard (used by ALL emission paths: unmatched / matched-parent
     # / comment). When a shared sprint spans more than one 큰틀(Epic) — OR mixes keyed
@@ -1123,18 +1714,12 @@ def generate_jira_suggestions(
     _epic_buckets = len(_epic_keys_present) + (1 if any(not t.get("epic_key") for t in _attachable) else 0)
     _multi_epic_unscoped = (not epic_scope) and _epic_buckets > 1
 
-    suggestions: list[dict[str, Any]] = []
+    suggestions: list[dict[str, Any]] = list(planning_suggestions)
     sid = 0
     # Honor the report date (payload['today']) instead of the wall clock so that
     # backdated reports compute 종료일/시작일 도래 against the correct day — and so the
     # date-sensitive 규칙(Rule 2/3) tests are deterministic. Falls back to today.
-    today = date.today()
-    _pt = payload.get("today")
-    if _pt:
-        try:
-            today = date.fromisoformat(str(_pt))
-        except ValueError:
-            pass
+    today = suggestion_day
 
     # Build commit evidence — use sprint-wide commits, not just daily
     all_commits = [c.get("subject", "") for c in (payload.get("recent_commits") or [])]
@@ -1142,6 +1727,12 @@ def generate_jira_suggestions(
     # commit↔task matching. Seed from payload first (so body matching works without a
     # live git repo), then the git-log block below adds/refines from the working tree.
     commit_bodies: dict[str, str] = {}
+    # subject → short sha. Lets a task/부작업 whose title cites a commit sha (e.g. the
+    # retro plan tasks "… (7890686)") match that commit even when no keyword overlaps.
+    commit_shas: dict[str, str] = {}
+    for _c in (payload.get("recent_commits") or []):
+        if _c.get("subject") and _c.get("sha") and _c["subject"] not in commit_shas:
+            commit_shas[_c["subject"]] = str(_c["sha"])
     for _c in (payload.get("recent_commits") or []):
         _cs, _cb = _c.get("subject", ""), _c.get("body", "")
         if _cs and _cb and _cs not in commit_bodies:
@@ -1162,8 +1753,8 @@ def generate_jira_suggestions(
                 result = subprocess.run(
                     ["git", "log", f"--since={sprint_start}",
                      f"--until={(today + timedelta(days=1)).isoformat()}",
-                     "--format=%s\x1f%b\x1e", "-50"],
-                    cwd=str(repo_root), capture_output=True, text=True, timeout=5,
+                     "--format=%h\x1f%s\x1f%b\x1e", f"-{_GIT_EVIDENCE_CAP}"],
+                    cwd=str(repo_root), capture_output=True, text=True, timeout=20,
                     encoding="utf-8", errors="replace",
                 )
                 if result.returncode == 0:
@@ -1172,18 +1763,22 @@ def generate_jira_suggestions(
                         chunk = chunk.strip()
                         if not chunk:
                             continue
-                        parts = chunk.split("\x1f", 1)
-                        subj = parts[0].strip()
+                        parts = chunk.split("\x1f", 2)
+                        if len(parts) < 2:
+                            continue
+                        sha, subj = parts[0].strip(), parts[1].strip()
                         if not subj:
                             continue
                         git_commits.append(subj)
-                        body = parts[1].strip() if len(parts) >= 2 else ""
+                        if sha and subj not in commit_shas:
+                            commit_shas[subj] = sha
+                        body = parts[2].strip() if len(parts) >= 3 else ""
                         if body and subj not in commit_bodies:
                             commit_bodies[subj] = body
-                    if len(git_commits) >= 50:
+                    if len(git_commits) >= _GIT_EVIDENCE_CAP:
                         _log_swallowed(
                             "generate_jira_suggestions/git_log_cap",
-                            RuntimeError("git log hit -50 cap; older sprint commits excluded from evidence"),
+                            RuntimeError(f"git log hit -{_GIT_EVIDENCE_CAP} cap; older sprint commits excluded from evidence"),
                         )
                     all_commits = list(dict.fromkeys(git_commits + all_commits))  # dedupe
                 elif result.returncode != 0:
@@ -1380,11 +1975,16 @@ def generate_jira_suggestions(
         title_words = [w.lower() for w in task_title.split()
                        if len(w) >= 3 and w.lower() not in ("및", "위한", "통한", "결과")]
         search_terms = set(keywords + title_words)
-        if not search_terms:
+        cited_shas = {m.lower() for m in re.findall(r"\b[0-9a-f]{7,40}\b", task_title)}
+        if not search_terms and not cited_shas:
             return []
         matched = []
         for subj in all_commits:
             if _is_noise_commit(subj):
+                continue
+            _sha = commit_shas.get(subj, "").lower()
+            if _sha and any(_sha.startswith(c) or c.startswith(_sha) for c in cited_shas):
+                matched.append(subj)
                 continue
             if body_aware:
                 text, text_ns = _mt[subj], _mt_ns[subj]
@@ -1394,6 +1994,19 @@ def generate_jira_suggestions(
             if any(_term_in(term, text, text_ns) for term in search_terms):
                 matched.append(subj)
         return matched[:5]
+
+    def _cited_commits_for(task_title: str) -> list[str]:
+        """Commits whose sha is cited verbatim in the task/부작업 title — explicit
+        provenance, stronger than keyword overlap."""
+        cited = {m.lower() for m in re.findall(r"\b[0-9a-f]{7,40}\b", task_title)}
+        if not cited:
+            return []
+        out = []
+        for subj in all_commits:
+            _sha = commit_shas.get(subj, "").lower()
+            if _sha and any(_sha.startswith(c) or c.startswith(_sha) for c in cited):
+                out.append(subj)
+        return out[:5]
 
     for task in sprint_tasks:
         key = task.get("key", "")
@@ -1421,8 +2034,32 @@ def generate_jira_suggestions(
             if not skey:
                 continue
 
-            # 진행 중 부작업 → 완료 처리 제안 (커밋 + description 기반 구체적 결과)
-            if sst == "in_progress":
+            # 진행 중 부작업 → 완료 처리 제안.
+            # Status alone is NEVER completion evidence: the old path marked every
+            # in-progress subtask as a medium-confidence complete action, which made the
+            # unconfirmed batch button capable of closing unfinished Jira work. Require a
+            # matching commit with an explicit completion marker.
+            # Explicitly cited shas are the strongest evidence: a 부작업 whose title
+            # names the commits it covers ("… (7890686, e290c4e)") is provably done.
+            completion_commits: list[str] = _cited_commits_for(stitle)
+            if not completion_commits and sst == "in_progress":
+                # Keyword fallback, in-progress only. A PENDING 부작업 must never be
+                # closed on keyword overlap: planned work whose title happens to carry
+                # a completion word ("… 잔재 제거", "… 정리") would otherwise be
+                # reported as finished before anyone started it.
+                sub_commits = _match_commits_for(stitle, skey)
+                completion_commits = [
+                    c for c in sub_commits
+                    if re.search(
+                        r"(?i)(?:완료|종료|해결|complete(?:d)?|finish(?:ed)?|resolve(?:d)?|done)",
+                        f"{c}\n{commit_bodies.get(c, '')}",
+                    )
+                ]
+            # A pending 부작업 with cited-sha evidence is a complete candidate; one
+            # WITHOUT evidence falls through to the start-transition rule below.
+            if sst == "in_progress" or completion_commits:
+                if not completion_commits:
+                    continue
                 sid += 1
                 # Description: prefer Jira live, fall back to local sprint_tasks.json
                 desc = sub.get("description", "")
@@ -1432,10 +2069,16 @@ def generate_jira_suggestions(
                         if ls.get("title") == stitle:
                             desc = ls.get("description", "")
                             break
-                if desc:
-                    text = f"{stitle} 완료. {desc}"
-                else:
-                    text = f"{stitle} 완료."
+                # Say HOW it was completed, in the report register a manager reads:
+                # what was done, ending in ~함. A bare "완료" tells them nothing.
+                how_lines = "\n".join(
+                    f"* {line}" for line in
+                    (p for p in (_manager_phrase(c) for c in completion_commits[:3])
+                     if _reads_as_work(p))
+                )
+                text = f"{stitle} 완료함."
+                if how_lines:
+                    text += f"\n{how_lines}"
                 suggestions.append({
                     "id": f"s{sid}",
                     "task_key": skey,
@@ -1445,8 +2088,12 @@ def generate_jira_suggestions(
                     "suggested_text": text,
                     # status/comment-only — 부작업 설명 덮어쓰기 방지(설명은 텍스트에 이미 포함).
                     "suggested_description": "",
-                    "reason": f"{key} 하위작업, 현재 진행 중",
-                    "confidence": "medium",
+                    "reason": (
+                        f"명시적 완료 커밋 {len(completion_commits)}건: "
+                        + ", ".join(completion_commits[:2])
+                    ),
+                    "confidence": "high" if len(completion_commits) >= 2 else "medium",
+                    "source_commits": completion_commits[:5],
                     "status": "pending",
                 })
 
@@ -1461,7 +2108,7 @@ def generate_jira_suggestions(
                             "type": "transition",
                             "title": f"  └ {stitle} — 작업 시작",
                             "subtitle": f"{key} 하위작업 · {title} · 시작일 {t_start}",
-                            "suggested_text": f"상위 작업({key}) 시작일 도래. 작업을 시작합니다.",
+                            "suggested_text": f"상위 작업({key}) 시작일 도래로 작업 시작함.",
                             # status-only — never re-write the 부작업's own description.
                             "suggested_description": "",
                             "reason": f"시작일 {t_start} ≤ 오늘",
@@ -1493,7 +2140,7 @@ def generate_jira_suggestions(
                 "type": "complete",
                 "title": f"{title} — 전체 완료 보고",
                 "subtitle": f"상위 작업 · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
-                "suggested_text": f"전체 하위작업 완료.\n{sub_results}\n종료 요청합니다.",
+                "suggested_text": f"부작업 전건 완료로 종료 요청함.\n{sub_results}",
                 # status/comment-only — never re-write the issue's own description.
                 "suggested_description": "",
                 "reason": f"부작업 {len(done_subs)}/{len(subtasks)} 완료",
@@ -1548,20 +2195,27 @@ def generate_jira_suggestions(
                         rule2_conf = "medium"
                     else:
                         rule2_conf = "low"
-                    # Keep title/reason/closing consistent: don't assert "완료 처리" when the
-                    # confidence demoted the action to a "점검 필요" nudge (self-contradiction).
-                    if rule2_conf == "high":
-                        title_suffix = f"{over_label}, 완료 처리"
-                        rule2_closing = "종료 요청합니다."
-                        reason_text = when_text
-                    else:
-                        title_suffix = f"{over_label} — 진행 점검 필요"
-                        rule2_closing = "기한 도래 — 진행 상황 점검 필요."
-                        reason_text = f"{when_text} — 진행 상황 점검 필요"
+                    # A date or keyword match proves neither implementation completion
+                    # nor acceptance. Rule 2 is always a progress-check COMMENT. Actual
+                    # complete actions come only from explicit completion evidence or
+                    # the separate all-subtasks-done rule.
+                    title_suffix = f"{over_label} — 진행 점검 필요"
+                    rule2_closing = "진행 상황 점검 필요함."
+                    _evidence = [
+                        p for p in (_manager_phrase(c)
+                                    for c in dict.fromkeys(subj_hits + body_hits))
+                        if _reads_as_work(p)
+                    ][:3]
+                    if _evidence:
+                        rule2_closing = (
+                            "\n".join(f"* {line}" for line in _evidence)
+                            + "\n" + rule2_closing
+                        )
+                    reason_text = f"{when_text} — 진행 상황 점검 필요"
                     suggestions.append({
                         "id": f"s{sid}",
                         "task_key": key,
-                        "type": "complete",
+                        "type": "comment",
                         "title": f"{title} — {title_suffix}",
                         "subtitle": f"상위 작업 · {subtitle_period} · 부작업 {len(done_subs)}/{len(subtasks)} 완료",
                         "suggested_text": f"{text_prefix}\n{sub_report}\n{rule2_closing}",
@@ -1587,7 +2241,7 @@ def generate_jira_suggestions(
                         "type": "transition",
                         "title": f"{title} — 작업 시작",
                         "subtitle": f"상위 작업 · 시작일 {t_start}",
-                        "suggested_text": f"시작일({t_start}) 도래. 작업을 시작합니다.",
+                        "suggested_text": f"시작일({t_start}) 도래로 작업 시작함.",
                         # status-only — never re-write the issue's own description.
                         "suggested_description": "",
                         "reason": f"시작일 {t_start} ≤ 오늘 {today.isoformat()}",
@@ -1858,6 +2512,24 @@ def generate_jira_suggestions(
     _seen_sig: set[tuple] = set()
     _deduped: list[dict[str, Any]] = []
     for _s in suggestions:
+        # Planning proposals already carry a content-stable id + Jira-side dedupe
+        # marker from workflow.jira_planning. Preserve both. Falling through to the
+        # legacy (task_key,type,disc) id would assign every keyless create_task the
+        # same id, so distinct plans would overwrite/collapse in persistence and UI.
+        _marker = str(_s.get("dedupe_marker") or "")
+        if _marker:
+            _sig = ("dedupe_marker", _marker)
+            if _sig in _seen_sig:
+                continue
+            _seen_sig.add(_sig)
+            if not _s.get("id"):
+                _s["id"] = _stable_id(
+                    _s.get("task_key", ""),
+                    _s.get("type", "create_task"),
+                    _marker,
+                )
+            _deduped.append(_s)
+            continue
         # add_subtask cards key on the SOURCE commit, not the 60-char-truncated text:
         # the same commit can land in BOTH the unmatched and matched-parent loops on
         # different parents (different task_key) → keying on src collapses those to one;
@@ -1890,9 +2562,22 @@ def generate_jira_suggestions(
                 task_epic_map[_sub["key"]] = (_ek, _es)
     for _s in suggestions:
         _k = _s.get("task_key", "")
-        _ek, _es = task_epic_map.get(_k, ("", ""))
-        _s["epic_key"] = _ek
-        _s["epic_summary"] = _es
+        if _k in task_epic_map:
+            _ek, _es = task_epic_map[_k]
+            _s["epic_key"] = _ek
+            _s["epic_summary"] = _es
+
+    # Optimistic revision for editable create-task cards. The proxy verifies this
+    # base digest before applying user edits, so a same-day report regeneration
+    # cannot make a stale browser approve a different revision under the same id.
+    try:
+        from workflow.jira_apply import proposal_revision
+
+        for _s in suggestions:
+            if _s.get("type") == "create_task":
+                _s["proposal_revision"] = proposal_revision(_s)
+    except Exception as exc:
+        _log_swallowed("generate_jira_suggestions/proposal_revision", exc)
 
     # Confidence-aware truncation: the per-subtask loop appends medium/low cards
     # without a max_suggestions guard, so a task with many subtasks could push a
@@ -2121,7 +2806,20 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
     adapter = get_adapter(cfg)
     schemas = {
         "daily": '{"title": str, "summary": [str], "completed": [str], "focus": [str], "risks": [str], "next_actions": [str]}',
-        "plan": '{"title": str, "summary": [str], "priority_actions": [str], "mid_term_actions": [str], "risks": [str], "notes": [str]}',
+        # ``tasks`` is the Jira-ready expansion of priority_actions. The two
+        # coexist on purpose: the plan document renders the flat list, while
+        # workflow.jira_planning reads the structured records (it prefers the
+        # record when both carry the same summary) to build a review card a
+        # human can approve without rewriting it.
+        "plan": (
+            '{"title": str, "summary": [str], "priority_actions": [str], '
+            '"mid_term_actions": [str], '
+            '"tasks": [{"summary": str, "purpose": str, "problem": str, '
+            '"scope": [str], "out_of_scope": [str], "acceptance_criteria": [str], '
+            '"subtasks": [{"summary": str, "description": str, "acceptance_criteria": [str]}], '
+            '"remaining_work": [str], "risks": [str]}], '
+            '"risks": [str], "notes": [str]}'
+        ),
         "weekly": '{"title": str, "summary": [str], "highlights": [str], "areas": [str], "risks": [str], "next_week": [str]}',
         "monthly": '{"title": str, "summary": [str], "highlights": [str], "areas": [str], "risks": [str], "next_month": [str]}',
         "jira": '{"title": str, "summary": str, "task_name": str, "task_goal": str, "scope": [str], "completed": [str], "in_progress": [str], "remaining": [str], "task_board": [{"key": str, "title": str, "status": str, "period": str, "subtasks": [str], "related_commits": [str]}], "validation": [str], "risks": [str], "links": [str], "status_summary": {"completed_count": int, "in_progress_count": int, "remaining_count": int}}',
@@ -2144,13 +2842,19 @@ def ask_gemini_for_sections(report_type: str, payload: dict[str, Any]) -> dict[s
         "- For each task_board entry, copy key/title/start/end from sprint_tasks; do not paraphrase or translate keys.\n"
         "- Show each task with its subtasks, status (완료/진행 중/예정), and related commits.\n"
         "- For daily/weekly/monthly/plan, when referencing Jira tasks in narrative text, quote keys exactly as they appear in payload.sprint_tasks[].key. Do not invent keys.\n"
+        "- For plan, write one `tasks` entry for EVERY `priority_actions` and `mid_term_actions` item, reusing that exact sentence as `tasks[].summary`, so the flat lists and the structured list stay linked and no action reaches review without a body.\n"
+        "- Each plan `tasks` entry reads like a Jira ticket a developer can start without asking questions: purpose = 왜 하는지 한 문장, problem = 지금 상태와 문제 1~2문장, scope/out_of_scope = 포함·제외 항목, acceptance_criteria = 판정 가능한 한국어 2개 이상(수치·'0건'·'이상' 등), subtasks = 3~5개이며 각각 summary(짧은 제목) + description(1~2문장) + acceptance_criteria 1개.\n"
+        "- Ground every plan `tasks` sentence in the supplied context (commits, changed files, sprint tasks). If the context does not support a field, omit that field instead of inventing content.\n"
         "- No markdown fence, JSON only.\n\n"
         f"Context JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
     result = adapter.generate(
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         temperature=0.3,
-        max_tokens=4096,
+        # A cap, not a spend: only generated tokens are billed. 4096 truncated the
+        # plan document once `tasks` started carrying per-ticket narrative and a
+        # 3~5 step breakdown, and a truncated body fails json.loads outright.
+        max_tokens=8192 if report_type == "plan" else 4096,
         timeout=180.0,
     )
     data = json.loads(clean_json_block(result.get("output", "")))
@@ -2609,8 +3313,10 @@ def generate_document(report_type: str, payload: dict[str, Any]) -> tuple[str, s
         # Never trust the LLM for sprint-derived fact fields. Two cases:
         # 1) sprint_tasks present → overwrite with deterministic fallback values
         #    derived directly from sprint_tasks (real APPL-XXX keys).
-        # 2) sprint_tasks empty (project lacks `jira` config) → wipe to empty
-        #    placeholders so Gemini cannot inject hallucinated keys like APPL-001.
+        # 2) sprint_tasks empty → wipe to deterministic placeholders so Gemini
+        #    cannot inject hallucinated keys like APPL-001.  An empty board does
+        #    not necessarily mean "Jira is unconfigured": commit-only projects
+        #    deliberately set suggest_existing=false while keeping auto_plan=true.
         if payload.get("sprint_tasks"):
             truth = build_fallback_jira_doc(report_type, payload)
             # 'links' is fact-overridden too: the schema invites GitHub commit URLs, so
@@ -2622,8 +3328,23 @@ def generate_document(report_type: str, payload: dict[str, Any]) -> tuple[str, s
                     sections[fact_field] = truth[fact_field]
         else:
             sections["task_board"] = []
-            sections["scope"] = ["Jira 스프린트 미연동 — startup_projects.json 의 jira 설정 필요"]
-            sections["completed"] = ["Jira 스프린트 미연동 상태입니다."]
+            if payload.get("jira_planning_enabled"):
+                sections["scope"] = [
+                    "기존 Jira 스프린트 조회 비활성 — 커밋 기반 신규 Task 자동 계획 활성"
+                ]
+                sections["completed"] = [
+                    "기존 스프린트 이슈를 자동 추정하지 않고 커밋 근거로 새 작업을 계획합니다."
+                ]
+            elif payload.get("jira_enabled"):
+                sections["scope"] = [
+                    "Jira 연동됨 — 현재 스프린트 또는 설정된 Epic 범위에 표시할 작업 없음"
+                ]
+                sections["completed"] = ["현재 범위의 Jira 작업이 없습니다."]
+            else:
+                sections["scope"] = [
+                    "Jira 스프린트 미연동 — startup_projects.json 의 jira 설정 필요"
+                ]
+                sections["completed"] = ["Jira 스프린트 미연동 상태입니다."]
             sections["in_progress"] = []
             sections["remaining"] = []
             sections["links"] = []
@@ -3682,6 +4403,12 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
     if project_config and isinstance(project_config.get("jira"), dict):
         project_key = (project_config["jira"].get("project_key") or "").strip()
     pk_attr = escape(project_key)
+    # The provider's sprint dict carries name/start/end only; the configured
+    # sprint_id is what the 계획 작성 modal pre-fills.
+    sprint_id_cfg = ""
+    if project_config and isinstance(project_config.get("jira"), dict):
+        sprint_id_cfg = str(project_config["jira"].get("sprint_id") or "")
+    sprint_attr = escape(str(sprint.get("id") or sprint_id_cfg))
 
     return f'''
 {gantt_html}
@@ -3697,6 +4424,7 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
       <span class="jira-status pending">{pending} To Do</span>
       <button class="jira-btn new-issue" onclick="jiraNewEpic('{pk_attr}')" title="새 에픽(큰틀) 생성">+ 새 에픽</button>
       <button class="jira-btn new-issue" onclick="jiraNewTask('{pk_attr}')" title="새 작업 생성">+ 새 작업</button>
+      <button class="jira-btn new-issue" onclick="jiraNewPlan('{pk_attr}', '{sprint_attr}')" title="큰 단위 작업 + 부작업을 한 번에 검토·등록">+ 계획 작성</button>
     </div>
   </div>
   {"".join(rows)}
@@ -3711,7 +4439,7 @@ def html_jira_live_board(project_config: dict[str, Any] | None = None) -> str:
 JIRA_BOARD_SCRIPT = """
 <script>
 (function() {
-  const API = 'http://localhost:18923';
+  const API = (location.port === '18923') ? location.origin : 'http://localhost:18923';
 
   // HTML escape for safe interpolation into innerHTML / attributes / onclick().
   // Matches Python's html.escape(..., quote=True).
@@ -4074,11 +4802,18 @@ JIRA_BOARD_SCRIPT = """
         const todoC = allItems.filter(i => i.status==='pending').length;
 
         // Rebuild header counts
+        // Only the count chips are replaced — the "+ 새 에픽 / + 새 작업 / + 계획 작성"
+        // buttons live in the same container and must survive a refresh.
         const header = board.querySelector('.jira-board-actions');
-        if (header) header.innerHTML =
-          `<span class="jira-status done">${doneC} Done</span>` +
-          `<span class="jira-status in-progress">${progC} In Progress</span>` +
-          `<span class="jira-status pending">${todoC} To Do</span>`;
+        if (header) {
+          header.querySelectorAll('.jira-status').forEach(el => el.remove());
+          const chips = document.createElement('span');
+          chips.innerHTML =
+            `<span class="jira-status done">${doneC} Done</span>` +
+            `<span class="jira-status in-progress">${progC} In Progress</span>` +
+            `<span class="jira-status pending">${todoC} To Do</span>`;
+          header.prepend(...chips.childNodes);
+        }
 
         // Drop both old task rows AND old epic-group wrappers — we rebuild
         // both so the swimlanes stay in sync with current data.
@@ -4280,6 +5015,256 @@ JIRA_BOARD_SCRIPT = """
       if (btn) { btn.textContent = 'Today ON'; }
     }
   })();
+
+  // ---- 계획 작성 (plan composer) --------------------------------------------
+  // Big manager-facing tasks, each with 0..n subtasks, previewed through
+  // POST /api/jira/plan {apply:false} and only written on an explicit second
+  // click that echoes the previewed total back (the proxy refuses a mismatch).
+  // The proxy's fetch shim attaches X-Proxy-Token, so no header work here.
+  function _planTaskHtml(idx) {
+    return `
+      <div class="plan-task" data-task>
+        <div class="plan-task-head">
+          <span class="plan-task-no">작업 ${idx}</span>
+          <input type="text" data-pf="summary" placeholder="작업 제목 (관리자가 한눈에 볼 큰 단위)">
+          <input type="date" data-pf="start" title="시작일"><span class="field-dash">~</span><input type="date" data-pf="end" title="종료일">
+          <button class="jira-btn" type="button" onclick="_planRemove(this, '[data-task]')" title="이 작업 삭제">✕</button>
+        </div>
+        <textarea rows="3" data-pf="description" placeholder="본문 — 한 줄에 하나씩 적으면 Jira 에 * 항목으로 들어갑니다"></textarea>
+        <input type="text" data-pf="done_note" placeholder="완료 코멘트 (이미 끝난 작업이면 어떻게 끝났는지 — 비우면 코멘트 없음)">
+        <div class="plan-subs" data-subs></div>
+        <button class="jira-btn add" type="button" onclick="_planAddSub(this)">+ 부작업</button>
+      </div>`;
+  }
+  function _planSubHtml() {
+    return `
+      <div class="plan-sub" data-sub>
+        <div class="plan-task-head">
+          <span class="plan-sub-mark">└</span>
+          <input type="text" data-pf="summary" placeholder="부작업 제목">
+          <input type="date" data-pf="start" title="시작일"><span class="field-dash">~</span><input type="date" data-pf="end" title="종료일">
+          <button class="jira-btn" type="button" onclick="_planRemove(this, '[data-sub]')" title="이 부작업 삭제">✕</button>
+        </div>
+        <input type="text" data-pf="description" placeholder="부작업 설명 (선택)">
+        <input type="text" data-pf="done_note" placeholder="완료 코멘트 (선택)">
+      </div>`;
+  }
+  window._planRemove = function(btn, selector) {
+    const overlay = btn.closest('.jira-modal-overlay');
+    btn.closest(selector).remove();
+    overlay.querySelectorAll('[data-task] .plan-task-no').forEach((n, i) => { n.textContent = '작업 ' + (i + 1); });
+    _planInvalidate(overlay);
+  };
+  window._planAddTask = function(btn) {
+    const overlay = btn.closest('.jira-modal-overlay');
+    const list = overlay.querySelector('[data-plan-tasks]');
+    list.insertAdjacentHTML('beforeend', _planTaskHtml(list.querySelectorAll('[data-task]').length + 1));
+    _planInvalidate(overlay);
+    list.lastElementChild.querySelector('[data-pf="summary"]').focus();
+  };
+  window._planAddSub = function(btn) {
+    const subs = btn.closest('[data-task]').querySelector('[data-subs]');
+    subs.insertAdjacentHTML('beforeend', _planSubHtml());
+    _planInvalidate(btn.closest('.jira-modal-overlay'));
+    subs.lastElementChild.querySelector('[data-pf="summary"]').focus();
+  };
+  // Own fields only: a task's [data-pf] lookup must not descend into its subtasks.
+  function _pf(root, name) {
+    const el = [...root.querySelectorAll('[data-pf="' + name + '"]')]
+      .find(e => e.closest('[data-task],[data-sub]') === root);
+    return el ? (el.value || '').trim() : '';
+  }
+  const _bullets = (text) => text.split('\\n').map(l => l.trim()).filter(Boolean)
+    .map(l => '* ' + l.replace(/^[*-]\\s*/, '')).join('\\n');
+  function _planCollect(overlay) {
+    const epic = _val(overlay, 'epic');
+    const tasks = [];
+    overlay.querySelectorAll('[data-task]').forEach(t => {
+      const subtasks = [];
+      t.querySelectorAll('[data-sub]').forEach(sb => subtasks.push({
+        summary: _pf(sb, 'summary'), description: _pf(sb, 'description'),
+        start: _pf(sb, 'start'), end: _pf(sb, 'end'), done_note: _pf(sb, 'done_note')
+      }));
+      tasks.push({
+        epic, summary: _pf(t, 'summary'), description: _bullets(_pf(t, 'description')),
+        start: _pf(t, 'start'), end: _pf(t, 'end'), done_note: _pf(t, 'done_note'), subtasks
+      });
+    });
+    return {epics: {}, tasks};
+  }
+  function _planInvalidate(overlay) {
+    // Any edit after a preview makes it stale — register stays disabled until
+    // the user previews again (the proxy also refuses a mismatched total).
+    overlay.dataset.previewTotal = '';
+    overlay.dataset.previewFingerprint = '';
+    if (overlay.dataset.done) return;
+    const reg = overlay.querySelector('[data-plan-register]');
+    if (reg) { reg.disabled = true; reg.textContent = 'Jira 등록 (먼저 미리보기)'; }
+  }
+  function _planRenderPreview(overlay, d) {
+    const box = overlay.querySelector('[data-plan-preview]');
+    const p = d.preview || {tasks: 0, subtasks: 0, total: 0, notes: 0, lines: []};
+    const reusedN = p.reused || 0;
+    let html = `<div class="plan-preview-head">등록 예정: 작업 ${p.tasks}건 · 부작업 ${p.subtasks}건 · 합계 ${p.total}건` +
+      (reusedN ? ` <span class="plan-note">신규 ${p.new} · 기존 재사용 ${reusedN}</span>` : '') +
+      ` · 완료 코멘트 ${p.notes}건 <span class="hint">(새로 만드는 항목은 '할 일')</span></div>`;
+    if (reusedN) html += `<div class="plan-hint">기존 항목은 다시 만들지 않고 그대로 씁니다 (본문·날짜·코멘트도 바꾸지 않음).</div>`;
+    if (d.errors && d.errors.length) html += '<ul class="plan-errors">' + d.errors.map(e => '<li>' + escHtml(e) + '</li>').join('') + '</ul>';
+    if (d.created) {
+      html += '<ul class="plan-preview-lines">' + d.created.map(c =>
+        `<li class="${c.kind === '부작업' ? 'sub' : 'task'} ${(c.key && !c.status_error) ? 'ok' : 'fail'}"><span class="plan-kind">${c.key ? escHtml(c.key) : '실패'}</span><span>${escHtml(c.summary)}</span>${c.reused ? '<span class="plan-note">기존' + (c.status_kept ? ' · 상태 유지' : '') + '</span>' : ''}${c.status ? '<span class="plan-note">' + escHtml(c.status) + '</span>' : ''}${c.error || c.status_error ? '<span class="plan-note fail">' + escHtml(c.error || c.status_error) + '</span>' : ''}</li>`
+      ).join('') + '</ul>';
+    } else {
+      html += '<ul class="plan-preview-lines">' + (p.lines || []).map(l =>
+        `<li class="${l.kind === '부작업' ? 'sub' : 'task'}${l.existing_key ? ' reused' : ''}"><span class="plan-kind">${escHtml(l.kind)}</span><span class="plan-period">${escHtml(l.start || '—')} ~ ${escHtml(l.end || '—')}</span><span>${escHtml(l.summary)}</span>${l.existing_key ? '<span class="plan-note">기존 ' + escHtml(l.existing_key) + '</span>' : ''}${l.note && !l.existing_key ? '<span class="plan-note">코멘트</span>' : ''}</li>`
+      ).join('') + '</ul>';
+    }
+    box.innerHTML = html;
+    box.hidden = false;
+  }
+  window.jiraPlanPreview = function(btn) {
+    const overlay = btn.closest('.jira-modal-overlay');
+    const plan = _planCollect(overlay);
+    btn.disabled = true; btn.textContent = '검토 중...';
+    fetch(API + '/api/jira/plan', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({plan, apply: false, project_key: overlay.dataset.projectKey || ''})
+    }).then(r => r.json()).then(d => {
+      _planRenderPreview(overlay, d);
+      const reg = overlay.querySelector('[data-plan-register]');
+      if (d.ok) {
+        overlay.dataset.previewTotal = String(d.preview.total);
+        overlay.dataset.previewFingerprint = d.preview.fingerprint || '';
+        reg.disabled = false;
+        reg.textContent = d.preview.reused ? ('Jira 등록 (신규 ' + d.preview.new + '건 · 기존 ' + d.preview.reused + '건)') : ('Jira 등록 (' + d.preview.total + '건)');
+      } else { _planInvalidate(overlay); }
+    }).catch(() => _setCreateError(overlay, '프록시 서버 미실행 (python scripts/jira_proxy.py)'))
+      .finally(() => { btn.disabled = false; btn.textContent = '미리보기'; });
+  };
+  window.jiraPlanRegister = function(btn) {
+    const overlay = btn.closest('.jira-modal-overlay');
+    const total = parseInt(overlay.dataset.previewTotal || '0', 10);
+    if (!total) { _setCreateError(overlay, '먼저 미리보기로 검토하세요.'); return; }
+    const retry = !!overlay.dataset.done;
+    const sprintId = _val(overlay, 'sprint').trim();
+    const autoStatus = !!(_field(overlay, 'auto_status') || {}).checked;
+    if (!confirm((retry ? '실패분만 다시 등록합니다 (이미 만들어진 항목은 재사용). ' : '') + 'Jira 에 ' + total + '건을 등록합니다' + (sprintId ? ' (스프린트 ' + sprintId + ' 포함)' : '') + (autoStatus ? '\\n종료일이 지난 항목은 종료 요청, 진행 중 기간은 진행 중으로 바로 넘깁니다.' : '') + '.\\n이 작업은 되돌릴 수 없습니다. 진행할까요?')) return;
+    const plan = _planCollect(overlay);
+    const idle = 'Jira 등록 (' + total + '건)';
+    btn.disabled = true; btn.textContent = '등록 중...';
+    fetch(API + '/api/jira/plan', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({plan, apply: true, confirm_total: total, confirm_fingerprint: overlay.dataset.previewFingerprint || '', auto_status: autoStatus, sprint_id: sprintId || null, project_key: overlay.dataset.projectKey || ''})
+    }).then(r => r.json()).then(d => {
+      _planRenderPreview(overlay, d);
+      if (d.applied) {
+        const okCount = (d.created || []).filter(c => c.key && !c.status_error).length;
+        const reused = d.reused || 0;
+        jiraToast(okCount + '건 반영' + (reused ? ' (기존 ' + reused + '건 재사용)' : '') + (d.failed ? ' · 실패 ' + d.failed + '건' : ''));
+        // Editing is over either way: the plan content is what the run record
+        // is keyed on, so the form is frozen and only the outcome is shown.
+        overlay.dataset.done = '1';
+        overlay.querySelectorAll('input, textarea, select, .plan-body .jira-btn, .plan-toolbar .jira-btn').forEach(el => { el.disabled = true; });
+        const pv = [...overlay.querySelectorAll('.modal-actions .jira-btn')].find(b => b.textContent.trim() === '미리보기');
+        if (pv) pv.disabled = true;
+        if (d.failed) {
+          // Same fingerprint, same run record: the retry re-sends the plan and the
+          // server reuses everything that already exists, creating only the gaps.
+          btn.disabled = false;
+          btn.textContent = '실패분 다시 등록 (' + d.failed + '건)';
+          _setCreateError(overlay, d.failed + '건이 실패했습니다. 다시 등록하면 이미 만들어진 항목은 재사용되고 실패분만 새로 만듭니다.');
+        } else {
+          btn.textContent = '등록됨 (' + okCount + '건)';
+        }
+        _afterAction();
+      } else {
+        _setCreateError(overlay, (d.errors || ['등록 실패']).join('\\n'));
+        btn.disabled = false; btn.textContent = idle;
+      }
+    }).catch(() => { _setCreateError(overlay, '프록시 서버 미실행 (python scripts/jira_proxy.py)'); btn.disabled = false; btn.textContent = idle; });
+  };
+  window.jiraPlanImport = function(btn) {
+    // Paste a draft JSON (same shape as reports/.tmp_jira_draft_*.json) to fill the form.
+    const overlay = btn.closest('.jira-modal-overlay');
+    const ta = overlay.querySelector('[data-plan-json]');
+    if (ta.hidden) { ta.hidden = false; ta.focus(); btn.textContent = 'JSON 적용'; return; }
+    let data;
+    try { data = JSON.parse(ta.value); } catch (e) { _setCreateError(overlay, 'JSON 파싱 실패 — ' + e.message); return; }
+    const list = overlay.querySelector('[data-plan-tasks]');
+    const sel = _field(overlay, 'epic');
+    const set = (root, name, v) => { const el = [...root.querySelectorAll('[data-pf="' + name + '"]')].find(e => e.closest('[data-task],[data-sub]') === root); if (el) el.value = v || ''; };
+    list.innerHTML = '';
+    (data.tasks || []).forEach((t, i) => {
+      list.insertAdjacentHTML('beforeend', _planTaskHtml(i + 1));
+      const node = list.lastElementChild;
+      set(node, 'summary', t.summary); set(node, 'start', t.start); set(node, 'end', t.end);
+      set(node, 'description', String(t.description || '').split('\\n').map(l => l.replace(/^\\*\\s*/, '')).join('\\n'));
+      set(node, 'done_note', t.done_note);
+      if (t.epic && sel) {
+        if (![...sel.options].some(o => o.value === t.epic)) { const o = document.createElement('option'); o.value = t.epic; o.textContent = t.epic; sel.appendChild(o); }
+        sel.value = t.epic;
+      }
+      const subs = node.querySelector('[data-subs]');
+      (t.subtasks || []).forEach(sb => {
+        subs.insertAdjacentHTML('beforeend', _planSubHtml());
+        const sn = subs.lastElementChild;
+        set(sn, 'summary', sb.summary); set(sn, 'description', sb.description); set(sn, 'start', sb.start); set(sn, 'end', sb.end); set(sn, 'done_note', sb.done_note);
+      });
+    });
+    ta.hidden = true; btn.textContent = 'JSON 붙여넣기';
+    const epics = new Set((data.tasks || []).map(t => t.epic).filter(Boolean));
+    if (epics.size > 1) _setCreateError(overlay, '초안에 큰틀이 ' + epics.size + '개 섞여 있습니다 (' + [...epics].join(', ') + '). 이 화면은 큰틀 하나에만 등록하므로 위 선택값이 전체에 적용됩니다.');
+    _planInvalidate(overlay);
+  };
+  window.jiraNewPlan = function(projectKey, sprintId) {
+    const overlay = document.createElement('div');
+    overlay.className = 'jira-modal-overlay';
+    overlay.dataset.projectKey = projectKey || '';
+    overlay.innerHTML = `
+      <div class="jira-modal desc-modal plan-modal">
+        <h4>계획 작성${projectKey ? ' — ' + escHtml(projectKey) : ''} <span class="desc-modal-key">큰 단위 작업 + 부작업 · 미리보기 후 등록</span></h4>
+        <div class="plan-toolbar">
+          <div class="field-group">
+            <label class="field-label">상위 큰틀 (Epic)</label>
+            <select data-field="epic"><option value="">(선택하세요)</option></select>
+          </div>
+          <div class="field-group">
+            <label class="field-label">스프린트 id (선택)</label>
+            <input type="text" data-field="sprint" value="${escHtml(sprintId || '')}" placeholder="예: 152">
+          </div>
+          <label class="plan-toggle" title="종료일이 지난 항목은 종료 요청(완료 코멘트 포함), 오늘이 기간 안이면 진행 중으로 등록 직후 전환">
+            <input type="checkbox" data-field="auto_status"> 날짜 기준 상태 반영
+          </label>
+          <div class="plan-toolbar-btns">
+            <button class="jira-btn" type="button" onclick="jiraPlanImport(this)">JSON 붙여넣기</button>
+            <button class="jira-btn add" type="button" onclick="_planAddTask(this)">+ 작업</button>
+          </div>
+        </div>
+        <textarea data-plan-json rows="6" hidden placeholder='{"tasks": [{"epic": "APPL-373", "summary": "...", "description": "* ...", "start": "2026-09-08", "end": "2026-10-15", "subtasks": [...]}]}'></textarea>
+        <div class="plan-body">
+          <div data-plan-tasks class="plan-tasks"></div>
+          <div data-plan-preview class="plan-preview" hidden></div>
+        </div>
+        <div class="modal-actions">
+          <button class="jira-btn" type="button" onclick="this.closest('.jira-modal-overlay').remove()">닫기</button>
+          <button class="jira-btn" type="button" onclick="jiraPlanPreview(this)">미리보기</button>
+          <button class="jira-btn complete" type="button" data-plan-register disabled onclick="jiraPlanRegister(this)">Jira 등록 (먼저 미리보기)</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    _wireModalDismiss(overlay);
+    overlay.addEventListener('input', () => _planInvalidate(overlay));
+    overlay.querySelector('[data-plan-tasks]').insertAdjacentHTML('beforeend', _planTaskHtml(1));
+    const url = API + '/api/jira/epics' + (projectKey ? ('?project=' + encodeURIComponent(projectKey)) : '');
+    fetch(url).then(r => r.json()).then(d => {
+      const sel = _field(overlay, 'epic'); if (!sel) return;
+      (d.epics || []).forEach(e => {
+        const dup = [...sel.options].find(o => o.value === e.key);
+        if (dup) { dup.textContent = e.key + ' — ' + (e.summary || ''); return; }
+        const o = document.createElement('option'); o.value = e.key; o.textContent = e.key + ' — ' + (e.summary || ''); sel.appendChild(o);
+      });
+    }).catch(() => {});
+  };
 })();
 </script>
 """
@@ -4302,7 +5287,14 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]], panel_date: s
         return ""
 
     high_count = sum(1 for s in pending if s.get("confidence") == "high")
-    type_icons = {"comment": "Comment", "complete": "Complete", "add_subtask": "+ Sub", "transition": "Start"}
+    quality_ready_count = sum(
+        1 for s in pending
+        if s.get("type") == "create_task" and bool(s.get("auto_apply_eligible"))
+    )
+    type_icons = {
+        "comment": "Comment", "complete": "Complete", "add_subtask": "+ Sub",
+        "transition": "Start", "create_task": "New Task",
+    }
 
     # Group pending by Epic (큰틀) so the review panel mirrors the Gantt/Live
     # board layout. Suggestions without an epic_key fall into a "No Epic" bucket.
@@ -4324,23 +5316,72 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]], panel_date: s
         sid = escape(s.get("id", ""))
         key = escape(s.get("task_key", ""))
         stype = s.get("type", "comment")
+        is_create = stype == "create_task"
+        project_key = escape(s.get("project_key", ""))
+        epic_key = escape(s.get("epic_key", ""))
+        dedupe_marker = escape(s.get("dedupe_marker", ""))
+        proposal_revision = escape(s.get("proposal_revision", ""))
+        report_required = escape(s.get("report_required", "yes"))
+        display_key = key or project_key or "NEW"
         title = escape(s.get("title", ""))
         subtitle = escape(s.get("subtitle", ""))
         text = escape(s.get("suggested_text", ""))
         desc_text = escape(s.get("suggested_description", ""))
         reason = escape(s.get("reason", ""))
         conf = s.get("confidence", "medium")
+        evidence_type = escape(s.get("evidence_type", ""))
+        quality_score = int(s.get("quality_score") or 0)
+        quality_grade = str(s.get("quality_grade") or "draft")
+        quality_grade_escaped = escape(quality_grade)
+        blocking_reasons = [
+            escape(str(item)) for item in (s.get("blocking_reasons") or []) if str(item).strip()
+        ]
+        quality_eligible = bool(s.get("auto_apply_eligible")) if is_create else True
+        quality_class = (
+            "ready" if quality_eligible
+            else "review" if quality_grade == "manual"
+            else "draft"
+        )
+        quality_panel = ""
+        if is_create:
+            blocker_html = ""
+            if blocking_reasons:
+                blocker_html = '<ul class="quality-blockers">' + "".join(
+                    f"<li>{item}</li>" for item in blocking_reasons
+                ) + "</ul>"
+            quality_panel = f'''
+  <div class="quality-panel">
+    <div class="quality-meta">
+      <span><strong>근거 유형</strong> {evidence_type or '미분류'}</span>
+      <span><strong>품질 등급</strong> {quality_grade_escaped}</span>
+      <span><strong>자동 적용</strong> {'가능' if quality_eligible else '차단'}</span>
+    </div>{blocker_html}
+  </div>'''
         icon_label = type_icons.get(stype, "Action")
         collapsed = ' suggestion-collapsed' if conf == "low" else ""
-        comment_label = "부작업 제목" if stype == "add_subtask" else "댓글 (Comment)"
-        desc_label = "부작업 본문 (Description)" if stype == "add_subtask" else "설명 (Description)"
-        desc_hint = "" if stype == "add_subtask" else '<span class="hint">— 비워두면 변경 안 함</span>'
+        quality_blocked_class = " quality-blocked" if is_create and not quality_eligible else ""
+        comment_label = (
+            "부작업 제목" if stype == "add_subtask"
+            else "작업 제목 (Summary)" if is_create
+            else "댓글 (Comment)"
+        )
+        desc_label = (
+            "부작업 본문 (Description)" if stype == "add_subtask"
+            else "작업 설명 (Description)" if is_create
+            else "설명 (Description)"
+        )
+        desc_hint = "" if stype in ("add_subtask", "create_task") else '<span class="hint">— 비워두면 변경 안 함</span>'
         subtitle_html = f'<div class="suggestion-subtitle">{subtitle}</div>' if subtitle else ""
         dates_html = ""
-        if stype == "add_subtask":
-            ps = escape(s.get("parent_start") or "")
-            pe = escape(s.get("parent_end") or "")
-            hint = "— 부모 작업 일정 미리 채움" if (ps or pe) else "— 비워두면 부모 작업 일정 상속"
+        if stype in ("add_subtask", "create_task"):
+            ps = escape((s.get("start") or "") if is_create else (s.get("parent_start") or ""))
+            pe = escape((s.get("end") or "") if is_create else (s.get("parent_end") or ""))
+            hint = (
+                "— 신규 작업 계획 일정"
+                if is_create
+                else "— 부모 작업 일정 미리 채움" if (ps or pe)
+                else "— 비워두면 부모 작업 일정 상속"
+            )
             dates_html = f'''
   <div class="suggestion-dates">
     <label class="suggestion-field-label">시작/종료일 <span class="hint">{hint}</span></label>
@@ -4351,28 +5392,43 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]], panel_date: s
     </div>
   </div>'''
 
-        return f'''<div class="jira-suggestion{collapsed}" data-sid="{sid}" data-key="{key}" data-type="{stype}">
+        approve_disabled = " disabled" if is_create and not quality_eligible else ""
+        approve_title = (
+            ' title="품질 필수조건을 통과해야 승인할 수 있습니다"'
+            if is_create and not quality_eligible else ""
+        )
+        approve_text = "보완 필요" if is_create and not quality_eligible else "승인"
+        return f'''<div class="jira-suggestion{collapsed}{quality_blocked_class}" data-sid="{sid}" data-key="{key}" data-type="{stype}" data-project="{project_key}" data-epic="{epic_key}" data-marker="{dedupe_marker}" data-revision="{proposal_revision}" data-report-required="{report_required}" data-quality-eligible="{'true' if quality_eligible else 'false'}">
   <div class="suggestion-head">
-    <span class="jira-key">{key}</span>
+    <span class="jira-key">{display_key}</span>
     <span class="suggestion-type {stype}">{icon_label}</span>
     <span class="confidence {conf}">{conf}</span>
+    {f'<span class="quality-score {quality_class}">{quality_score}/100</span>' if is_create else ''}
     <span class="suggestion-spacer"></span>
     <strong class="suggestion-title">{title}</strong>
   </div>
   {subtitle_html}
   <div class="suggestion-reason">{reason}</div>
+  {quality_panel}
   <div class="suggestion-fields">
     <div>
       <label class="suggestion-field-label" for="text-{sid}">{comment_label}</label>
       <textarea class="suggestion-text" id="text-{sid}">{text}</textarea>
     </div>
     <div>
-      <label class="suggestion-field-label" for="desc-{sid}">{desc_label}{desc_hint}</label>
-      <textarea class="suggestion-description" id="desc-{sid}">{desc_text}</textarea>
+      <div class="suggestion-field-head">
+        <label class="suggestion-field-label" for="desc-{sid}">{desc_label}{desc_hint}</label>
+        <span class="suggestion-desc-tools">
+          <button type="button" class="jira-btn suggestion-edit-toggle" onclick="suggToggleDesc('{sid}')">원문 편집</button>
+          <button type="button" class="jira-btn suggestion-expand" onclick="suggExpandDesc('{sid}')">크게 보기</button>
+        </span>
+      </div>
+      <div class="desc-preview suggestion-preview" id="descpv-{sid}"></div>
+      <textarea class="suggestion-description" id="desc-{sid}" hidden>{desc_text}</textarea>
     </div>
   </div>{dates_html}
   <div class="suggestion-actions">
-    <button class="jira-btn approve" onclick="suggApprove('{sid}')">승인</button>
+    <button class="jira-btn approve" onclick="suggApprove('{sid}')"{approve_disabled}{approve_title}>{approve_text}</button>
     <button class="jira-btn reject" onclick="suggReject('{sid}')">거절</button>
   </div>
 </div>'''
@@ -4413,10 +5469,10 @@ def html_jira_suggestions_panel(suggestions: list[dict[str, Any]], panel_date: s
   <div class="jira-suggestions-header">
     <div>
       <h3>Jira 제안 리뷰</h3>
-      <span class="sprint-meta">{len(pending)}건 대기 &middot; {high_count}건 높은 확신</span>
+      <span class="sprint-meta">{len(pending)}건 대기 &middot; {quality_ready_count}건 품질 통과 &middot; {high_count}건 높은 확신</span>
     </div>
     <div class="jira-board-actions">
-      <button class="jira-btn approve" onclick="suggBatchApprove()">전체 승인</button>
+      <button class="jira-btn approve" onclick="suggBatchApprove()">품질 통과 전체 승인</button>
       <button class="jira-btn" id="sugg-refresh-btn" onclick="suggRefresh()">Refresh</button>
     </div>
   </div>
@@ -4440,7 +5496,7 @@ REGENERATE_BAR_HTML = """
 REGENERATE_SCRIPT = """
 <script>
 (function() {
-  const API = 'http://localhost:18923';
+  const API = (location.port === '18923') ? location.origin : 'http://localhost:18923';
   const POLL_MS = 4000;
   // Track which finished-run we have already shown toast/reload for, keyed by
   // started_at — without this, a completed lock file makes every page open
@@ -4483,6 +5539,24 @@ REGENERATE_SCRIPT = """
     }
   }
 
+  // A finished regeneration reloads the page to show the new data, but never
+  // while a dialog is open: 크게 보기 can hold several minutes of unsaved
+  // Description edits, and a silent reload would discard them. Wait it out.
+  function reloadWhenIdle() {
+    const editorOpen = () => !!document.querySelector('.jira-modal-overlay');
+    if (!editorOpen()) {
+      setTimeout(() => location.reload(), 1500);
+      return;
+    }
+    const status = document.getElementById('regen-status');
+    if (status) status.textContent = '✓ 완료 — 편집 창을 닫으면 새로고침됩니다';
+    const timer = setInterval(() => {
+      if (editorOpen()) return;
+      clearInterval(timer);
+      location.reload();
+    }, 1000);
+  }
+
   function poll() {
     fetch(API + '/api/regenerate/status')
       .then(r => r.json())
@@ -4505,7 +5579,7 @@ REGENERATE_SCRIPT = """
         // Re-render now that SEEN_KEY matches, so status shows the result
         setUi(state);
         if (state.exit_code === 0) {
-          setTimeout(() => location.reload(), 1500);
+          reloadWhenIdle();
         }
       })
       .catch(() => {
@@ -4600,12 +5674,209 @@ REGENERATE_SCRIPT = """
 JIRA_SUGGESTIONS_SCRIPT = """
 <script>
 (function() {
-  const API = 'http://localhost:18923';
+  const API = (location.port === '18923') ? location.origin : 'http://localhost:18923';
 
   // HTML escape for safe interpolation into innerHTML / attributes / onclick().
   // Matches Python's html.escape(..., quote=True) behavior including single quote.
   const escHtml = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  // ── 크게 보기 (expand Description) ────────────────────────────────────────
+  // The suggestions panel is rendered independently of the live board, so this
+  // block keeps its own dismiss helper rather than borrowing _wireModalDismiss
+  // (the portfolio dashboard can emit the panel without the board script).
+  function _wireDescDismiss(overlay) {
+    const escHandler = function(ev) { if (ev.key === 'Escape') overlay.remove(); };
+    document.addEventListener('keydown', escHandler);
+    const origRemove = overlay.remove.bind(overlay);
+    overlay.remove = function() {
+      document.removeEventListener('keydown', escHandler);
+      origRemove();
+    };
+    overlay.addEventListener('click', function(ev) {
+      if (ev.target === overlay) overlay.remove();
+    });
+  }
+
+  // [label|url] → anchor for http(s) only; anything else stays literal text so a
+  // javascript:/data: URL in an LLM-authored body can never become a live link.
+  // *bold* is handled here too: a work-breakdown bullet leads with a bold step
+  // title (`* *1. 제목* — 설명`), which would otherwise read as stray asterisks.
+  function _wikiInline(line, host) {
+    const re = /\\[([^\\]|]+)\\|([^\\]]+)\\]|\\*([^*\\n]+)\\*/g;
+    let last = 0;
+    let m;
+    while ((m = re.exec(line)) !== null) {
+      if (m.index > last) host.appendChild(document.createTextNode(line.slice(last, m.index)));
+      if (m[3] !== undefined) {
+        const b = document.createElement('strong');
+        b.textContent = m[3];
+        host.appendChild(b);
+        last = re.lastIndex;
+        continue;
+      }
+      const url = m[2].trim();
+      if (/^https?:\\/\\//i.test(url)) {
+        const a = document.createElement('a');
+        a.href = url;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        a.textContent = m[1];
+        host.appendChild(a);
+      } else {
+        host.appendChild(document.createTextNode(m[1]));
+      }
+      last = re.lastIndex;
+    }
+    if (last < line.length) host.appendChild(document.createTextNode(line.slice(last)));
+  }
+
+  // Read-only render of the Jira wiki body (h2. headings, * bullets, {noformat}).
+  // Built with createElement/textContent only — never innerHTML — so the preview
+  // cannot be turned into an injection surface by generated content.
+  function _renderWiki(src, host) {
+    while (host.firstChild) host.removeChild(host.firstChild);
+    const text = String(src == null ? '' : src);
+    if (!text.trim()) {
+      const empty = document.createElement('div');
+      empty.className = 'desc-preview-empty';
+      empty.textContent = '설명이 비어 있습니다.';
+      host.appendChild(empty);
+      return;
+    }
+    let list = null;
+    let fence = null;
+    text.split(/\\r?\\n/).forEach(function(raw) {
+      const line = raw.replace(/\\s+$/, '');
+      if (fence) {
+        if (line.indexOf('{noformat}') !== -1) { fence = null; return; }
+        fence.appendChild(document.createTextNode(line + '\\n'));
+        return;
+      }
+      // The dedupe marker is emitted as a single-line {noformat}…{noformat}.
+      const single = line.match(/^\\{noformat\\}(.*)\\{noformat\\}$/);
+      if (single) {
+        list = null;
+        const pre = document.createElement('pre');
+        pre.textContent = single[1];
+        host.appendChild(pre);
+        return;
+      }
+      if (line.trim() === '{noformat}') {
+        list = null;
+        fence = document.createElement('pre');
+        host.appendChild(fence);
+        return;
+      }
+      const head = line.match(/^h[1-6]\\.\\s*(.*)$/);
+      if (head) {
+        list = null;
+        const h = document.createElement('h5');
+        h.textContent = head[1];
+        host.appendChild(h);
+        return;
+      }
+      const bullet = line.match(/^\\s*[*-]\\s+(.*)$/);
+      if (bullet) {
+        if (!list) { list = document.createElement('ul'); host.appendChild(list); }
+        const li = document.createElement('li');
+        _wikiInline(bullet[1], li);
+        list.appendChild(li);
+        return;
+      }
+      if (!line.trim()) { list = null; return; }
+      list = null;
+      const p = document.createElement('p');
+      _wikiInline(line, p);
+      host.appendChild(p);
+    });
+  }
+
+  window.suggExpandDesc = function(sid) {
+    const source = document.getElementById('desc-' + sid);
+    if (!source) return;
+    const card = document.querySelector('[data-sid="' + sid + '"]');
+    const labelEl = card ? card.querySelector('label[for="desc-' + sid + '"]') : null;
+    const title = labelEl ? labelEl.textContent.split('—')[0].trim() : '설명 (Description)';
+    const keyLabel = card ? (card.dataset.key || card.dataset.project || 'NEW') : '';
+
+    const overlay = document.createElement('div');
+    overlay.className = 'jira-modal-overlay';
+    overlay.innerHTML = `
+      <div class="jira-modal desc-modal">
+        <h4>${escHtml(title)}<span class="desc-modal-key">${escHtml(keyLabel)}</span></h4>
+        <div class="desc-modal-tabs">
+          <button type="button" class="jira-btn desc-tab active" data-mode="edit">편집</button>
+          <button type="button" class="jira-btn desc-tab" data-mode="preview">미리보기</button>
+        </div>
+        <textarea class="desc-modal-text" spellcheck="false"></textarea>
+        <div class="desc-preview" hidden></div>
+        <div class="modal-actions">
+          <button type="button" class="jira-btn desc-cancel">취소</button>
+          <button type="button" class="jira-btn approve desc-save">적용</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+
+    const ta = overlay.querySelector('.desc-modal-text');
+    const preview = overlay.querySelector('.desc-preview');
+    ta.value = source.value;
+
+    overlay.querySelectorAll('.desc-tab').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        const isPreview = btn.dataset.mode === 'preview';
+        overlay.querySelectorAll('.desc-tab').forEach(function(b) {
+          b.classList.toggle('active', b === btn);
+        });
+        if (isPreview) _renderWiki(ta.value, preview);
+        ta.hidden = isPreview;
+        preview.hidden = !isPreview;
+      });
+    });
+
+    overlay.querySelector('.desc-cancel').addEventListener('click', function() { overlay.remove(); });
+    overlay.querySelector('.desc-save').addEventListener('click', function() {
+      // Re-resolve by id instead of reusing `source`: suggRefresh may have rebuilt
+      // the card while the modal was open, detaching the original textarea.
+      const target = document.getElementById('desc-' + sid);
+      if (target) target.value = ta.value;
+      window.suggRenderDesc(sid);
+      overlay.remove();
+    });
+    _wireDescDismiss(overlay);
+    ta.focus();
+  };
+
+  // The card body reads as rendered wiki by default; the raw markup sits behind
+  // 원문 편집. The textarea is only hidden, never detached — suggApprove and the
+  // 크게 보기 modal both read its value, and a hidden field still carries one.
+  window.suggRenderDesc = function(sid) {
+    const ta = document.getElementById('desc-' + sid);
+    const pv = document.getElementById('descpv-' + sid);
+    if (ta && pv) _renderWiki(ta.value, pv);
+  };
+
+  window.suggRenderAllDesc = function(root) {
+    (root || document).querySelectorAll('.suggestion-preview').forEach(function(pv) {
+      const ta = document.getElementById('desc-' + pv.id.slice('descpv-'.length));
+      if (ta) _renderWiki(ta.value, pv);
+    });
+  };
+
+  window.suggToggleDesc = function(sid) {
+    const ta = document.getElementById('desc-' + sid);
+    const pv = document.getElementById('descpv-' + sid);
+    if (!ta || !pv) return;
+    const toEdit = ta.hidden;
+    // Leaving edit mode re-renders, so the preview can never show a stale body.
+    if (!toEdit) _renderWiki(ta.value, pv);
+    ta.hidden = !toEdit;
+    pv.hidden = toEdit;
+    const card = document.querySelector('[data-sid="' + sid + '"]');
+    const btn = card ? card.querySelector('.suggestion-edit-toggle') : null;
+    if (btn) btn.textContent = toEdit ? '미리보기' : '원문 편집';
+    if (toEdit) ta.focus();
+  };
 
   // Recompute the Epic header (count + 낮음 pill) and "done" class after
   // approve / reject. Keeps the swimlane status truthful without waiting
@@ -4640,27 +5911,46 @@ JIRA_SUGGESTIONS_SCRIPT = """
     if (!card) return;
     const key = card.dataset.key;
     const type = card.dataset.type;
+    const projectKey = card.dataset.project || '';
+    const epicKey = card.dataset.epic || '';
+    const dedupeMarker = card.dataset.marker || '';
+    const proposalRevision = card.dataset.revision || '';
+    const reportRequired = card.dataset.reportRequired || 'yes';
+    const qualityEligible = card.dataset.qualityEligible !== 'false';
+    const targetLabel = key || projectKey || 'NEW';
     const text = document.getElementById('text-' + sid).value;
     const descEl = document.getElementById('desc-' + sid);
     const desc = descEl ? descEl.value : '';
     if (type === 'add_subtask' && !text.trim()) {
-      jiraToast(key + ' 부작업 제목이 비어 있습니다');
+      jiraToast(targetLabel + ' 부작업 제목이 비어 있습니다');
+      return;
+    }
+    if (type === 'create_task' && (!projectKey.trim() || !text.trim())) {
+      jiraToast(targetLabel + ' 신규 작업의 프로젝트 키와 제목은 필수입니다');
+      return;
+    }
+    if (type === 'create_task' && !qualityEligible) {
+      jiraToast(targetLabel + ' 품질 필수조건을 먼저 보완하세요');
       return;
     }
     if (!text.trim() && !desc.trim()) {
-      jiraToast(key + ' 댓글 또는 설명을 입력하세요');
+      jiraToast(targetLabel + ' 댓글 또는 설명을 입력하세요');
       return;
     }
-    // add_subtask 한정: 사용자가 명시한 시작/종료일이 있으면 함께 보낸다.
-    // 둘 다 비어있으면 백엔드가 부모 작업의 일정을 상속한다.
+    // add_subtask/create_task 일정은 함께 전송한다. 신규 Task는 계획 일정이
+    // 필수이고, 부작업은 둘 다 비우면 백엔드가 부모 일정을 상속한다.
     let start = '', end = '';
-    if (type === 'add_subtask') {
+    if (type === 'add_subtask' || type === 'create_task') {
       const sEl = document.getElementById('start-' + sid);
       const eEl = document.getElementById('end-' + sid);
       start = sEl ? (sEl.value || '') : '';
       end = eEl ? (eEl.value || '') : '';
+      if (type === 'create_task' && (!start || !end)) {
+        jiraToast(targetLabel + ' 신규 작업의 시작일과 종료일은 필수입니다');
+        return;
+      }
       if (start && end && start > end) {
-        jiraToast(key + ' 시작일이 종료일보다 늦을 수 없습니다');
+        jiraToast(targetLabel + ' 시작일이 종료일보다 늦을 수 없습니다');
         return;
       }
     }
@@ -4668,7 +5958,7 @@ JIRA_SUGGESTIONS_SCRIPT = """
     btn.disabled = true;
     btn.textContent = '처리 중...';
 
-    const actionLabel = {comment:'댓글', complete:'완료처리', transition:'상태전환', add_subtask:'부작업'}[type] || '액션';
+    const actionLabel = {comment:'댓글', complete:'완료처리', transition:'상태전환', add_subtask:'부작업', create_task:'신규 작업'}[type] || '액션';
     // Send the panel's date so the proxy targets the EXACT file these cards came from
     // (else it resolves the newest file → a stale tab can re-fire a Jira write).
     const _panel = document.getElementById('jira-suggestions-panel');
@@ -4677,7 +5967,14 @@ JIRA_SUGGESTIONS_SCRIPT = """
     fetch(API + '/api/suggestions/' + sid + '/approve', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({task_key: key, type: type, text: text, comment: text, description: desc, start: start, end: end, date: panelDate})
+      body: JSON.stringify({
+        task_key: key, type: type, text: text, comment: text, summary: text,
+        description: desc, start: start, end: end, date: panelDate,
+        project_key: projectKey, epic_key: epicKey, issue_type: 'Task',
+        issuetype: 'Task', dedupe_marker: dedupeMarker,
+        proposal_revision: proposalRevision,
+        report_required: reportRequired
+      })
     }).then(r => r.json()).then(d => {
       if (d.ok && d.status_persisted !== false) {
         card.classList.add('applied');
@@ -4686,13 +5983,13 @@ JIRA_SUGGESTIONS_SCRIPT = """
         const parts = [];
         if (text.trim()) parts.push(actionLabel);
         if (desc.trim()) parts.push('설명');
-        jiraToast(key + ' 승인 완료 (' + (parts.join('+') || '액션') + ')');
+        jiraToast(targetLabel + ' 승인 완료 (' + (parts.join('+') || '액션') + ')');
         _afterAction();
       } else if (d.ok && d.status_persisted === false) {
         // Jira write succeeded but the audit row wasn't found — warn so the user
         // doesn't re-click (which would double-write). Do NOT grey it.
         btn.disabled = false; btn.textContent = '승인';
-        jiraToast(key + ' Jira 반영됨 but 상태 저장 실패 — 재클릭 금지(중복 방지), 새로고침 필요');
+        jiraToast(targetLabel + ' Jira 반영됨 but 상태 저장 실패 — 재클릭 금지(중복 방지), 새로고침 필요');
       } else {
         btn.textContent = '실패';
         const reasons = [];
@@ -4702,7 +5999,7 @@ JIRA_SUGGESTIONS_SCRIPT = """
         if (d.description_ok === false) {
           reasons.push('설명' + (d.description_error ? ' — ' + d.description_error : ''));
         }
-        jiraToast(key + ' 실패: ' + (reasons.join(' / ') || d.error || 'unknown'));
+        jiraToast(targetLabel + ' 실패: ' + (reasons.join(' / ') || d.error || 'unknown'));
       }
     }).catch(() => { btn.textContent = '연결 실패'; jiraToast(key + ' 프록시 서버 미실행'); });
   };
@@ -4731,7 +6028,23 @@ JIRA_SUGGESTIONS_SCRIPT = """
   };
 
   window.suggBatchApprove = function() {
-    const cards = document.querySelectorAll('.jira-suggestion:not(.applied):not(.suggestion-collapsed)');
+    // Batch actions are deliberately limited to create_task proposals.  That path is
+    // protected by the durable outbox + Jira marker reconciliation; legacy comment,
+    // subtask and workflow mutations remain individual-review actions until they use
+    // the same exactly-once apply service.
+    const cards = Array.from(document.querySelectorAll(
+      '.jira-suggestion:not(.applied):not(.suggestion-collapsed)'
+    )).filter(card => {
+      const conf = card.querySelector('.confidence');
+      const type = card.dataset.type || '';
+      const qualityEligible = card.dataset.qualityEligible === 'true';
+      return conf && conf.classList.contains('high') && type === 'create_task' && qualityEligible;
+    });
+    if (!cards.length) {
+      jiraToast('일괄 승인 가능한 높은 확신의 신규 Task 제안이 없습니다');
+      return;
+    }
+    if (!window.confirm(`검토한 ${cards.length}건을 Jira에 반영할까요?`)) return;
     cards.forEach(card => {
       const sid = card.dataset.sid;
       suggApprove(sid);
@@ -4752,12 +6065,16 @@ JIRA_SUGGESTIONS_SCRIPT = """
         const body = document.getElementById('jira-suggestions-body');
         if (!body) return;
         const suggestions = data.suggestions || [];
-        const typeIcons = {comment:'Comment', complete:'Complete', add_subtask:'+ Sub', transition:'Start'};
+        const typeIcons = {comment:'Comment', complete:'Complete', add_subtask:'+ Sub', transition:'Start', create_task:'New Task'};
 
         // Update header counts
         const meta = panel.querySelector('.sprint-meta');
         const highCount = suggestions.filter(s => s.confidence === 'high').length;
-        if (meta) meta.textContent = suggestions.length + '건 대기 · ' + highCount + '건 높은 확신';
+        const qualityReadyCount = suggestions.filter(
+          s => s.type === 'create_task' && s.auto_apply_eligible === true
+        ).length;
+        if (meta) meta.textContent = suggestions.length + '건 대기 · ' + qualityReadyCount
+          + '건 품질 통과 · ' + highCount + '건 높은 확신';
 
         // Group by Epic (큰틀): mirror the server-side render so refresh keeps swimlanes.
         const groups = {};
@@ -4779,21 +6096,29 @@ JIRA_SUGGESTIONS_SCRIPT = """
         const renderCard = (s) => {
           const collapsed = s.confidence === 'low' ? ' suggestion-collapsed' : '';
           const card = document.createElement('div');
-          card.className = 'jira-suggestion' + collapsed;
+          const isSub = s.type === 'add_subtask';
+          const isCreate = s.type === 'create_task';
+          const qualityEligible = isCreate ? s.auto_apply_eligible === true : true;
+          card.className = 'jira-suggestion' + collapsed + (isCreate && !qualityEligible ? ' quality-blocked' : '');
           // dataset uses textContent semantics under the hood — safe from XSS.
           card.dataset.sid = s.id || '';
           card.dataset.key = s.task_key || '';
           card.dataset.type = s.type || '';
-          const isSub = s.type === 'add_subtask';
-          const commentLabel = isSub ? '부작업 제목' : '댓글 (Comment)';
-          const descLabel = isSub ? '부작업 본문 (Description)' : '설명 (Description)';
-          const descHint = isSub ? '' : '<span class="hint">— 비워두면 변경 안 함</span>';
+          card.dataset.project = s.project_key || '';
+          card.dataset.epic = s.epic_key || '';
+          card.dataset.marker = s.dedupe_marker || '';
+          card.dataset.revision = s.proposal_revision || '';
+          card.dataset.reportRequired = s.report_required || 'yes';
+          card.dataset.qualityEligible = qualityEligible ? 'true' : 'false';
+          const commentLabel = isSub ? '부작업 제목' : (isCreate ? '작업 제목 (Summary)' : '댓글 (Comment)');
+          const descLabel = isSub ? '부작업 본문 (Description)' : (isCreate ? '작업 설명 (Description)' : '설명 (Description)');
+          const descHint = (isSub || isCreate) ? '' : '<span class="hint">— 비워두면 변경 안 함</span>';
           const subtitleHtml = s.subtitle ? `<div class="suggestion-subtitle">${escHtml(s.subtitle)}</div>` : '';
-          const psv = escHtml(s.parent_start || '');
-          const pev = escHtml(s.parent_end || '');
-          const dateHint = (s.parent_start || s.parent_end) ? '— 부모 작업 일정 미리 채움' : '— 비워두면 부모 작업 일정 상속';
+          const psv = escHtml(isCreate ? (s.start || '') : (s.parent_start || ''));
+          const pev = escHtml(isCreate ? (s.end || '') : (s.parent_end || ''));
+          const dateHint = isCreate ? '— 신규 작업 계획 일정' : ((s.parent_start || s.parent_end) ? '— 부모 작업 일정 미리 채움' : '— 비워두면 부모 작업 일정 상속');
           const sidEsc = escHtml(s.id || '');
-          const datesHtml = isSub ? `
+          const datesHtml = (isSub || isCreate) ? `
             <div class="suggestion-dates">
               <label class="suggestion-field-label">시작/종료일 <span class="hint">${dateHint}</span></label>
               <div class="suggestion-date-row">
@@ -4804,28 +6129,55 @@ JIRA_SUGGESTIONS_SCRIPT = """
             </div>` : '';
           const typeEsc = escHtml(s.type || '');
           const confEsc = escHtml(s.confidence || '');
+          const qualityScore = Number.isFinite(Number(s.quality_score)) ? Number(s.quality_score) : 0;
+          const qualityGrade = String(s.quality_grade || 'draft');
+          const qualityClass = qualityEligible ? 'ready' : (qualityGrade === 'manual' ? 'review' : 'draft');
+          const blockerItems = Array.isArray(s.blocking_reasons) ? s.blocking_reasons : [];
+          const blockersHtml = blockerItems.length ? '<ul class="quality-blockers">'
+            + blockerItems.map(reason => `<li>${escHtml(reason)}</li>`).join('') + '</ul>' : '';
+          const qualityHtml = isCreate ? `
+            <div class="quality-panel">
+              <div class="quality-meta">
+                <span><strong>근거 유형</strong> ${escHtml(s.evidence_type || '미분류')}</span>
+                <span><strong>품질 등급</strong> ${escHtml(qualityGrade)}</span>
+                <span><strong>자동 적용</strong> ${qualityEligible ? '가능' : '차단'}</span>
+              </div>${blockersHtml}
+            </div>` : '';
+          const qualityBadge = isCreate
+            ? `<span class="quality-score ${qualityClass}">${qualityScore}/100</span>` : '';
+          const approveDisabled = isCreate && !qualityEligible ? ' disabled title="품질 필수조건을 통과해야 승인할 수 있습니다"' : '';
+          const approveText = isCreate && !qualityEligible ? '보완 필요' : '승인';
           card.innerHTML = `
             <div class="suggestion-head">
-              <span class="jira-key">${escHtml(s.task_key)}</span>
+              <span class="jira-key">${escHtml(s.task_key || s.project_key || 'NEW')}</span>
               <span class="suggestion-type ${typeEsc}">${escHtml(typeIcons[s.type]||'Action')}</span>
               <span class="confidence ${confEsc}">${confEsc}</span>
+              ${qualityBadge}
               <span class="suggestion-spacer"></span>
               <strong class="suggestion-title">${escHtml(s.title)}</strong>
             </div>
             ${subtitleHtml}
             <div class="suggestion-reason">${escHtml(s.reason)}</div>
+            ${qualityHtml}
             <div class="suggestion-fields">
               <div>
                 <label class="suggestion-field-label" for="text-${sidEsc}">${commentLabel}</label>
                 <textarea class="suggestion-text" id="text-${sidEsc}">${escHtml(s.suggested_text||'')}</textarea>
               </div>
               <div>
-                <label class="suggestion-field-label" for="desc-${sidEsc}">${descLabel}${descHint}</label>
-                <textarea class="suggestion-description" id="desc-${sidEsc}">${escHtml(s.suggested_description||'')}</textarea>
+                <div class="suggestion-field-head">
+                  <label class="suggestion-field-label" for="desc-${sidEsc}">${descLabel}${descHint}</label>
+                  <span class="suggestion-desc-tools">
+                    <button type="button" class="jira-btn suggestion-edit-toggle" onclick="suggToggleDesc('${sidEsc}')">원문 편집</button>
+                    <button type="button" class="jira-btn suggestion-expand" onclick="suggExpandDesc('${sidEsc}')">크게 보기</button>
+                  </span>
+                </div>
+                <div class="desc-preview suggestion-preview" id="descpv-${sidEsc}"></div>
+                <textarea class="suggestion-description" id="desc-${sidEsc}" hidden>${escHtml(s.suggested_description||'')}</textarea>
               </div>
             </div>${datesHtml}
             <div class="suggestion-actions">
-              <button class="jira-btn approve" onclick="suggApprove('${sidEsc}')">승인</button>
+              <button class="jira-btn approve" onclick="suggApprove('${sidEsc}')"${approveDisabled}>${approveText}</button>
               <button class="jira-btn reject" onclick="suggReject('${sidEsc}')">거절</button>
             </div>`;
           return card;
@@ -4852,6 +6204,9 @@ JIRA_SUGGESTIONS_SCRIPT = """
           g.items.forEach(s => wrap.appendChild(renderCard(s)));
           body.appendChild(wrap);
         });
+        // Rebuilt cards start with an empty preview node — fill them before the
+        // toast, so a refresh never leaves a blank body where the text used to be.
+        window.suggRenderAllDesc(body);
 
         jiraToast('제안 리뷰 갱신 완료 (' + suggestions.length + '건)');
       })
@@ -4873,6 +6228,9 @@ JIRA_SUGGESTIONS_SCRIPT = """
     var _rb = document.getElementById('sugg-refresh-btn');
     if (_rb) _rb.style.display = 'none';
   }
+
+  // Server-rendered cards ship an empty preview node; fill them once at load.
+  window.suggRenderAllDesc();
 })();
 </script>
 """
@@ -5149,7 +6507,11 @@ def make_payload(
     profile_name: str,
 ) -> dict[str, Any]:
     github_meta = fetch_github_metadata(remote_url, branch, window, commits)
-    jira_enabled = _project_jira_for_repo(repo_root) is not None
+    jira_cfg = _project_jira_for_repo(repo_root)
+    # A project may opt into commit/plan -> Jira task creation without sharing an
+    # existing sprint.  In that mode (`suggest_existing: false`) we must not fetch all
+    # Tasks in the Jira project and guess parents across unrelated Epics.
+    jira_enabled = bool(jira_cfg) and bool(jira_cfg.get("suggest_existing", True))
     return build_context_payload(
         today=today,
         report_type=report_type,
@@ -5391,13 +6753,23 @@ def main() -> int:
     except Exception:
         pass
 
-    # Generate Jira suggestions from matched tasks + AI analysis
+    # Generate Jira suggestions from matched tasks + the ACTUAL plan report. Keep the
+    # Jira status sections separate: feeding only the Jira card here meant the planning
+    # module never saw priority_actions/mid_term_actions/risks from the plan document.
     _jira_suggestions: list[dict[str, Any]] = []
+    _plan_sections = next(
+        (dict(card.get("sections") or {}) for card in dashboard_cards
+         if card.get("report_type") == "plan"),
+        {},
+    )
     for card in dashboard_cards:
         if card["report_type"] == "jira":
             _jira_suggestions = generate_jira_suggestions(
                 card["payload"],
-                card.get("sections"),
+                {
+                    "plan": _plan_sections,
+                    "jira": dict(card.get("sections") or {}),
+                },
             )
             if _jira_suggestions:
                 sugg_path = output_root / "reports" / "jira" / f"{today.isoformat()}-jira-suggestions.json"

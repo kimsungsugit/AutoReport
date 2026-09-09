@@ -1068,18 +1068,107 @@ code {
 .confidence.high { background: var(--ok-bg); color: var(--ok-ink); }
 .confidence.medium { background: var(--warn-bg); color: var(--warn-ink); }
 .confidence.low { background: var(--paper-alt); color: var(--muted); }
+.quality-score { display: inline-flex; align-items: center; padding: 2px 7px; border: 1px solid var(--line); border-radius: var(--r-pill); font-size: 10px; font-weight: 800; background: var(--paper-alt); color: var(--muted); }
+.quality-score.ready { background: var(--ok-bg); border-color: var(--ok-bg); color: var(--ok-ink); }
+.quality-score.review { background: var(--warn-bg); border-color: var(--warn-bg); color: var(--warn-ink); }
+.quality-score.draft { background: var(--err-bg); border-color: var(--err-bg); color: var(--err-ink); }
+.jira-suggestion.quality-blocked { border-left: 4px solid var(--warn); }
+.quality-panel { margin: 8px 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--paper-alt); font-size: 11px; color: var(--muted); }
+.quality-panel strong { color: var(--ink); }
+.quality-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; }
+.quality-blockers { margin: 6px 0 0; padding-left: 18px; color: var(--err-ink); }
+.quality-blockers li { margin: 2px 0; }
 .suggestion-reason { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
 .suggestion-text { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; resize: vertical; min-height: 40px; box-sizing: border-box; background: var(--paper); color: var(--ink); }
 .suggestion-fields { display: flex; flex-direction: column; gap: 8px; margin-top: 4px; }
 .suggestion-field-label { display: block; font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-bottom: 3px; }
 .suggestion-field-label .hint { color: var(--muted); font-weight: 500; text-transform: none; letter-spacing: 0; margin-left: 4px; opacity: .8; }
-.suggestion-description { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; font-family: inherit; resize: vertical; min-height: 56px; box-sizing: border-box; background: var(--paper); color: var(--ink); }
+.suggestion-description { width: 100%; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); font-size: 13px; line-height: 1.65; font-family: inherit; resize: vertical; min-height: 96px; box-sizing: border-box; background: var(--paper); color: var(--ink); }
+/* create_task/add_subtask carry the full structured Jira body (문제/범위/완료조건/
+   검증/근거커밋 …) — 56px showed ~2 lines of a ~40-line document. Only these two
+   open tall; comment/complete/transition ship an empty optional description and
+   would otherwise render a large blank box. 크게 보기 covers the rest either way. */
+.jira-suggestion[data-type="create_task"] .suggestion-description,
+.jira-suggestion[data-type="add_subtask"] .suggestion-description { min-height: 240px; }
+.suggestion-field-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 3px; }
+.suggestion-field-head .suggestion-field-label { margin-bottom: 0; }
+.jira-btn.suggestion-expand { padding: 2px 9px; font-size: 10px; letter-spacing: .04em; color: var(--muted); flex: 0 0 auto; }
+.jira-btn.suggestion-expand:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+/* 크게 보기 modal — wide/tall variant of .jira-modal for reading long descriptions. */
+.jira-modal.desc-modal { width: 960px; max-width: 94vw; display: flex; flex-direction: column; max-height: 92vh; }
+.desc-modal h4 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.desc-modal h4 .desc-modal-key { font-family: var(--mono); font-size: 12px; color: var(--muted); font-weight: 600; }
+.desc-modal-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+.jira-btn.desc-tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.desc-modal [hidden] { display: none !important; }
+.desc-modal-text { flex: 1 1 auto; min-height: 45vh; line-height: 1.7; font-size: 13.5px; margin-bottom: 0 !important; }
+.desc-preview { flex: 1 1 auto; min-height: 45vh; overflow: auto; padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--paper-alt); font-size: 13.5px; line-height: 1.75; color: var(--ink); }
+.desc-preview h5 { margin: 16px 0 6px; font-size: 13px; font-weight: 800; letter-spacing: .02em; color: var(--accent); border-bottom: 1px solid var(--line); padding-bottom: 4px; }
+.desc-preview h5:first-child { margin-top: 0; }
+.desc-preview ul { margin: 4px 0 8px; padding-left: 20px; }
+.desc-preview li { margin: 3px 0; }
+.desc-preview p { margin: 4px 0 8px; white-space: pre-wrap; }
+.desc-preview pre { margin: 8px 0 0; padding: 8px 10px; border-radius: var(--r-sm); background: var(--paper); border: 1px solid var(--line); font-family: var(--mono); font-size: 11px; color: var(--muted); white-space: pre-wrap; word-break: break-all; }
+.desc-preview a { color: var(--accent); }
+.desc-preview .desc-preview-empty { color: var(--muted); font-style: italic; }
+.desc-modal .modal-actions { margin-top: 14px; }
+/* 계획 작성 modal — big tasks with nested subtasks, previewed before any Jira write. */
+.jira-modal.plan-modal { width: 1100px; }
+.plan-toolbar { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 10px; }
+.plan-toolbar .field-group { flex: 1 1 220px; margin-bottom: 0; }
+.plan-toolbar-btns { display: flex; gap: 6px; }
+.plan-toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--ink); padding-bottom: 8px; white-space: nowrap; cursor: pointer; }
+.plan-toggle input { margin: 0; width: auto; }
+.plan-modal [disabled] { opacity: .6; cursor: not-allowed; }
+.plan-modal [data-plan-json] { font-family: var(--mono); font-size: 12px; margin-bottom: 10px; }
+.plan-body { flex: 1 1 auto; min-height: 40vh; overflow: auto; display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 12px; }
+.plan-body .plan-preview[hidden] { display: none; }
+.plan-body:has(.plan-preview[hidden]) { grid-template-columns: 1fr; }
+.plan-task { border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: var(--r-md); background: var(--paper-alt); padding: 10px 12px; margin-bottom: 10px; }
+.plan-task-head { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+.plan-task-head input[type="text"] { flex: 1 1 auto; margin-bottom: 0; }
+.plan-task-head input[type="date"] { width: 140px; margin-bottom: 0; }
+.plan-task-head .jira-btn { padding: 4px 8px; }
+.plan-task-no { font-family: var(--mono); font-size: 11px; font-weight: 800; color: #fff; background: var(--accent); padding: 2px 8px; border-radius: 999px; flex-shrink: 0; }
+.plan-task textarea, .plan-task > input[type="text"] { margin-bottom: 6px; }
+.plan-subs { margin: 4px 0 6px 18px; }
+.plan-sub { border: 1px dashed var(--line); border-radius: var(--r-sm); background: var(--paper); padding: 6px 8px; margin-bottom: 6px; }
+.plan-sub input[type="text"] { margin-bottom: 4px; }
+.plan-sub-mark { color: var(--muted); font-family: var(--mono); flex-shrink: 0; }
+.plan-preview { padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--paper-alt); font-size: 13px; overflow: auto; }
+.plan-preview-head { font-weight: 800; margin-bottom: 8px; color: var(--ink); }
+.plan-preview-head .hint { font-weight: 500; color: var(--muted); }
+.plan-errors { margin: 0 0 10px; padding: 8px 10px 8px 26px; background: var(--danger-bg); color: var(--danger-ink); border-radius: var(--r-sm); }
+.plan-preview-lines { list-style: none; margin: 0; padding: 0; }
+.plan-preview-lines li { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-bottom: 1px solid var(--line-light); }
+.plan-preview-lines li.sub { padding-left: 22px; color: var(--muted); }
+.plan-preview-lines li > span:not([class]) { flex: 1 1 auto; min-width: 0; }
+.plan-preview-lines li .plan-note { margin-left: auto; }
+.plan-preview-lines li.fail { color: var(--danger-ink); }
+.plan-preview-lines li.reused { opacity: .75; }
+.plan-hint { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+.plan-kind { font-family: var(--mono); font-size: 11px; font-weight: 700; color: var(--accent); flex-shrink: 0; }
+.plan-preview-lines li.ok .plan-kind { color: var(--ok); }
+.plan-period { font-family: var(--mono); font-size: 11px; color: var(--muted); flex-shrink: 0; }
+.plan-note { font-size: 11px; white-space: nowrap; flex-shrink: 0; padding: 1px 6px; border-radius: 999px; background: var(--info-bg); color: var(--info-ink); }
+.plan-note.fail { background: var(--danger-bg); color: var(--danger-ink); }
+/* In-card body: the same rendered view as the modal preview, sized for a card.
+   The raw wiki source stays one click away (원문 편집) — `h2.`/`*bullet*` markup
+   is Jira syntax, not something a reviewer should have to read through. */
+.suggestion-preview { min-height: 96px; max-height: 340px; }
+.jira-suggestion[data-type="create_task"] .suggestion-preview,
+.jira-suggestion[data-type="add_subtask"] .suggestion-preview { min-height: 240px; }
+.jira-suggestion [hidden] { display: none !important; }
+.suggestion-desc-tools { display: flex; align-items: center; gap: 5px; flex: 0 0 auto; }
+.jira-btn.suggestion-edit-toggle { padding: 2px 9px; font-size: 10px; letter-spacing: .04em; color: var(--muted); flex: 0 0 auto; }
+.jira-btn.suggestion-edit-toggle:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
 .suggestion-dates { margin-top: 8px; }
 .suggestion-date-row { display: flex; gap: 8px; align-items: center; }
 .suggestion-date-row .jira-date-input { flex: 0 0 auto; }
 .suggestion-actions { display: flex; gap: 6px; margin-top: 8px; }
 .suggestion-actions .jira-btn.approve { background: var(--ok-bg); color: var(--ok-ink); border-color: var(--ok-bg); }
-.suggestion-actions .jira-btn.approve:hover { background: var(--ok); color: #fff; }
+.suggestion-actions .jira-btn.approve:hover:not(:disabled) { background: var(--ok); color: #fff; }
+.suggestion-actions .jira-btn.approve:disabled { cursor: not-allowed; opacity: .55; background: var(--paper-alt); color: var(--muted); border-color: var(--line); }
 .suggestion-actions .jira-btn.reject { background: var(--paper-alt); color: var(--muted); }
 .suggestion-actions .jira-btn.reject:hover { background: var(--err-bg); color: var(--err-ink); }
 .suggestion-collapsed { display: none; }

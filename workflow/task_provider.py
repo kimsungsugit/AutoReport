@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 import re
 import ssl
 from abc import ABC, abstractmethod
@@ -109,9 +110,20 @@ class TaskProvider(ABC):
         """Return [{key, summary}] of open Epics. project_key overrides default."""
         return []
 
+    def find_issues_by_label(self, label: str, project_key: str = "") -> list[dict]:
+        """Return [{key, summary, status}] matching one exact automation label."""
+        return []
+
+    def find_issues_by_marker(
+        self, marker: str, project_key: str = "", label: str = ""
+    ) -> list[dict]:
+        """Return issues matching an idempotency marker embedded at creation."""
+        return []
+
     def create_issue(self, issuetype: str, summary: str, description: str = "",
                      start: str = "", end: str = "", epic_key: str = "",
-                     project_key: str = "", report_required: str = "") -> str:
+                     project_key: str = "", report_required: str = "",
+                     labels: list[str] | None = None) -> str:
         """Create a top-level issue (Epic or Task). project_key overrides default.
 
         Returns new issue key, or '' on failure.
@@ -175,19 +187,29 @@ class JiraApiTaskProvider(TaskProvider):
     }
 
     def __init__(self, base_url: str, token: str, project_key: str = "APPL",
-                 sprint_id: str | int | None = None):
+                 sprint_id: str | int | None = None, verify_tls: bool | None = None):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.project_key = project_key
         self.sprint_id = sprint_id
         self._fallback = JsonFileTaskProvider()
         self._ssl_ctx = ssl.create_default_context()
-        self._ssl_ctx.check_hostname = False
-        self._ssl_ctx.verify_mode = ssl.CERT_NONE
+        if verify_tls is None:
+            verify_tls = os.environ.get("JIRA_VERIFY_TLS", "1").strip().lower() not in (
+                "0", "false", "no", "off",
+            )
+        if not verify_tls:
+            # Legacy/self-signed deployments may opt out explicitly, but secure TLS is
+            # the default. Never silently disable hostname/certificate verification.
+            self._ssl_ctx.check_hostname = False
+            self._ssl_ctx.verify_mode = ssl.CERT_NONE
         self.last_error: str = ""  # last write-operation error message (for diagnostics)
+        self.live_available: bool | None = None
+        self.fallback_used: bool = False
         self._epic_link_field: str | None = None  # lazy-detected customfield ID for Epic Link
         self._epic_name_field: str | None = None  # lazy-detected customfield ID for Epic Name
         self._issuetype_names: dict[str, str] | None = None  # lazy {"epic": "에픽"|"Epic", "task": "작업"|"Task"}
+        self._create_field_keys_cache: dict[tuple[str, str], set[str]] = {}
 
     def _request(self, method: str, path: str, body: dict | None = None) -> dict:
         """Make an authenticated request to Jira REST API.
@@ -214,25 +236,80 @@ class JiraApiTaskProvider(TaskProvider):
                 err_body = ""
             raise RuntimeError(f"HTTP {e.code} {e.reason}: {err_body[:300]}") from e
 
+    def _request_all_issues(self, path: str, page_size: int = 100) -> dict:
+        """Read every Jira search/agile page without silently truncating a sprint.
+
+        Jira Server search and Agile endpoints both expose ``startAt`` and
+        ``maxResults``.  Their terminal metadata differs, so stop on either an
+        explicit ``isLast`` flag, the declared total, or a short/empty page.
+        """
+        if page_size < 1:
+            raise ValueError("page_size must be positive")
+        issues: list[dict] = []
+        start_at = 0
+        first_page: dict | None = None
+        while True:
+            separator = "&" if "?" in path else "?"
+            page = self._request(
+                "GET",
+                f"{path}{separator}startAt={start_at}&maxResults={page_size}",
+            )
+            if first_page is None:
+                first_page = dict(page)
+            raw_batch = page.get("issues", [])
+            if raw_batch is None:
+                batch: list[dict] = []
+            elif not isinstance(raw_batch, list):
+                raise RuntimeError("Jira response field 'issues' is not a list")
+            else:
+                batch = raw_batch
+            issues.extend(batch)
+
+            next_start = start_at + len(batch)
+            total = page.get("total")
+            total_reached = isinstance(total, int) and next_start >= total
+            if page.get("isLast") is True or total_reached or not batch:
+                break
+            # When Jira omits total/isLast, a short page is the only terminal hint.
+            if total is None and len(batch) < page_size:
+                break
+            if next_start <= start_at:
+                raise RuntimeError("Jira pagination did not advance")
+            start_at = next_start
+
+        result = first_page or {}
+        result["issues"] = issues
+        result["total"] = len(issues)
+        return result
+
     def get_tasks(self) -> dict[str, Any]:
+        self.last_error = ""
+        self.fallback_used = False
         try:
             # epic_link customfield (보통 customfield_10008, 인스턴스마다 다를 수 있음)
             elf = self._detect_epic_link_field() or "customfield_10008"
             if self.sprint_id:
-                data = self._request("GET",
+                data = self._request_all_issues(
                     f"/rest/agile/1.0/sprint/{self.sprint_id}/issue"
-                    f"?maxResults=100&fields=summary,status,issuetype,subtasks,"
+                    f"?fields=summary,status,issuetype,subtasks,"
                     f"customfield_10230,customfield_10900,{elf}")
                 sprint_info = self._request("GET",
                     f"/rest/agile/1.0/sprint/{self.sprint_id}")
-                return self._convert_jira_response(data, sprint_info, epic_link_field=elf)
+                result = self._convert_jira_response(data, sprint_info, epic_link_field=elf)
+                self.live_available = True
+                return result
             else:
-                data = self._request("GET",
+                data = self._request_all_issues(
                     f"/rest/api/2/search?jql=project={self.project_key}"
                     f"+AND+type=Task&fields=summary,subtasks,status,"
                     f"customfield_10230,customfield_10900,{elf}")
-                return self._convert_jira_response(data, epic_link_field=elf)
-        except Exception:
+                result = self._convert_jira_response(data, epic_link_field=elf)
+                self.live_available = True
+                return result
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.live_available = False
+            self.fallback_used = True
             return self._fallback.get_tasks()
 
     def update_subtask_status(self, task_key: str, subtask_title: str, status: str) -> bool:
@@ -297,20 +374,48 @@ class JiraApiTaskProvider(TaskProvider):
                 )
                 return False
 
+            # The comment goes through the dedicated comment API, NOT the transition
+            # payload: this Jira's transition screens have no comment field, so an
+            # `update.comment` rides along with a 200 and is then silently dropped —
+            # the transition looked successful while the "how it was done" note
+            # vanished. Posting it separately makes the note verifiable.
             payload: dict[str, Any] = {"transition": {"id": transition_id}}
-            if comment:
+            try:
+                self._request(
+                    "POST", f"/rest/api/2/issue/{issue_key}/transitions", payload
+                )
+            except Exception as exc:
+                # A workflow that REQUIRES a comment on this transition rejects the
+                # bare payload; retry with the comment embedded so it still moves.
+                if not comment or "comment" not in str(exc).lower():
+                    raise
                 payload["update"] = {"comment": [{"add": {"body": comment}}]}
-            self._request("POST", f"/rest/api/2/issue/{issue_key}/transitions", payload)
+                self._request(
+                    "POST", f"/rest/api/2/issue/{issue_key}/transitions", payload
+                )
+                return True
+            if comment and not self.add_comment(issue_key, comment):
+                # Status moved but the note did not land — report it instead of
+                # returning a success that hides a missing audit trail.
+                self.last_error = (
+                    f"'{status}' 전환은 됐으나 댓글 등록 실패: {self.last_error}"
+                )
+                return False
             return True
         except Exception as e:
             self.last_error = str(e)
             return False
 
     def complete_issue(self, issue_key: str, comment: str = "") -> bool:
-        """Mark issue as '종료 요청' with a completion comment."""
-        if comment:
-            return self.transition_issue(issue_key, "종료 요청", comment)
-        return self.transition_issue(issue_key, "종료 요청")
+        """Mark issue as '종료 요청' and always leave a completion comment.
+
+        An empty comment falls back to a short dated note so the transition is
+        never silent in the issue history.
+        """
+        note = (comment or "").strip() or (
+            f"AutoReport 완료 처리 ({date.today().isoformat()}) — 작업 완료로 종료 요청"
+        )
+        return self.transition_issue(issue_key, "종료 요청", note)
 
     def update_description(self, issue_key: str, description: str) -> bool:
         """Replace an issue's description via PUT /rest/api/2/issue/{key}."""
@@ -511,9 +616,122 @@ class JiraApiTaskProvider(TaskProvider):
             self.last_error = str(e)
             return []
 
+    def find_issues_by_label(self, label: str, project_key: str = "") -> list[dict]:
+        """Find previously-created AutoReport issues for Jira-side idempotency."""
+        self.last_error = ""
+        pk = (project_key or self.project_key).strip()
+        clean_label = (label or "").strip()
+        if not pk or not re.fullmatch(r"[A-Za-z0-9_-]+", pk):
+            self.last_error = f"invalid project key: {pk!r}"
+            return []
+        if not clean_label or not re.fullmatch(r"[A-Za-z0-9_.-]+", clean_label):
+            self.last_error = f"invalid label: {clean_label!r}"
+            return []
+        try:
+            from urllib.parse import quote
+            jql = f'project={pk} AND labels="{clean_label}" ORDER BY created DESC'
+            data = self._request(
+                "GET",
+                f"/rest/api/2/search?jql={quote(jql)}&fields=summary,status&maxResults=20",
+            )
+            return [
+                {
+                    "key": issue.get("key", ""),
+                    "summary": (issue.get("fields") or {}).get("summary", ""),
+                    "status": (((issue.get("fields") or {}).get("status") or {}).get("name", "")),
+                }
+                for issue in data.get("issues", [])
+                if issue.get("key")
+            ]
+        except Exception as exc:
+            self.last_error = str(exc)
+            return []
+
+    def find_issues_by_marker(
+        self, marker: str, project_key: str = "", label: str = ""
+    ) -> list[dict]:
+        """Find a Task by the opaque marker embedded in its summary at creation.
+
+        The APPL Task create screen does not expose Jira's ``labels`` field. A
+        summary marker is therefore the only idempotency value that is written in
+        the same POST as the issue itself, eliminating the create-then-tag crash
+        window. ``label`` is accepted only for interface compatibility and ignored.
+        """
+        del label
+        self.last_error = ""
+        pk = (project_key or self.project_key).strip().upper()
+        clean_marker = (marker or "").strip().upper()
+        if not re.fullmatch(r"[A-Z][A-Z0-9_-]*", pk):
+            self.last_error = f"invalid project key: {pk!r}"
+            return []
+        if not re.fullmatch(r"ARID[A-F0-9]{20}", clean_marker):
+            self.last_error = f"invalid proposal marker: {clean_marker!r}"
+            return []
+        try:
+            from urllib.parse import quote
+
+            jql = (
+                f'project={pk} AND summary ~ "\\\"{clean_marker}\\\"" '
+                "ORDER BY created DESC"
+            )
+            data = self._request(
+                "GET",
+                f"/rest/api/2/search?jql={quote(jql)}&fields=summary,status&maxResults=20",
+            )
+            return [
+                {
+                    "key": issue.get("key", ""),
+                    "summary": (issue.get("fields") or {}).get("summary", ""),
+                    "status": (((issue.get("fields") or {}).get("status") or {}).get("name", "")),
+                }
+                for issue in data.get("issues", [])
+                if issue.get("key")
+            ]
+        except Exception as exc:
+            self.last_error = str(exc)
+            return []
+
+    def find_issue_by_exact_summary(self, summary: str, project_key: str = "",
+                                    epic_key: str = "", parent_key: str = "") -> str:
+        """Key of an existing issue with exactly this summary under epic/parent, or ''.
+
+        Second line of defence for plan re-registration when the local run
+        record is missing: the summary is what a reviewer sees, so a clean
+        manager-facing title stays clean (no marker) and still dedupes.  Text
+        search is fuzzy, hence the exact comparison on the returned rows.
+        """
+        self.last_error = ""
+        pk = (project_key or self.project_key).strip().upper()
+        clean = (summary or "").strip()
+        if not clean or not re.fullmatch(r"[A-Z][A-Z0-9_-]*", pk):
+            return ""
+        try:
+            from urllib.parse import quote
+            phrase = clean.replace("\\", "\\\\").replace('"', '\\"')
+            clauses = [f"project={pk}", f'summary ~ "\\"{phrase}\\""']
+            if parent_key and re.fullmatch(r"[A-Z][A-Z0-9]+-[0-9]+", parent_key):
+                clauses.append(f"parent={parent_key}")
+            elif epic_key and re.fullmatch(r"[A-Z][A-Z0-9]+-[0-9]+", epic_key):
+                elf = self._detect_epic_link_field() or ""
+                cf_id = elf.replace("customfield_", "")
+                if cf_id.isdigit():
+                    clauses.append(f"cf[{cf_id}]={epic_key}")
+                clauses.append('issuetype != 부작업')
+            jql = " AND ".join(clauses) + " ORDER BY created DESC"
+            data = self._request(
+                "GET", f"/rest/api/2/search?jql={quote(jql)}&fields=summary&maxResults=20")
+            for issue in data.get("issues", []):
+                if ((issue.get("fields") or {}).get("summary") or "").strip() == clean:
+                    return str(issue.get("key") or "")
+            return ""
+        except Exception as exc:
+            self.last_error = str(exc)
+            return ""
+
     def create_issue(self, issuetype: str, summary: str, description: str = "",
                      start: str = "", end: str = "", epic_key: str = "",
-                     project_key: str = "", report_required: str = "") -> str:
+                     project_key: str = "", report_required: str = "",
+                     labels: list[str] | None = None) -> str:
         """Create an Epic or Task at the project root.
 
         - issuetype: case-insensitive 'epic' or 'task' (Korean 에픽/작업/큰틀 also accepted).
@@ -545,6 +763,10 @@ class JiraApiTaskProvider(TaskProvider):
             }
             if description:
                 fields["description"] = description
+            if labels:
+                fields["labels"] = sorted({
+                    str(label).strip() for label in labels if str(label).strip()
+                })
             # Start/End custom fields are configured on Task/Sub-task screens
             # only in this Jira instance. Sending them on the Epic (큰틀)
             # creation screen returns "Field 'customfield_10230' cannot be set".
@@ -579,7 +801,10 @@ class JiraApiTaskProvider(TaskProvider):
                 # creation under an Epic 400s with "주간보고 사항 항목은 필수".
                 # User-supplied start/end already populated above take precedence.
                 try:
-                    inheritable = ("customfield_10230", "customfield_10900", "customfield_11100")
+                    # components is inherited too: board 239's filter is
+                    # `component = 김성수`, so a Task created without the Epic's
+                    # component lands in the sprint but never shows on the board.
+                    inheritable = ("customfield_10230", "customfield_10900", "customfield_11100", "components")
                     parent = self._request(
                         "GET",
                         f"/rest/api/2/issue/{epic_key}?fields={','.join(inheritable)}",
@@ -733,16 +958,24 @@ def get_task_provider(project_config: dict | None = None) -> TaskProvider:
         project_config: optional project dict from startup_projects.json
                         with jira.project_key, jira.sprint_id fields.
     """
-    import os
     _ensure_dotenv_loaded()
     jira_url = os.environ.get("JIRA_URL", "")
     jira_token = os.environ.get("JIRA_TOKEN", "")
     if jira_url and jira_token:
-        project_key = "APPL"
+        project_key = os.environ.get("JIRA_PROJECT_KEY", "APPL").strip() or "APPL"
         sprint_id = None
         if project_config and isinstance(project_config.get("jira"), dict):
             jira_cfg = project_config["jira"]
             project_key = jira_cfg.get("project_key", project_key)
             sprint_id = jira_cfg.get("sprint_id")
-        return JiraApiTaskProvider(jira_url, jira_token, project_key, sprint_id)
+        verify_tls = os.environ.get("JIRA_VERIFY_TLS", "1").strip().lower() not in (
+            "0", "false", "no", "off",
+        )
+        return JiraApiTaskProvider(
+            jira_url,
+            jira_token,
+            project_key,
+            sprint_id,
+            verify_tls=verify_tls,
+        )
     return JsonFileTaskProvider()

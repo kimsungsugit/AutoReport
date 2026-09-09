@@ -28,10 +28,37 @@ sys.path.insert(0, str(REPO_ROOT))
 from dotenv import load_dotenv
 load_dotenv(REPO_ROOT / ".env")
 
+from workflow.jira_apply import (
+    InvalidCreateTaskProposal,
+    JiraApplyBlocked,
+    JiraApplyFailed,
+    JiraApplyService,
+    JiraApplyUncertain,
+    proposal_revision,
+)
+from workflow.jira_outbox import JiraOutbox
+from workflow.jira_plan_register import (
+    PlanRunStore, apply_status_by_dates, create_subtask, describe_plan, probe_existing, register_plan,
+    validate_plan,
+)
 from workflow.task_provider import get_task_provider
 
 PORT = 18923
+PROJECT_KEY_DEFAULT = "APPL"
 provider = get_task_provider({"jira": {"project_key": "APPL", "sprint_id": 152}})
+
+
+def _get_jira_apply_service() -> JiraApplyService:
+    """Build the create-only service from the current provider and repo root.
+
+    Constructing it per request reloads the durable outbox and converts a
+    process-crash ``in_flight`` record to ``uncertain`` before any Jira retry.
+    """
+
+    return JiraApplyService(
+        provider,
+        JiraOutbox(REPO_ROOT / "reports" / "jira_outbox.json"),
+    )
 
 # CSRF defense: every POST here performs an irreversible REAL Jira write (signed by the
 # user's PAT). The server is reachable by any page the user visits (localhost bind does
@@ -220,6 +247,7 @@ def _find_suggestions_file(target_date: str | None = None) -> Path | None:
         for f in files:
             if target_date in f:
                 return Path(f)
+        return None
     return Path(files[0]) if files else None
 
 
@@ -242,6 +270,7 @@ def _find_project_suggestions_file(project: str, target_date: str | None = None)
         for f in files:
             if target_date in f:
                 return Path(f)
+        return None
     return Path(files[0]) if files else None
 
 
@@ -260,6 +289,13 @@ def _read_suggestions_path(path: Path | None) -> dict:
 def _split_namespaced_id(sid: str) -> tuple[str, str]:
     """Portfolio ids are '{project}-{stableid}'; stable ids are 's'+hex (no '-'), so the
     last '-' cleanly separates project from raw id. A bare id (no '-') → project=''."""
+    # New create-task proposal ids contain a dash themselves (``jtp-...``).
+    # Preserve that raw id when the portfolio prepends a project namespace.
+    if sid.startswith("jtp-"):
+        return "", sid
+    proposal_separator = sid.rfind("-jtp-")
+    if proposal_separator > 0:
+        return sid[:proposal_separator], sid[proposal_separator + 1:]
     if "-" in sid:
         project, _, raw = sid.rpartition("-")
         return project, raw
@@ -310,6 +346,64 @@ def _save_suggestions(path: Path, data: dict):
 def _last_error() -> str:
     """Read the most recent provider error message (empty string if none)."""
     return getattr(provider, "last_error", "") or ""
+
+
+def _approval_source_mismatch(stored: dict, submitted: dict) -> str:
+    """Reject identity changes while allowing optional legacy fields to be absent.
+
+    The browser may edit presentation text, but it cannot reinterpret a stored
+    suggestion as a different Jira action or point it at a different issue.
+    Callers must use the returned stored values after this check.
+    """
+
+    fields = ["type", "task_key"]
+    if str(stored.get("type") or "").strip() == "create_task":
+        fields.extend(("project_key", "epic_key", "dedupe_marker"))
+    for field in fields:
+        if field not in submitted:
+            return f"submitted approval is missing immutable field {field!r}"
+        expected = str(stored.get(field) or "").strip()
+        actual = str(submitted.get(field) or "").strip()
+        if actual != expected:
+            return (
+                f"submitted {field} does not match the stored suggestion "
+                f"({actual!r} != {expected!r})"
+            )
+    return ""
+
+
+def _reviewed_create_task_proposal(stored: dict, submitted: dict) -> dict:
+    """Merge validated editable values into a server-owned proposal copy."""
+
+    required = ("text", "description", "start", "end", "report_required")
+    missing = [field for field in required if field not in submitted]
+    if missing:
+        raise ValueError(
+            "approval is missing reviewed fields; reload the dashboard: "
+            + ", ".join(missing)
+        )
+    summary = str(submitted.get("text") or "").strip()
+    description = str(submitted.get("description") or "")
+    start = str(submitted.get("start") or "").strip()
+    end = str(submitted.get("end") or "").strip()
+    report_required = str(submitted.get("report_required") or "").strip().lower()
+    if not summary:
+        raise ValueError("create_task summary is required")
+    if not start or not end or not _is_valid_date(start) or not _is_valid_date(end):
+        raise ValueError("create_task start and end must use YYYY-MM-DD")
+    if start > end:
+        raise ValueError("create_task start cannot be after end")
+    if report_required not in ("yes", "no"):
+        raise ValueError("create_task report_required must be yes or no")
+    reviewed = dict(stored)
+    reviewed.update(
+        suggested_text=summary,
+        suggested_description=description,
+        start=start,
+        end=end,
+        report_required=report_required,
+    )
+    return reviewed
 
 
 def _is_valid_date(s: str) -> bool:
@@ -571,42 +665,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 _json_response(self, {"error": "parent_key and summary required"}, 400)
                 return
             try:
-                fields: dict = {
-                    "project": {"key": parent_key.split("-")[0]},
-                    "parent": {"key": parent_key},
-                    "summary": summary,
-                    "issuetype": {"name": "부작업"},
-                }
-                if description:
-                    fields["description"] = description
-                # Inherit required customfields from parent (mirrors the
-                # suggestion-approve add_subtask branch). If the parent fetch
-                # fails or the fields are unset on the parent, Jira's 400
-                # surfaces the missing-field message to the caller as before.
-                try:
-                    required_cfs = ("customfield_10230", "customfield_10900", "customfield_11100")
-                    parent = provider._request(
-                        "GET",
-                        f"/rest/api/2/issue/{parent_key}?fields={','.join(required_cfs)}",
-                    )
-                    pfields = (parent or {}).get("fields", {}) or {}
-                    for cf in required_cfs:
-                        val = pfields.get(cf)
-                        if val is None:
-                            continue
-                        if isinstance(val, dict) and "id" in val:
-                            fields[cf] = {"id": val["id"]}
-                        elif isinstance(val, list):
-                            fields[cf] = [
-                                {"id": v["id"]} if isinstance(v, dict) and "id" in v else v
-                                for v in val
-                            ]
-                        else:
-                            fields[cf] = val
-                except Exception:
-                    pass
-                result = provider._request("POST", "/rest/api/2/issue", {"fields": fields})
-                _json_response(self, {"ok": True, "key": result.get("key", "")})
+                new_key = create_subtask(provider, parent_key, summary, description)
+                _json_response(self, {"ok": True, "key": new_key})
             except Exception as e:
                 _json_response(self, {"ok": False, "error": str(e)}, 500)
 
@@ -651,6 +711,53 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 err = _last_error() or "이슈 생성 실패"
                 _json_response(self, {"ok": False, "error": err}, 500)
 
+        # POST /api/jira/plan  — reviewed plan (tasks + subtasks) from the dashboard.
+        # body: {plan: {epics, tasks[...]}, apply: bool, confirm_total: int, sprint_id?}
+        # apply=false (default) validates and returns the preview only — no Jira call.
+        # apply=true additionally requires confirm_total == the previewed total so a
+        # stale preview (plan edited after previewing) is refused instead of written.
+        elif path == "/api/jira/plan":
+            plan, errors = validate_plan(body.get("plan"))
+            if errors:
+                _json_response(self, {"ok": False, "errors": errors, "preview": describe_plan(plan)}, 400)
+                return
+            project_key = (body.get("project_key") or "").strip() or PROJECT_KEY_DEFAULT
+            if not re.fullmatch(r"[A-Z][A-Z0-9]+", project_key):
+                _json_response(self, {"ok": False, "errors": [f"project_key 형식이 올바르지 않습니다: {project_key}"]}, 400)
+                return
+            # Run record: a retry of the same plan (same fingerprint) reuses what
+            # the previous run created instead of registering it twice.
+            store = PlanRunStore(REPO_ROOT / "reports" / "jira_plan_runs")
+            # Read-only probe (run record + Jira exact-title search) so the preview
+            # already says which lines will be reused instead of created.
+            existing = probe_existing(plan, provider, project_key, store)
+            preview = describe_plan(plan, existing)
+            if not body.get("apply"):
+                _json_response(self, {"ok": True, "applied": False, "preview": preview})
+                return
+            # The preview's fingerprint covers the whole normalized content, so an
+            # edit that keeps the count (retitle, date move) is still refused.
+            if (body.get("confirm_total") != preview["total"]
+                    or body.get("confirm_fingerprint") != preview["fingerprint"]):
+                _json_response(self, {"ok": False, "preview": preview,
+                                      "errors": ["미리보기 이후 계획이 바뀌었습니다 — 다시 미리보기 하세요"]}, 409)
+                return
+            sprint_id = body.get("sprint_id") or None
+            if sprint_id is not None and not str(sprint_id).isdigit():
+                _json_response(self, {"ok": False, "errors": ["sprint_id 는 숫자여야 합니다"]}, 400)
+                return
+            try:
+                created = register_plan(plan, provider, project_key, sprint_id, store=store, existing=existing)
+                if body.get("auto_status"):
+                    apply_status_by_dates(created, provider, date.today().isoformat())
+            except Exception as e:
+                _json_response(self, {"ok": False, "errors": [str(e)]}, 500)
+                return
+            failed = [c for c in created if not c.get("key") or c.get("status_error")]
+            reused = sum(1 for c in created if c.get("reused"))
+            _json_response(self, {"ok": not failed, "applied": True, "preview": preview,
+                                  "created": created, "failed": len(failed), "reused": reused})
+
         # POST /api/suggestions/{id}/approve
         elif "/api/suggestions/" in path and path.endswith("/approve"):
             sid = path.split("/")[3]
@@ -667,12 +774,199 @@ class ProxyHandler(BaseHTTPRequestHandler):
                  if s.get("id") == _raw_id),
                 None,
             )
-            if _existing and _existing.get("status") == "approved":
-                _json_response(self, {"ok": True, "comment_ok": True, "description_ok": True,
-                                      "already_applied": True})
+            if not _existing:
+                _json_response(
+                    self,
+                    {"ok": False, "error": "stored suggestion was not found"},
+                    404,
+                )
                 return
-            task_key = body.get("task_key", "")
-            stype = body.get("type", "comment")
+            _identity_error = _approval_source_mismatch(_existing, body)
+            if _identity_error:
+                _json_response(
+                    self,
+                    {
+                        "ok": False,
+                        "error": _identity_error,
+                        "comment_ok": False,
+                        "description_ok": False,
+                    },
+                    409,
+                )
+                return
+
+            # The persisted record is authoritative.  Submitted identity fields
+            # were checked above but are never used to select a Jira mutation.
+            task_key = str(_existing.get("task_key") or "").strip()
+            stype = str(_existing.get("type") or "comment").strip()
+            _base_revision = ""
+            _reviewed_proposal = _existing
+            if stype == "create_task":
+                _base_revision = proposal_revision(_existing)
+                _submitted_revision = str(body.get("proposal_revision") or "").strip()
+                _allowed_revisions = {_base_revision}
+                if _existing.get("status") == "approved":
+                    _allowed_revisions.add(
+                        str(_existing.get("jira_review_revision") or "").strip()
+                    )
+                if not _submitted_revision or _submitted_revision not in _allowed_revisions:
+                    _json_response(
+                        self,
+                        {"ok": False,
+                         "error": "stored proposal changed; reload and review it again",
+                         "comment_ok": False, "description_ok": False},
+                        409,
+                    )
+                    return
+                try:
+                    _reviewed_proposal = _reviewed_create_task_proposal(_existing, body)
+                    # This value is stamped by the server-side review route.  Client
+                    # payloads cannot promote an automatic hook request into rollout
+                    # stage C's manual-review channel.
+                    _reviewed_proposal["approval_channel"] = "manual_review"
+                except ValueError as exc:
+                    _json_response(
+                        self,
+                        {"ok": False, "error": str(exc), "comment_ok": False,
+                         "description_ok": False},
+                        400,
+                    )
+                    return
+                if _existing.get("status") == "approved":
+                    _applied_revision = str(
+                        _existing.get("jira_applied_revision") or _base_revision
+                    )
+                    if proposal_revision(_reviewed_proposal) != _applied_revision:
+                        _json_response(
+                            self,
+                            {"ok": False,
+                             "error": "approved create_task content cannot be changed",
+                             "comment_ok": False, "description_ok": False},
+                            409,
+                        )
+                        return
+            if _existing.get("status") == "approved":
+                _json_response(self, {"ok": True, "comment_ok": True, "description_ok": True,
+                                      "already_applied": True,
+                                      "key": _existing.get("created_task_key", ""),
+                                      "operation_id": _existing.get("jira_operation_id", ""),
+                                      "proposal_marker": _existing.get("jira_proposal_marker", ""),
+                                      "outbox_state": _existing.get("jira_outbox_state", "applied")})
+                return
+
+            if stype == "create_task":
+                try:
+                    _apply_result = _get_jira_apply_service().apply_create_task(
+                        _reviewed_proposal
+                    )
+                except InvalidCreateTaskProposal as exc:
+                    _json_response(
+                        self,
+                        {"ok": False, "error": str(exc), "comment_ok": False,
+                         "description_ok": False},
+                        400,
+                    )
+                    return
+                except JiraApplyFailed as exc:
+                    _json_response(
+                        self,
+                        {"ok": False, "error": str(exc), "comment_ok": False,
+                         "description_ok": False,
+                         "operation_id": exc.operation_id,
+                         "outbox_state": exc.state.value if exc.state else "failed"},
+                        409,
+                    )
+                    return
+                except JiraApplyUncertain as exc:
+                    _json_response(
+                        self,
+                        {"ok": False, "error": str(exc), "comment_ok": False,
+                         "description_ok": False, "uncertain": True,
+                         "created_key": exc.created_key,
+                         "operation_id": exc.operation_id,
+                         "outbox_state": exc.state.value if exc.state else "uncertain"},
+                        409,
+                    )
+                    return
+                except JiraApplyBlocked as exc:
+                    _json_response(
+                        self,
+                        {"ok": False, "error": str(exc), "comment_ok": False,
+                         "description_ok": False,
+                         "operation_id": exc.operation_id,
+                         "outbox_state": exc.state.value if exc.state else "pending"},
+                        503,
+                    )
+                    return
+                except Exception as exc:
+                    print(
+                        f"[jira_proxy] create_task {sid}: local apply failure: {exc}",
+                        file=sys.stderr,
+                    )
+                    _json_response(
+                        self,
+                        {"ok": False, "error": f"local Jira apply failed: {exc}",
+                         "comment_ok": False, "description_ok": False},
+                        500,
+                    )
+                    return
+
+                # Jira/outbox is already terminal here.  Persisting the card is a
+                # separate local gate: if it fails, a re-click is still safe because
+                # the outbox returns SKIP (or the Jira marker reconciles the result).
+                _persisted = False
+                _persistence_error = ""
+                try:
+                    _data = _read_suggestions_path(_spath)
+                    for _suggestion in _data.get("suggestions", []):
+                        if _suggestion.get("id") == _raw_id:
+                            if proposal_revision(_suggestion) != _base_revision:
+                                _persistence_error = (
+                                    "stored proposal changed while Jira was applying; "
+                                    "approval status was not written to the new revision"
+                                )
+                                break
+                            _suggestion["status"] = "approved"
+                            _suggestion["suggested_text"] = _reviewed_proposal["suggested_text"]
+                            _suggestion["suggested_description"] = _reviewed_proposal[
+                                "suggested_description"
+                            ]
+                            _suggestion["start"] = _reviewed_proposal["start"]
+                            _suggestion["end"] = _reviewed_proposal["end"]
+                            _suggestion["report_required"] = _reviewed_proposal[
+                                "report_required"
+                            ]
+                            _suggestion["created_task_key"] = _apply_result.key
+                            _suggestion["jira_operation_id"] = _apply_result.operation_id
+                            _suggestion["jira_proposal_marker"] = _apply_result.marker
+                            _suggestion["jira_outbox_state"] = _apply_result.state.value
+                            _suggestion["jira_review_revision"] = _base_revision
+                            _suggestion["jira_applied_revision"] = proposal_revision(
+                                _reviewed_proposal
+                            )
+                            _persisted = True
+                            break
+                    if _persisted:
+                        _save_suggestions(_spath, _data)
+                except OSError as exc:
+                    _persisted = False
+                    _persistence_error = str(exc)
+                    print(
+                        f"[jira_proxy] create_task {sid}: applied but suggestion "
+                        f"persistence failed: {exc}",
+                        file=sys.stderr,
+                    )
+                _response = {
+                    "ok": True,
+                    "comment_ok": True,
+                    "description_ok": True,
+                    "status_persisted": _persisted,
+                    "persistence_error": _persistence_error,
+                    **_apply_result.to_dict(),
+                }
+                _json_response(self, _response)
+                return
+
             # `text` is the legacy single-field; `comment` and `description` are the
             # split fields from the new dual-input UI. Fall back to `text` for
             # backwards compatibility with older payloads.
@@ -732,7 +1026,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     # 사내 Jira 필수: customfield_10230(Start date), customfield_10900(End date),
                     # customfield_11100(주간보고 사항). 부모에 값이 있으면 그대로 상속한다.
                     try:
-                        required_cfs = ("customfield_10230", "customfield_10900", "customfield_11100")
+                        required_cfs = ("customfield_10230", "customfield_10900", "customfield_11100", "components")
                         parent = provider._request(
                             "GET",
                             f"/rest/api/2/issue/{task_key}?fields={','.join(required_cfs)}",
