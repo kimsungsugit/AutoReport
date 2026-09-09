@@ -4,13 +4,27 @@
       "name": "GreencoreMaster",
       "path": "D:/Project/Program/GreencoreMaster",
       "profile": "desktop_app",
-      "enabled": true
+      "enabled": true,
+      "jira": {
+        "project_key": "APPL",
+        "suggest_existing": false,
+        "auto_plan": true,
+        "plan_horizon_days": 7,
+        "report_required": "yes"
+      }
     },
     {
       "name": "AutoReport",
       "path": "D:/Project/Program/AutoReport",
       "profile": "reporting_automation",
-      "enabled": true
+      "enabled": true,
+      "jira": {
+        "project_key": "APPL",
+        "suggest_existing": false,
+        "auto_plan": true,
+        "plan_horizon_days": 7,
+        "report_required": "yes"
+      }
     },
     {
       "name": "Release_claude",
@@ -21,7 +35,10 @@
         "project_key": "APPL",
         "sprint_id": 152,
         "board_id": 239,
-        "epic_key": "APPL-373"
+        "epic_key": "APPL-373",
+        "auto_plan": true,
+        "plan_horizon_days": 7,
+        "report_required": "yes"
       }
     },
     {
@@ -33,7 +50,10 @@
         "project_key": "APPL",
         "sprint_id": 152,
         "board_id": 239,
-        "epic_key": "APPL-418"
+        "epic_key": "APPL-418",
+        "auto_plan": true,
+        "plan_horizon_days": 7,
+        "report_required": "yes"
       }
     }
   ]

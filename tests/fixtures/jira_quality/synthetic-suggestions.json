@@ -1,0 +1,81 @@
+{
+  "date": "2026-08-11",
+  "suggestions": [
+    {
+      "id": "good-commit-backed",
+      "type": "create_task",
+      "dedupe_marker": "autoreport:jira-create-task:v1:good",
+      "proposal_revision": "jrev_good",
+      "source_commits": [
+        {"sha": "1111111111111111111111111111111111111111"},
+        {"sha": "2222222222222222222222222222222222222222"}
+      ],
+      "executed_validation": [
+        {
+          "command": "pytest tests/test_feature.py -q",
+          "environment": "python 3.13 / Windows",
+          "actual_result": "2 passed",
+          "source": "ci://build/10"
+        },
+        {
+          "command": "npm test",
+          "environment": "node 24 / Windows",
+          "source": "ci://build/11"
+        }
+      ],
+      "expected_assessment": {
+        "quality_score": 90,
+        "quality_grade": "auto",
+        "blocking_reasons": [],
+        "auto_apply_eligible": true,
+        "quality_dimensions": {"traceability": 20},
+        "evidence_type": "commit_backed"
+      }
+    },
+    {
+      "id": "mixed-commit-backed",
+      "type": "create_task",
+      "dedupe_marker": "autoreport:jira-create-task:v1:mixed",
+      "proposal_revision": "jrev_mixed",
+      "source_commits": [
+        {"sha": "3333333333333333333333333333333333333333"},
+        {"sha": "4444444444444444444444444444444444444444"},
+        {"sha": "5555555555555555555555555555555555555555"},
+        {"sha": "6666666666666666666666666666666666666666"}
+      ],
+      "executed_validation": [
+        {
+          "command": "dotnet test",
+          "environment": ".NET 10 / Windows",
+          "exit_code": 0,
+          "source": "ci://build/12"
+        },
+        "tests looked good"
+      ],
+      "expected_assessment": {
+        "quality_score": 50,
+        "quality_grade": "draft",
+        "blocking_reasons": ["missing_acceptance_criteria", "mixed_scope"],
+        "auto_apply_eligible": false,
+        "quality_dimensions": {"cohesion": 0},
+        "evidence_type": "commit_backed"
+      }
+    },
+    {
+      "id": "plan-only",
+      "type": "create_task",
+      "dedupe_marker": "autoreport:jira-create-task:v1:plan",
+      "proposal_revision": "jrev_plan",
+      "source_commits": [],
+      "executed_validation": [],
+      "expected_assessment": {
+        "quality_score": 40,
+        "quality_grade": "draft",
+        "blocking_reasons": ["plan_only"],
+        "auto_apply_eligible": false,
+        "quality_dimensions": {"traceability": 0},
+        "evidence_type": "plan_draft"
+      }
+    }
+  ]
+}

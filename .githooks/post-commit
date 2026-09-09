@@ -1,0 +1,74 @@
+#!/bin/sh
+# Queue the new commit for Jira review.  A post-commit integration failure must
+# never change the outcome of the Git commit itself, so this hook always exits 0
+# while preserving the worker exit code in the queue log and sidecar file.
+
+# Git for Windows normally supplies these paths, but explicit sh.exe invocations
+# may not. Keep the hook self-contained for installer/test diagnostics too.
+PATH="/usr/bin:/mingw64/bin:$PATH"
+export PATH
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  printf '%s\n' '[jira-queue] repository root unavailable; hook skipped' >&2
+  exit 0
+fi
+
+HOOK_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+AUTOREPORT_ROOT=$(CDPATH= cd -- "$HOOK_DIR/.." && pwd -P)
+repo_name=$(basename "$REPO_ROOT" | tr -cd 'A-Za-z0-9._-')
+QUEUE_ROOT=${AUTOREPORT_QUEUE_ROOT:-"$AUTOREPORT_ROOT/reports/jira_queue"}
+QUEUE_DIR="$QUEUE_ROOT/$repo_name"
+LOG_FILE="$QUEUE_DIR/post-commit-hook.log"
+EXIT_FILE="$QUEUE_DIR/post-commit-hook.last-exit"
+if ! mkdir -p "$QUEUE_DIR" 2>/dev/null; then
+  printf '%s\n' "[jira-queue] cannot create queue directory: $QUEUE_DIR" >&2
+  exit 0
+fi
+
+SYNC_SCRIPT=${AUTOREPORT_SYNC_SCRIPT:-"$AUTOREPORT_ROOT/scripts/sync_commit_to_jira.py"}
+
+PYTHON_EXE=${AUTOREPORT_PYTHON:-}
+if [ -z "$PYTHON_EXE" ]; then
+  # AutoReport's supported runtime is the system Python. A stale repo-local venv
+  # can miss python-dotenv/Jira dependencies and silently downgrade auto-apply.
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_EXE=$(command -v python)
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_EXE=$(command -v python3)
+  elif [ -f "$AUTOREPORT_ROOT/.venv/Scripts/python.exe" ]; then
+    PYTHON_EXE="$AUTOREPORT_ROOT/.venv/Scripts/python.exe"
+  elif [ -f "$AUTOREPORT_ROOT/.venv/bin/python.exe" ]; then
+    PYTHON_EXE="$AUTOREPORT_ROOT/.venv/bin/python.exe"
+  fi
+fi
+
+timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)
+commit_sha=$(git rev-parse HEAD 2>/dev/null || true)
+
+if [ -z "$PYTHON_EXE" ]; then
+  {
+    printf '%s\n' "[$timestamp] [ERROR] commit=$commit_sha Python executable unavailable; exit=127"
+  } >>"$LOG_FILE" 2>&1
+  printf '%s\n' '127' >"$EXIT_FILE"
+  exit 0
+fi
+
+{
+  printf '%s\n' "[$timestamp] [START] commit=$commit_sha Jira plan/proposal sync"
+  "$PYTHON_EXE" "$SYNC_SCRIPT" --repo "$REPO_ROOT" --commit HEAD
+  worker_exit=$?
+  if [ "$worker_exit" -eq 0 ]; then
+    printf '%s\n' "[$timestamp] [OK] commit=$commit_sha worker_exit=0"
+  elif [ "$worker_exit" -eq 3 ]; then
+    printf '%s\n' "[$timestamp] [BLOCKED] commit=$commit_sha auto-apply requires review; worker_exit=3"
+  else
+    printf '%s\n' "[$timestamp] [ERROR] commit=$commit_sha proposal queue failed; worker_exit=$worker_exit"
+  fi
+} >>"$LOG_FILE" 2>&1
+
+printf '%s\n' "$worker_exit" >"$EXIT_FILE"
+
+# Deliberately do not propagate the worker failure to Git.  The queue log and
+# last-exit sidecar carry operational failure semantics for monitoring/retry.
+exit 0

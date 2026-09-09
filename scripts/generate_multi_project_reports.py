@@ -143,6 +143,44 @@ def parse_jira_plan(path: Path) -> dict[str, object]:
     }
 
 
+def parse_next_plan(path: Path) -> dict[str, object]:
+    """Parse the actual next-plan artifact used by the portfolio Task Plans tab."""
+    sections = parse_markdown_sections(path)
+
+    def pick(*aliases: str) -> list[str]:
+        for name in aliases:
+            raw = sections.get(name)
+            if not raw:
+                continue
+            items = [line[2:].strip() for line in raw if line.startswith("- ")]
+            items = _strip_placeholders(items)
+            if items:
+                return items
+        return []
+
+    summary = pick("계획 요약", "Plan Summary", "Summary")
+    priority = pick("우선 작업", "Priority Actions", "Priority Work")
+    mid_term = pick("중기 작업", "Mid-term Actions", "Mid-term Work")
+    risks = pick("리스크", "Risks")
+    return {
+        "task_name": summary[0] if summary else "",
+        "task_goal": summary[1] if len(summary) > 1 else (summary[0] if summary else ""),
+        "task_scope": summary[:3],
+        "remaining": (priority + mid_term)[:7],
+        "risks": risks[:4],
+    }
+
+
+def merge_task_plan(next_plan: dict[str, object], jira_status: dict[str, object]) -> dict[str, object]:
+    """Use next-plan for future work and Jira status only for execution evidence."""
+    merged = dict(jira_status)
+    for key in ("task_name", "task_goal", "task_scope", "remaining", "risks"):
+        value = next_plan.get(key)
+        if value:
+            merged[key] = value
+    return merged
+
+
 _DAILY_SECTION_ALIASES: dict[str, str] = {
     # Primary facets (### subsection)
     "### \uC8FC\uC694 \uBCC0\uACBD \uC131\uACA9": "primary",
@@ -221,7 +259,7 @@ def parse_automation_status(path: Path, project_name: str) -> dict[str, object]:
 
 
 def build_task_board(item: dict) -> str:
-    plan = item.get("jira_plan_data") or {}
+    plan = item.get("task_plan_data") or item.get("jira_plan_data") or {}
     daily = item.get("daily_data") or {}
     auto_status = item.get("automation_status_data") or {}
     task_name = str(plan.get("task_name") or item["name"])
@@ -263,6 +301,7 @@ def build_task_board(item: dict) -> str:
     supporting_facet_html = "".join(f'<span class="facet-chip support">{escape(x)}</span>' for x in supporting_facets) or '<span class="facet-chip support">보조 변경 없음</span>'
     auto_status_text = str(auto_status.get("status") or "")
     jira_plan_link = item.get("jira_plan_link", "")
+    next_plan_link = item.get("next_plan_link", "")
     auto_status_link = item.get("automation_status_link", "")
     return f"""
 <section class="task-board">
@@ -309,6 +348,7 @@ def build_task_board(item: dict) -> str:
     <div class="facet-title">Definition Of Done</div>
     <ul>{validation_html}</ul>
     <div class="task-links">
+      {f'<a href="{escape(next_plan_link)}">Next Plan</a>' if next_plan_link else ''}
       {f'<a href="{escape(jira_plan_link)}">Jira Status</a>' if jira_plan_link else ''}
       {f'<a href="{escape(auto_status_link)}">Auto Commit Status</a>' if auto_status_link else ''}
     </div>
@@ -586,6 +626,10 @@ def main() -> int:
         daily_md = output_root / "reports" / "daily_brief" / f"{run_date}-daily-report.md"
         jira_plan = output_root / "reports" / "jira" / f"{run_date}-jira-status.html"
         jira_plan_md = output_root / "reports" / "jira" / f"{run_date}-jira-status.md"
+        next_plan = output_root / "reports" / "plans" / f"{run_date}-next-plan.html"
+        next_plan_md = output_root / "reports" / "plans" / f"{run_date}-next-plan.md"
+        jira_status_data = parse_jira_plan(jira_plan_md)
+        next_plan_data = parse_next_plan(next_plan_md)
         items.append(
             {
                 "name": name,
@@ -595,7 +639,9 @@ def main() -> int:
                 "dashboard_link": dashboard.as_uri() if dashboard.exists() else "",
                 "daily_link": daily.as_uri() if daily.exists() else "",
                 "jira_plan_link": jira_plan.as_uri() if jira_plan.exists() else "",
-                "jira_plan_data": parse_jira_plan(jira_plan_md),
+                "next_plan_link": next_plan.as_uri() if next_plan.exists() else "",
+                "jira_plan_data": jira_status_data,
+                "task_plan_data": merge_task_plan(next_plan_data, jira_status_data),
                 "daily_data": parse_daily_facets(daily_md),
                 "automation_status_link": automation_html.as_uri() if automation_html.exists() else "",
                 "automation_status_data": parse_automation_status(automation_json, name),

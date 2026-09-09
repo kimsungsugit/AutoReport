@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import subprocess
 import sys
 from datetime import date, datetime
@@ -60,9 +62,109 @@ def current_branch(repo_root: Path) -> str:
     return proc.stdout.strip() or "main"
 
 
+def commits_ahead_of_origin(repo_root: Path, branch: str) -> int:
+    """Return commits in HEAD that are not yet on origin/<branch>.
+
+    A clean worktree does not imply that the branch is synchronized.  The evening
+    job can successfully create a commit and then fail while pushing it; on the
+    next run that repository is clean but still needs a push.
+    """
+    proc = run_git(
+        repo_root,
+        ["rev-list", "--count", f"origin/{branch}..HEAD"],
+        check=False,
+    )
+    if proc.returncode != 0:
+        return 0
+    try:
+        return max(0, int(proc.stdout.strip()))
+    except ValueError:
+        return 0
+
+
+def jira_sync_sidecar_path(repo_root: Path) -> Path:
+    """Return the sidecar written by the tracked post-commit hook."""
+    queue_root = Path(
+        os.environ.get("AUTOREPORT_QUEUE_ROOT")
+        or (WORKSPACE_ROOT / "reports" / "jira_queue")
+    )
+    safe_repo = re.sub(r"[^A-Za-z0-9._-]", "", repo_root.name) or "repository"
+    return queue_root / safe_repo / "post-commit-hook.last-exit"
+
+
+def jira_sync_sidecar_fingerprint(repo_root: Path) -> tuple[int, int] | None:
+    try:
+        stat = jira_sync_sidecar_path(repo_root).stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def read_jira_sync_exit(repo_root: Path) -> int | None:
+    sidecar = jira_sync_sidecar_path(repo_root)
+    try:
+        return int(sidecar.read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        # A corrupt/unreadable completion marker is not safe to treat as success.
+        return 2
+
+
+def write_jira_sync_exit(repo_root: Path, exit_code: int) -> None:
+    sidecar = jira_sync_sidecar_path(repo_root)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    temporary = sidecar.with_name(f".{sidecar.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(f"{exit_code}\n", encoding="utf-8")
+        os.replace(temporary, sidecar)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def jira_sync_status(exit_code: int | None) -> str:
+    if exit_code is None:
+        return "not_run"
+    if exit_code == 0:
+        return "succeeded"
+    if exit_code == 3:
+        return "review_required"
+    return "failed"
+
+
+def run_jira_sync_worker(repo_root: Path, commit_sha: str) -> subprocess.CompletedProcess[str]:
+    """Retry the same worker used by the hook for a stranded HEAD commit."""
+    return subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "sync_commit_to_jira.py"),
+            "--repo",
+            str(repo_root),
+            "--commit",
+            commit_sha,
+        ],
+        cwd=WORKSPACE_ROOT,
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
+def record_jira_sync(result: dict[str, Any], exit_code: int | None) -> None:
+    result["jira_sync_exit"] = exit_code
+    result["jira_sync_status"] = jira_sync_status(exit_code)
+
+
 def auto_commit_repo(repo_root: Path, run_day: str, message_prefix: str, dry_run: bool = False) -> dict[str, Any]:
     status_lines = collect_status_lines(repo_root)
     branch = current_branch(repo_root)
+    ahead_count = commits_ahead_of_origin(repo_root, branch)
+    sidecar_before_commit = jira_sync_sidecar_fingerprint(repo_root)
     result: dict[str, Any] = {
         "name": repo_root.name,
         "path": str(repo_root),
@@ -72,39 +174,94 @@ def auto_commit_repo(repo_root: Path, run_day: str, message_prefix: str, dry_run
         "message": "변경 없음",
         "commit": "",
         "error": "",
+        "jira_sync_exit": None,
+        "jira_sync_status": "not_run",
         "ran_at": datetime.now().isoformat(timespec="seconds"),
     }
-    if not status_lines:
-        return result
-
-    if dry_run:
-        result["status"] = "dry_run"
-        result["message"] = "자동 커밋/푸시 대상 점검 완료"
-        return result
 
     try:
-        run_git(repo_root, ["add", "-A"])
-        staged_check = subprocess.run(
-            ["git", "-c", f"safe.directory={repo_root}", "diff", "--cached", "--quiet"],
-            cwd=repo_root,
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        if staged_check.returncode == 0:
-            result["status"] = "no_staged_changes"
-            result["message"] = "스테이징 후 커밋 대상 없음"
+        if not status_lines:
+            previous_sync_exit = read_jira_sync_exit(repo_root)
+            record_jira_sync(result, previous_sync_exit)
+            if not dry_run and jira_sync_status(previous_sync_exit) == "failed":
+                head_sha = run_git(repo_root, ["rev-parse", "HEAD"]).stdout.strip()
+                result["commit"] = head_sha[:7]
+                sync_proc = run_jira_sync_worker(repo_root, head_sha)
+                write_jira_sync_exit(repo_root, sync_proc.returncode)
+                record_jira_sync(result, sync_proc.returncode)
+                if result["jira_sync_status"] == "failed":
+                    result["status"] = "failed"
+                    result["message"] = "Jira commit sync retry failed"
+                    result["error"] = (
+                        sync_proc.stderr.strip()
+                        or sync_proc.stdout.strip()
+                        or f"Jira sync worker exited {sync_proc.returncode}"
+                    )
+                    return result
+
+            if ahead_count == 0:
+                return result
+
+        if dry_run:
+            result["status"] = "dry_run"
+            result["message"] = (
+                f"미푸시 커밋 {ahead_count}건 푸시 대상"
+                if not status_lines
+                else "자동 커밋/푸시 대상 점검 완료"
+            )
+            if ahead_count:
+                result["commit"] = run_git(repo_root, ["rev-parse", "--short", "HEAD"]).stdout.strip()
             return result
 
-        commit_message = f"{message_prefix} {run_day}"
-        commit_proc = run_git(repo_root, ["commit", "-m", commit_message])
+        commit_proc: subprocess.CompletedProcess[str] | None = None
+        if status_lines:
+            run_git(repo_root, ["add", "-A"])
+            staged_check = subprocess.run(
+                ["git", "-c", f"safe.directory={repo_root}", "diff", "--cached", "--quiet"],
+                cwd=repo_root,
+                text=True,
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if staged_check.returncode == 0:
+                if ahead_count == 0:
+                    result["status"] = "no_staged_changes"
+                    result["message"] = "스테이징 후 커밋 대상 없음"
+                    return result
+            else:
+                commit_message = f"{message_prefix} {run_day}"
+                commit_proc = run_git(repo_root, ["commit", "-m", commit_message])
+
+        # Record HEAD before attempting the push.  If the push fails, this hash is
+        # the durable recovery handle and the next clean-worktree run can retry it.
         commit_hash = run_git(repo_root, ["rev-parse", "--short", "HEAD"]).stdout.strip()
+        result["commit"] = commit_hash
+        if commit_proc is not None:
+            sidecar_after_commit = jira_sync_sidecar_fingerprint(repo_root)
+            if sidecar_after_commit == sidecar_before_commit:
+                write_jira_sync_exit(repo_root, 2)
+                record_jira_sync(result, 2)
+                result["status"] = "failed"
+                result["message"] = "Jira commit sync failed"
+                result["error"] = "post-commit Jira sync sidecar was not updated"
+                return result
+            record_jira_sync(result, read_jira_sync_exit(repo_root))
+            if result["jira_sync_status"] == "failed":
+                result["status"] = "failed"
+                result["message"] = "Jira commit sync failed"
+                result["error"] = (
+                    f"post-commit Jira sync exited {result['jira_sync_exit']}"
+                )
+                return result
         push_proc = run_git(repo_root, ["push", "origin", branch])
         result["status"] = "pushed"
-        result["message"] = push_proc.stdout.strip() or commit_proc.stdout.strip() or "자동 커밋/푸시 완료"
-        result["commit"] = commit_hash
+        result["message"] = (
+            push_proc.stdout.strip()
+            or (commit_proc.stdout.strip() if commit_proc else "")
+            or "자동 커밋/푸시 완료"
+        )
         return result
     except Exception as exc:
         result["status"] = "failed"
@@ -120,6 +277,9 @@ def render_html(payload: dict[str, Any]) -> str:
     for item in payload.get("projects") or []:
         status = str(item.get("status") or "")
         cls = "ok" if status == "pushed" else ("warn" if status in {"no_changes", "no_staged_changes"} else "fail")
+        jira_status = str(item.get("jira_sync_status") or "not_run")
+        jira_exit = item.get("jira_sync_exit")
+        jira_text = jira_status if jira_exit is None else f"{jira_status} ({jira_exit})"
         rows.append(
             f"""
 <tr>
@@ -128,6 +288,7 @@ def render_html(payload: dict[str, Any]) -> str:
   <td class="{cls}">{status}</td>
   <td>{item.get("changed_files",0)}</td>
   <td>{item.get("commit","-") or "-"}</td>
+  <td>{jira_text}</td>
   <td>{item.get("message","")}</td>
 </tr>
 """
@@ -163,6 +324,7 @@ def render_html(payload: dict[str, Any]) -> str:
           <th>Status</th>
           <th>Changed</th>
           <th>Commit</th>
+          <th>Jira Sync</th>
           <th>Message</th>
         </tr>
       </thead>
@@ -194,6 +356,8 @@ def main() -> int:
                     "message": "경로 없음",
                     "commit": "",
                     "error": "",
+                    "jira_sync_exit": None,
+                    "jira_sync_status": "not_run",
                     "ran_at": datetime.now().isoformat(timespec="seconds"),
                 }
             )
@@ -209,6 +373,8 @@ def main() -> int:
                     "message": "Git 저장소 아님",
                     "commit": "",
                     "error": "",
+                    "jira_sync_exit": None,
+                    "jira_sync_status": "not_run",
                     "ran_at": datetime.now().isoformat(timespec="seconds"),
                 }
             )
@@ -232,7 +398,7 @@ def main() -> int:
     print(html_path)
     for item in results:
         print(f"{item['name']}: {item['status']}")
-    return 0
+    return 1 if any(item.get("status") == "failed" for item in results) else 0
 
 
 if __name__ == "__main__":

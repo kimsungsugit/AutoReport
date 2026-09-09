@@ -1,25 +1,12 @@
-Add a comment to a Jira issue.
+Prepare a reviewed comment for a Jira issue.
 
 Arguments: $ARGUMENTS (format: "ISSUE_KEY comment text")
 
 ## Steps
 
-1. Parse $ARGUMENTS — first token is the issue key (e.g. APPL-392), the rest is the comment
-2. Run the following Python script:
+1. Parse the issue key and comment.
+2. Do not call `workflow.task_provider` or Jira REST directly.
+3. Use the matching AutoReport dashboard suggestion and let the user review and
+   approve the final text. If no suggestion exists, report that no write occurred.
 
-```python
-import sys, os
-sys.path.insert(0, "d:/Project/Program/AutoReport")
-from dotenv import load_dotenv
-load_dotenv("d:/Project/Program/AutoReport/.env")
-from workflow.task_provider import get_task_provider
-
-provider = get_task_provider({"jira": {"project_key": "APPL", "sprint_id": 152}})
-result = provider.add_comment("<ISSUE_KEY>", "<COMMENT>")
-```
-
-3. Report the result:
-   - Success: "ISSUE_KEY에 댓글 작성 완료"
-   - Failure: "ISSUE_KEY 댓글 작성 실패"
-
-Keep the response to 1 line.
+This command must never bypass the proposal/outbox/idempotency path.

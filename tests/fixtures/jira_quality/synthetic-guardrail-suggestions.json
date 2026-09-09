@@ -1,0 +1,20 @@
+{
+  "suggestions": [
+    {
+      "id": "unsafe-plan-only",
+      "type": "create_task",
+      "dedupe_marker": "autoreport:jira-create-task:v1:good",
+      "target_status": "Done",
+      "source_commits": [],
+      "executed_validation": [],
+      "expected_assessment": {
+        "quality_score": 40,
+        "quality_grade": "draft",
+        "blocking_reasons": ["plan_only"],
+        "auto_apply_eligible": true,
+        "quality_dimensions": {"traceability": 0},
+        "evidence_type": "plan_draft"
+      }
+    }
+  ]
+}

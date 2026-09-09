@@ -46,3 +46,12 @@ class TestStartupProjectsStructure:
     def test_unique_names(self, projects_data):
         names = [p["name"] for p in projects_data["projects"]]
         assert len(names) == len(set(names)), f"Duplicate names: {names}"
+
+    def test_enabled_projects_have_commit_to_jira_planning(self, projects_data):
+        for project in projects_data["projects"]:
+            if not project["enabled"]:
+                continue
+            jira = project.get("jira")
+            assert isinstance(jira, dict), f"{project['name']} missing jira config"
+            assert jira.get("project_key"), f"{project['name']} missing Jira project key"
+            assert jira.get("auto_plan") is True, f"{project['name']} auto_plan is not enabled"

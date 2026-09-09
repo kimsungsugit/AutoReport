@@ -21,8 +21,13 @@ from scripts.generate_periodic_reports import (
     _render_sprint_summary,
     _keyword_pattern,
     _scope_tasks_to_epic,
+    _drop_if_expired,
     _log_swallowed,
+    _is_executable_validation_line,
+    generate_jira_creation_suggestions,
     generate_jira_suggestions,
+    html_jira_suggestions_panel,
+    JIRA_SUGGESTIONS_SCRIPT,
     write_text_atomic,
     merge_suggestion_status,
 )
@@ -72,6 +77,15 @@ def make_commits(*subjects: str) -> list[dict[str, str]]:
 # ---------------------------------------------------------------------------
 
 class TestLoadSprintTasks:
+    def test_expired_sprint_uses_report_reference_day(self):
+        data = {
+            "sprint": {"name": "Old", "end": "2026-06-30"},
+            "tasks": [{"key": "APPL-1"}],
+        }
+
+        assert _drop_if_expired(data, date(2026, 6, 30)) == data
+        assert _drop_if_expired(data, date(2026, 8, 11)) == {}
+
     def test_loads_existing_file(self):
         """The real sprint_tasks.json should load successfully."""
         result = load_sprint_tasks()
@@ -715,15 +729,15 @@ class TestGenerateJiraSuggestions:
             "status": "in_progress", "subtasks": [],
         }]
         result = generate_jira_suggestions(_suggestion_payload(sprint), None)
-        complete_for_t1 = [s for s in result if s["task_key"] == "T-1" and s["type"] == "complete"]
-        assert complete_for_t1, "Rule 2 종료일 도래 제안이 발동해야 함"
-        s = complete_for_t1[0]
+        review_for_t1 = [s for s in result if s["task_key"] == "T-1" and s["type"] == "comment"]
+        assert review_for_t1, "증거 없는 Rule 2는 완료가 아닌 점검 comment여야 함"
+        s = review_for_t1[0]
         assert "종료일 도래" in s["title"]
         assert "0일" not in s["title"]
         assert s["confidence"] == "low"
 
     def test_rule2_confidence_high_with_commit_evidence(self):
-        """Rule 2 는 커밋 증거가 있을 때만 high — 마감 도래 + 제목과 겹치는 커밋 → high."""
+        """Rule 2 는 증거가 있어도 high 점검 comment일 뿐, 자동 완료하지 않는다."""
         sprint = [{
             "key": "T-1", "title": "Wraps today",
             "start": "2026-05-01", "end": "2026-05-22",
@@ -732,10 +746,11 @@ class TestGenerateJiraSuggestions:
         # "wraps"/"today" 가 제목과 겹쳐 _match_commits_for 가 증거를 찾는다
         commits = ["feat: Wraps today final fix"]
         result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
-        complete_for_t1 = [s for s in result if s["task_key"] == "T-1" and s["type"] == "complete"]
-        assert complete_for_t1, "Rule 2 제안이 발동해야 함"
-        assert complete_for_t1[0]["confidence"] == "high"
-        assert "종료 요청합니다." in complete_for_t1[0]["suggested_text"]
+        review_for_t1 = [s for s in result if s["task_key"] == "T-1" and s["type"] == "comment"]
+        assert review_for_t1, "증거가 있는 Rule 2도 점검 comment로 발동해야 함"
+        assert review_for_t1[0]["confidence"] == "high"
+        assert "진행 상황 점검 필요" in review_for_t1[0]["suggested_text"]
+        assert not any(s["task_key"] == "T-1" and s["type"] == "complete" for s in result)
 
     def test_rule2_overdue_message(self):
         """end_date < today → "기한 초과 N일" 분기."""
@@ -745,10 +760,10 @@ class TestGenerateJiraSuggestions:
             "status": "in_progress", "subtasks": [],
         }]
         result = generate_jira_suggestions(_suggestion_payload(sprint), None)
-        complete_for_t2 = [s for s in result if s["task_key"] == "T-2" and s["type"] == "complete"]
-        assert complete_for_t2
-        assert "기한 초과" in complete_for_t2[0]["title"]
-        assert "7일" in complete_for_t2[0]["title"]  # 2026-05-22 - 2026-05-15
+        review_for_t2 = [s for s in result if s["task_key"] == "T-2" and s["type"] == "comment"]
+        assert review_for_t2
+        assert "기한 초과" in review_for_t2[0]["title"]
+        assert "7일" in review_for_t2[0]["title"]  # 2026-05-22 - 2026-05-15
 
     def test_rule2_skipped_for_pending(self):
         """pending 상태 task 는 end_date 와 무관하게 Rule 2 안 탐."""
@@ -758,8 +773,11 @@ class TestGenerateJiraSuggestions:
             "status": "pending", "subtasks": [],
         }]
         result = generate_jira_suggestions(_suggestion_payload(sprint), None)
-        completes = [s for s in result if s["task_key"] == "T-3" and s["type"] == "complete"]
-        assert completes == []
+        rule2_actions = [
+            s for s in result
+            if s["task_key"] == "T-3" and s["type"] in ("comment", "complete")
+        ]
+        assert rule2_actions == []
 
     def test_noise_chore_auto_filtered(self):
         """chore(auto): snapshot 은 noise → add_subtask 제안 후보 아님."""
@@ -839,7 +857,7 @@ class TestGenerateJiraSuggestions:
     def test_confidence_sort_preserves_high_under_cap(self):
         """저신뢰 카드가 많아도 high-confidence 제안이 max_suggestions 컷에서 살아남아야 한다.
 
-        per-subtask 루프는 cap 체크 없이 medium 카드를 쌓아서, 정렬 없이 자르면 뒤
+        per-subtask 루프는 cap 체크 없이 low 카드를 쌓아서, 정렬 없이 자르면 뒤
         task 의 high Rule 2 제안이 잘려나갔다. confidence 정렬로 high 가 앞으로 온다.
         """
         big = {
@@ -847,8 +865,8 @@ class TestGenerateJiraSuggestions:
             "start": "2026-05-01", "end": "2099-12-31",  # 미래
             "status": "in_progress",
             "subtasks": [
-                {"key": f"BIG-{i}", "title": f"sub {i}", "status": "in_progress"}
-                for i in range(12)  # 12 medium 카드 → cap(10) 초과
+                {"key": f"BIG-{i}", "title": f"sub {i}", "status": "pending"}
+                for i in range(12)  # 12 low 시작 카드 → cap(10) 초과
             ],
         }
         deadline = {
@@ -860,12 +878,47 @@ class TestGenerateJiraSuggestions:
         # (BIG 제목 "big task" 와는 안 겹쳐 BIG 으로는 안 샌다)
         payload = _suggestion_payload([big, deadline], ["feat: overdue cleanup"])  # 순서: BIG 먼저
         payload["today"] = "2026-06-01"
-        result = generate_jira_suggestions(payload, None)
-        assert len(result) == 10  # max_suggestions 기본값
+        # 컷 자체를 시험하는 테스트이므로 상한을 명시한다(기본값은 프로젝트별 설정).
+        result = generate_jira_suggestions(payload, None, max_suggestions=10)
+        assert len(result) == 10
         assert any(s["confidence"] == "high" and s["task_key"] == "DEADLINE"
                    for s in result), "high-confidence Rule 2 제안이 컷에서 살아남아야 함"
         # 정렬 결과: high 가 맨 앞
         assert result[0]["confidence"] == "high"
+
+    def test_max_suggestions_reads_project_config(self):
+        """상한은 jira_config.max_suggestions 로 프로젝트별 조정할 수 있어야 한다.
+
+        스프린트가 커지면 기본 상한이 완료 제안을 통째로 잘라내 한 주 작업이
+        대시보드에서 사라진다 — 그때 설정만으로 넓힐 수 있어야 한다.
+        """
+        big = {
+            "key": "BIG", "title": "big task",
+            "start": "2026-05-01", "end": "2099-12-31",
+            "status": "in_progress",
+            "subtasks": [
+                {"key": f"BIG-{i}", "title": f"sub {i}", "status": "pending"}
+                for i in range(12)
+            ],
+        }
+        payload = _suggestion_payload([big], ["feat: unrelated"])
+        payload["today"] = "2026-06-01"
+        payload["jira_config"] = dict(payload.get("jira_config") or {})
+
+        payload["jira_config"]["max_suggestions"] = 3
+        assert len(generate_jira_suggestions(payload, None)) == 3
+
+        payload["jira_config"].pop("max_suggestions", None)
+        uncapped = len(generate_jira_suggestions(payload, None))
+        assert uncapped > 3, "기본 상한이 이 표본을 자르면 이 테스트가 무의미해진다"
+
+        payload["jira_config"]["max_suggestions"] = uncapped - 1
+        assert len(generate_jira_suggestions(payload, None)) == uncapped - 1
+
+        # 잘못된 값은 기본값으로 되돌아가고, 명시 인자가 설정보다 우선한다.
+        payload["jira_config"]["max_suggestions"] = "many"
+        assert len(generate_jira_suggestions(payload, None)) == uncapped
+        assert len(generate_jira_suggestions(payload, None, max_suggestions=2)) == 2
 
     def test_honors_payload_today_not_wall_clock(self):
         """제안은 payload['today'](리포트 날짜) 기준으로 종료일 도래를 판단해야 한다.
@@ -882,9 +935,9 @@ class TestGenerateJiraSuggestions:
         payload = _suggestion_payload(sprint)
         payload["today"] = "2100-01-01"
         result = generate_jira_suggestions(payload, None)
-        completes = [s for s in result if s["task_key"] == "FUT-1" and s["type"] == "complete"]
-        assert completes, "payload['today'] 기준 종료일 초과 → Rule 2 발동해야 함"
-        assert "기한 초과" in completes[0]["title"]
+        reviews = [s for s in result if s["task_key"] == "FUT-1" and s["type"] == "comment"]
+        assert reviews, "payload['today'] 기준 종료일 초과 → Rule 2 점검 comment 발동해야 함"
+        assert "기한 초과" in reviews[0]["title"]
 
     def test_shared_sprint_no_leak_without_epic_scope(self):
         """공유 스프린트(여러 에픽) + epic_scope 미설정 시: 단어 overlap 0 인 커밋은
@@ -942,6 +995,10 @@ class TestGenerateJiraSuggestions:
         groups = defaultdict(list)
         for p in jira_projects:
             j = p["jira"]
+            # create-task-only planning projects intentionally have no sprint/epic;
+            # only live shared-sprint configurations need Epic isolation.
+            if j.get("sprint_id") is None:
+                continue
             groups[(j.get("project_key"), j.get("sprint_id"))].append(j.get("epic_key"))
         for sig, epics in groups.items():
             if len(epics) > 1:  # 공유 스프린트
@@ -1098,18 +1155,19 @@ class TestGenerateJiraSuggestions:
         assert not any(s["type"] == "comment" and s["task_key"] == "DUP2-1" for s in result), \
             "add_subtask 이미 있으면 같은 작업에 comment 중복 금지"
 
-    def test_no_comment_when_rule_already_fired(self):
-        """이미 complete/transition 제안이 있는 태스크엔 중복 comment 를 안 낸다."""
+    def test_rule2_emits_one_review_comment_and_never_completes(self):
+        """Rule 2는 별도 진행 comment를 중복하지 않고 완료 액션도 만들지 않는다."""
         sprint = [{
             "key": "OVR-1", "title": "telemetry buffer flush",
-            "start": "2026-05-01", "end": "2026-05-15",  # 종료 도래 → Rule 2 complete
+            "start": "2026-05-01", "end": "2026-05-15",  # 종료 도래 → Rule 2 comment
             "status": "in_progress", "subtasks": [],
         }]
         commits = ["feat: telemetry init", "fix: buffer flush", "refactor: telemetry pool"]
         result = generate_jira_suggestions(_suggestion_payload(sprint, commits), None)
-        assert any(s["type"] == "complete" and s["task_key"] == "OVR-1" for s in result)
-        assert not any(s["type"] == "comment" and s["task_key"] == "OVR-1" for s in result), \
-            "Rule 2 가 이미 발동했으면 comment 중복 금지"
+        comments = [s for s in result if s["type"] == "comment" and s["task_key"] == "OVR-1"]
+        assert len(comments) == 1, "Rule 2 점검 comment와 일반 진행 comment가 중복되면 안 됨"
+        assert "진행 상황 점검 필요" in comments[0]["suggested_text"]
+        assert not any(s["type"] == "complete" and s["task_key"] == "OVR-1" for s in result)
 
     def test_no_body_leak_to_foreign_epic_multi_epic(self):
         """본문-only 매칭이 다중 에픽(미설정)에서 남의 에픽 작업에 새지 않는다.
@@ -1164,7 +1222,7 @@ class TestGenerateJiraSuggestions:
 
     def test_rule2_body_evidence_calibration(self):
         """Rule 2 신뢰도 보정: 단일 body-only 매칭은 thin → medium(점검 필요), subject 또는
-        2건 이상 body 매칭이라야 high(종료 요청). high 는 배치승인 신호라 증거 기준을 높인다.
+        2건 이상 body 매칭이라야 high. 신뢰도와 무관하게 액션은 항상 점검 comment다.
         """
         base = {"key": "BOD-1", "title": "위협분석 모델",
                 "start": "2026-05-01", "end": "2026-05-15",  # overdue vs today 2026-05-22 (7일)
@@ -1173,18 +1231,19 @@ class TestGenerateJiraSuggestions:
         r1 = generate_jira_suggestions(_suggestion_payload(
             [dict(base)], ["feat(tara): work"],
             {"feat(tara): work": "- ISO 26262 HARA 위협분석 데이터모델"}), None)
-        c1 = [s for s in r1 if s["type"] == "complete" and s["task_key"] == "BOD-1"][0]
+        c1 = [s for s in r1 if s["type"] == "comment" and s["task_key"] == "BOD-1"][0]
         assert c1["confidence"] == "medium"
         assert "점검 필요" in c1["suggested_text"]
         assert "완료 처리" not in c1["title"], "low/medium 카드는 제목에 '완료 처리' 단정 금지"
-        # (2) 2건 body 매칭 → high + '종료 요청합니다.'
+        # (2) 2건 body 매칭 → high 이지만 여전히 점검 comment
         r2 = generate_jira_suggestions(_suggestion_payload(
             [dict(base)], ["feat(tara): work", "fix(tara): patch"],
             {"feat(tara): work": "- HARA 위협분석 1", "fix(tara): patch": "- 위협분석 개선"}), None)
-        c2 = [s for s in r2 if s["type"] == "complete" and s["task_key"] == "BOD-1"][0]
+        c2 = [s for s in r2 if s["type"] == "comment" and s["task_key"] == "BOD-1"][0]
         assert c2["confidence"] == "high"
-        assert "종료 요청합니다." in c2["suggested_text"]
-        assert "완료 처리" in c2["title"]
+        assert "점검 필요" in c2["suggested_text"]
+        assert "종료 요청합니다." not in c2["suggested_text"]
+        assert "완료 처리" not in c2["title"]
 
     def test_status_cards_never_carry_description(self):
         """complete/transition 카드는 suggested_description 이 항상 ""(빈 값) — 승인 시
@@ -1197,7 +1256,7 @@ class TestGenerateJiraSuggestions:
             # Rule 3: 시작일 도래 + pending → 전환
             {"key": "R3", "title": "rule three", "start": "2026-05-01", "end": "2099-12-31",
              "status": "pending", "description": "기존 설명 3", "subtasks": []},
-            # Rule 2: 마감 도래 → 완료(점검)
+            # Rule 2: 마감 도래 → 점검 comment (status_cards 필터에서 제외)
             {"key": "R2", "title": "rule two", "start": "2026-05-01", "end": "2026-05-10",
              "status": "in_progress", "description": "기존 설명 2", "subtasks": []},
         ]
@@ -1369,6 +1428,38 @@ class TestGenerateDocumentFactOverride:
         # status_summary 도 0 으로 강제
         assert sections["status_summary"]["completed_count"] == 0
 
+    def test_jira_gemini_commit_only_planning_is_not_reported_unconfigured(self):
+        """suggest_existing=false + auto_plan=true 는 미연동이 아니라 계획 전용 모드다."""
+        from unittest.mock import patch as _patch
+        from scripts import generate_periodic_reports as g
+
+        payload = _suggestion_payload([], [])
+        payload.update({
+            "report_type": "jira",
+            "jira_enabled": False,
+            "jira_planning_enabled": True,
+        })
+        hallucinated = {
+            "title": "Test", "summary": "x", "task_name": "n", "task_goal": "g",
+            "scope": ["[APPL-001] invented"], "completed": [], "in_progress": [],
+            "remaining": [], "task_board": [{"key": "APPL-001"}],
+            "validation": [], "risks": [], "links": [],
+            "status_summary": {"completed_count": 0, "in_progress_count": 1,
+                               "remaining_count": 0},
+        }
+
+        with _patch.object(g, "ask_gemini_for_sections", return_value=hallucinated), \
+             _patch.object(g, "ask_gemini_for_team_analysis", return_value={}):
+            _md, mode, sections = g.generate_document("jira", payload)
+
+        assert mode == "gemini"
+        assert sections["task_board"] == []
+        assert "신규 Task 자동 계획 활성" in sections["scope"][0]
+        assert "미연동" not in sections["scope"][0]
+        assert sections["status_summary"] == {
+            "completed_count": 0, "in_progress_count": 0, "remaining_count": 0,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Multi-project dashboard dedup — source-level 회귀 표식 (Iteration 2/3)
@@ -1382,6 +1473,11 @@ class TestDashboardDedupRegression:
         # render_html_dashboard 안에 (project_key, sprint_id, board_id) seen set 이 있어야 함
         assert "seen_boards" in src
         assert "board_key in seen_boards" in src
+
+    def test_batch_approval_is_limited_to_safe_create_task_path(self):
+        src = (Path(__file__).resolve().parents[1] / "scripts" / "generate_periodic_reports.py").read_text(encoding="utf-8")
+        assert "type === 'create_task'" in src
+        assert "!['complete', 'transition'].includes(type)" not in src
 
     def test_multi_project_has_dedup_and_merged_suggestions(self):
         src = (Path(__file__).resolve().parents[1] / "scripts" / "generate_multi_project_reports.py").read_text(encoding="utf-8")
@@ -1604,6 +1700,38 @@ class TestSuggestionPersistence:
         fresh = [{"id": "s1", "status": "pending"}]
         assert merge_suggestion_status(fresh, tmp_path / "missing.json") == fresh
 
+    def test_merge_carries_create_task_trace_and_recomputes_revision(self, tmp_path):
+        from workflow.jira_apply import proposal_revision
+
+        existing = tmp_path / "create.json"
+        prior = {
+            "id": "jtp-abc", "type": "create_task", "task_key": "",
+            "project_key": "APPL", "epic_key": "APPL-10", "dedupe_marker": "marker",
+            "status": "approved", "suggested_text": "reviewed title",
+            "suggested_description": "", "start": "2026-08-12", "end": "2026-08-20",
+            "report_required": "no", "created_task_key": "APPL-900",
+            "jira_operation_id": "op-1", "jira_proposal_marker": "ARID0123456789ABCDEF0123",
+            "jira_outbox_state": "applied", "jira_review_revision": "jrev_review",
+            "jira_applied_revision": "jrev_applied",
+        }
+        existing.write_text(json.dumps({"suggestions": [prior]}), encoding="utf-8")
+        fresh = [{
+            "id": "jtp-abc", "type": "create_task", "task_key": "",
+            "project_key": "APPL", "epic_key": "APPL-10", "dedupe_marker": "marker",
+            "status": "pending", "suggested_text": "regenerated title",
+            "suggested_description": "regenerated desc", "start": "2026-08-11",
+            "end": "2026-08-18", "report_required": "yes",
+        }]
+
+        merged = merge_suggestion_status(fresh, existing)[0]
+
+        assert merged["created_task_key"] == "APPL-900"
+        assert merged["jira_operation_id"] == "op-1"
+        assert merged["suggested_text"] == "reviewed title"
+        assert merged["suggested_description"] == ""
+        assert merged["start"] == "2026-08-12" and merged["end"] == "2026-08-20"
+        assert merged["proposal_revision"] == proposal_revision(merged)
+
     def test_namespaced_id_split(self):
         from scripts import jira_proxy as jp
         assert jp._split_namespaced_id("Release_claude-sa1b2c3") == ("Release_claude", "sa1b2c3")
@@ -1644,3 +1772,212 @@ class TestSuggestionPersistence:
         assert f is not None and f.name == "2026-06-02-jira-suggestions.json"
         f2 = jp._find_project_suggestions_file("ProjX", None)  # 날짜 없으면 최신
         assert f2 is not None and f2.name == "2026-06-03-jira-suggestions.json"
+
+
+class TestJiraPlanningIntegration:
+    @pytest.mark.parametrize(
+        ("line", "expected"),
+        [
+            ("검증: pytest tests/test_proxy.py -q: 3 passed", True),
+            ("npm run test: 22 passed", True),
+            ("검증", False),
+            ("빌드", False),
+            ("표기 변형 오탐 — 넷 다 테스트가 잡는다.", False),
+            ('"테스트 결과 리포트 템플릿은?"에서 시작했다.', False),
+        ],
+    )
+    def test_validation_collector_keeps_only_executable_commands(self, line, expected):
+        assert _is_executable_validation_line(line) is expected
+
+    def test_commit_creation_card_preserves_quality_evidence_and_business_schedule(self):
+        payload = {
+            "today": "2026-08-11",
+            "jira_planning_enabled": True,
+            "jira_project_key": "APPL",
+            "epic_scope": "APPL-500",
+            "remote_url": "https://example.invalid/repo.git",
+            "jira_config": {"plan_horizon_days": 7, "report_required": "yes"},
+            "recent_commits": [{
+                "hash": "e" * 40,
+                "subject": "feat(quality): 품질 점수와 차단 사유 표시",
+                "body": "",
+                "files": ["scripts/generate_periodic_reports.py", "tests/test_sprint_tasks.py"],
+            }],
+        }
+
+        result = generate_jira_creation_suggestions(payload, {})
+
+        assert len(result) == 1
+        suggestion = result[0]
+        assert suggestion["type"] == "create_task"
+        assert suggestion["evidence_type"] == "commit_backed"
+        assert suggestion["quality_score"] >= 85
+        assert suggestion["quality_grade"] == "high"
+        assert suggestion["auto_apply_eligible"] is True
+        assert suggestion["blocking_reasons"] == []
+        assert suggestion["verification_plan"][0]["status"] == "not_run"
+        # The body is the work list a manager approves — no headings, no code paths.
+        assert "h2." not in suggestion["suggested_description"]
+        assert suggestion["suggested_description"].startswith("* ")
+        assert suggestion["start"] == "2026-08-12"
+        assert suggestion["end"] >= suggestion["start"]
+
+    def test_planning_only_create_task_has_approval_revision(self, monkeypatch):
+        from scripts import generate_periodic_reports as gpr
+
+        monkeypatch.setattr(
+            gpr,
+            "generate_jira_creation_suggestions",
+            lambda *_args, **_kwargs: [{
+                "id": "jtp-planning-only",
+                "dedupe_marker": "autoreport:v1:planning-only",
+                "task_key": "",
+                "type": "create_task",
+                "suggested_text": "Plan next change",
+                "suggested_description": "Grounded plan",
+                "project_key": "APPL",
+                "epic_key": "",
+                "start": "2026-08-11",
+                "end": "2026-08-18",
+                "report_required": "yes",
+                "confidence": "high",
+                "status": "pending",
+            }],
+        )
+        payload = _suggestion_payload([])
+        payload["jira_enabled"] = False
+
+        result = generate_jira_suggestions(payload, {"plan": {}})
+
+        assert len(result) == 1
+        assert result[0]["type"] == "create_task"
+        assert result[0]["proposal_revision"].startswith("jrev_")
+
+    def test_in_progress_subtask_without_completion_evidence_never_completes(self):
+        sprint = [{
+            "key": "SAFE-1", "title": "Safe parent",
+            "start": "2026-05-01", "end": "2099-12-31",
+            "status": "in_progress",
+            "subtasks": [{
+                "key": "SAFE-2", "title": "worker cleanup", "status": "in_progress",
+            }],
+        }]
+
+        result = generate_jira_suggestions(_suggestion_payload(sprint), None)
+
+        assert not any(s["task_key"] == "SAFE-2" and s["type"] == "complete" for s in result)
+
+    def test_in_progress_subtask_requires_explicit_completion_commit(self):
+        sprint = [{
+            "key": "SAFE-1", "title": "Safe parent",
+            "start": "2026-05-01", "end": "2099-12-31",
+            "status": "in_progress",
+            "subtasks": [{
+                "key": "SAFE-2", "title": "worker cleanup", "status": "in_progress",
+            }],
+        }]
+        result = generate_jira_suggestions(
+            _suggestion_payload(sprint, ["fix: worker cleanup completed"]),
+            None,
+        )
+
+        matches = [s for s in result if s["task_key"] == "SAFE-2" and s["type"] == "complete"]
+        assert matches
+        assert "명시적 완료 커밋" in matches[0]["reason"]
+
+    def test_planning_markers_preserve_distinct_existing_ids(self, monkeypatch):
+        from scripts import generate_periodic_reports as gpr
+
+        planning = [
+            {
+                "id": "jtp-alpha", "dedupe_marker": "autoreport:v1:alpha",
+                "task_key": "", "type": "create_task", "suggested_text": "Alpha",
+                "suggested_description": "A", "confidence": "medium", "status": "pending",
+                "epic_key": "APPL-10", "epic_summary": "Planning",
+            },
+            {
+                "id": "jtp-beta", "dedupe_marker": "autoreport:v1:beta",
+                "task_key": "", "type": "create_task", "suggested_text": "Beta",
+                "suggested_description": "B", "confidence": "medium", "status": "pending",
+                "epic_key": "APPL-10", "epic_summary": "Planning",
+            },
+        ]
+        captured = {}
+
+        def fake_planning(payload, plan_sections, max_suggestions=10):
+            captured["plan"] = plan_sections
+            return [dict(item) for item in planning]
+
+        monkeypatch.setattr(gpr, "generate_jira_creation_suggestions", fake_planning)
+        payload = _suggestion_payload([{
+            "key": "DONE-1", "title": "Already done", "status": "done", "subtasks": [],
+        }])
+        plan = {"priority_actions": ["Alpha", "Beta"]}
+
+        result = generate_jira_suggestions(payload, {"plan": plan, "jira": {"summary": []}})
+
+        assert captured["plan"] == plan
+        assert [s["id"] for s in result] == ["jtp-alpha", "jtp-beta"]
+        assert len({s["dedupe_marker"] for s in result}) == 2
+        assert all(s["epic_key"] == "APPL-10" for s in result)
+        assert all(s.get("proposal_revision") for s in result)
+
+    def test_create_task_card_renders_editable_dates_and_target_metadata(self):
+        html = html_jira_suggestions_panel([{
+            "id": "jtp-1", "task_key": "", "type": "create_task",
+            "title": "신규 작업 계획", "subtitle": "APPL 신규 Task",
+            "suggested_text": "Review gate", "suggested_description": "Description",
+            "reason": "plan", "confidence": "medium", "status": "pending",
+            "project_key": "APPL", "epic_key": "APPL-10",
+            "dedupe_marker": "autoreport:marker", "report_required": "yes",
+            "proposal_revision": "pr-test-revision",
+            "start": "2026-08-11", "end": "2026-08-18",
+            "evidence_type": "commit_backed", "quality_score": 91,
+            "quality_grade": "high", "blocking_reasons": [],
+            "auto_apply_eligible": True,
+        }], "2026-08-11")
+
+        assert 'data-type="create_task"' in html
+        assert 'data-project="APPL"' in html
+        assert 'data-epic="APPL-10"' in html
+        assert 'data-marker="autoreport:marker"' in html
+        assert 'data-revision="pr-test-revision"' in html
+        assert "New Task" in html
+        assert "작업 제목 (Summary)" in html
+        assert 'value="2026-08-11"' in html and 'value="2026-08-18"' in html
+        assert 'data-quality-eligible="true"' in html
+        assert "91/100" in html and "commit_backed" in html
+
+    def test_create_task_card_blocks_approval_and_shows_quality_reasons(self):
+        html = html_jira_suggestions_panel([{
+            "id": "jtp-draft", "task_key": "", "type": "create_task",
+            "title": "근거 부족 계획", "suggested_text": "Draft task",
+            "suggested_description": "Description", "reason": "quality blocked",
+            "confidence": "low", "status": "pending", "project_key": "APPL",
+            "dedupe_marker": "autoreport:draft", "proposal_revision": "jrev-draft",
+            "start": "2026-08-11", "end": "2026-08-18",
+            "evidence_type": "plan_draft", "quality_score": 42,
+            "quality_grade": "draft", "blocking_reasons": ["출처 커밋이 없습니다"],
+            "auto_apply_eligible": False,
+        }], "2026-08-11")
+
+        assert 'data-quality-eligible="false"' in html
+        assert "42/100" in html
+        assert "출처 커밋이 없습니다" in html
+        assert "품질 필수조건을 통과해야 승인할 수 있습니다" in html
+        assert ">보완 필요</button>" in html
+
+    def test_create_task_approval_payload_includes_dates_and_dedupe_fields(self):
+        assert "create_task:'신규 작업'" in JIRA_SUGGESTIONS_SCRIPT
+        assert "project_key: projectKey" in JIRA_SUGGESTIONS_SCRIPT
+        assert "epic_key: epicKey" in JIRA_SUGGESTIONS_SCRIPT
+        assert "dedupe_marker: dedupeMarker" in JIRA_SUGGESTIONS_SCRIPT
+        assert "proposal_revision: proposalRevision" in JIRA_SUGGESTIONS_SCRIPT
+        assert "start: start, end: end, date: panelDate" in JIRA_SUGGESTIONS_SCRIPT
+        assert "card.dataset.qualityEligible !== 'false'" in JIRA_SUGGESTIONS_SCRIPT
+        assert "card.dataset.qualityEligible === 'true'" in JIRA_SUGGESTIONS_SCRIPT
+
+    def test_main_routes_plan_card_sections_to_jira_generation(self):
+        src = (Path(__file__).resolve().parents[1] / "scripts" / "generate_periodic_reports.py").read_text(encoding="utf-8")
+        assert 'card.get("report_type") == "plan"' in src
+        assert '"plan": _plan_sections' in src
